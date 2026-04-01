@@ -20,8 +20,6 @@ src/imgui/
 
 # Old backups / notes
 *.bak
-PLAN_FRESH_APPROACH.txt
-src/dllmain_v11_imgui_backup.cpp
-warehouse_distance_mod.py
-gimmick_bsecamp_warehouse_box_01.binarygimmick
-No Letterbox Standalone/
+
+
+.md
