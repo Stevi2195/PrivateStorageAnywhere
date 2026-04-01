@@ -1082,10 +1082,11 @@ static DWORD WINAPI InputThread(LPVOID) {
             if (g_pXInputGetState(0, &state) == 0) {
                 WORD buttons = state.Gamepad.wButtons;
                 WORD pressed = buttons & ~g_prevButtons;  // newly pressed
+                WORD released = g_prevButtons & ~buttons; // newly released
                 g_prevButtons = buttons;
 
-                // B button closes warehouse (always works, no ControllerButton config needed)
-                if (InterlockedCompareExchange(&g_warehouseActive, 0, 0) && (pressed & 0x2000)) {
+                // B button closes warehouse on RELEASE (not press) to prevent dodge roll
+                if (InterlockedCompareExchange(&g_warehouseActive, 0, 0) && (released & 0x2000)) {
                     trigger = true;
                 }
                 // Open/toggle with configured button
