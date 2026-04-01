@@ -1,0 +1,177 @@
+[size=4][b]Private Storage Anywhere[/b][/size]
+
+[line]
+
+Open your Private Storage (Camp Warehouse) from anywhere in the world with a single hotkey or controller button press. No need to walk back to your camp chest.
+
+[line]
+
+[size=3][b]Features[/b][/size]
+
+[list]
+[*][b]F6[/b] to open Private Storage from anywhere on the map
+[*][b]ESC[/b] to close (or F6 again)
+[*][b]Native UI:[/b] Uses the game's built-in warehouse interface — no custom overlay
+[*][b]Localized titles:[/b] Warehouse title automatically matches your game language (14 languages supported)
+[*][b]Full interaction:[/b] Move items in and out of storage, same as at the chest
+[*][b]No chest visit required:[/b] Works immediately after game start
+[*][b]Update-proof:[/b] Uses automatic pattern scanning and vtable matching to locate internal game functions instead of relying on hardcoded offsets
+[*][b]Compatible with UI mods:[/b] Identifies the warehouse panel by vtable signature, not by panel ID — works correctly even when mods like "No Letterbox" change the UI configuration
+[*][b]Safety system:[/b] Hotkey is automatically blocked during cutscenes, minigames, and other unsafe states
+[*][b]Configurable:[/b] Hotkey can be changed via INI file
+[*][b]Keyboard modifiers:[/b] Optional modifier key support (e.g. Shift+I to open storage while plain I opens inventory)
+[*][b]Xbox / XInput controller:[/b] Assign a controller button via XInput. Supports an optional modifier button (e.g. hold LB + press D-Pad). Works with Xbox controllers natively and all other controllers through Steam Input.
+[*][b]PS5 / PS4 controller:[/b] Native HID support for DualSense and DualShock 4 — close warehouse with Circle button. Configurable PSButton in INI (Share, Options, Circle, Triangle, Square, Cross, L1, R1, L3, R3, Touchpad, PS, Mute)
+[*][b]INI hot-reload:[/b] Press F11 to reload all settings without restarting the game
+[/list]
+
+[line]
+
+[size=3][b]Requirements[/b][/size]
+
+[list]
+[*]Ultimate ASI Loader (ThirteenAG) — place [b]version.dll[/b] in the game's [b]bin64[/b] folder. If you already use other ASI mods, the loader is probably already installed.
+[/list]
+
+[line]
+
+[size=3][b]Installation[/b][/size]
+
+[list=1]
+[*]Make sure Ultimate ASI Loader ([b]version.dll[/b]) is in:
+[code][Steam]\steamapps\common\Crimson Desert\bin64\[/code]
+[*]Copy [b]PrivateStorageAnywhere.asi[/b] and [b]PrivateStorageAnywhere.ini[/b] into the same [b]bin64[/b] folder.
+[*]Launch the game. Press F6 to open Private Storage from anywhere.
+[/list]
+
+[line]
+
+[size=3][b]Configuration[/b][/size]
+
+Edit [b]PrivateStorageAnywhere.ini[/b]:
+
+[code][Settings]
+Enabled=1              ; Master switch (0=off, 1=on)
+DebugLog=0             ; Create log file for troubleshooting (0=off, 1=on)
+Hotkey=75              ; Keyboard hotkey in hex (default: 75 = F6)
+ModifierKey=00         ; Hold this key + Hotkey (00 = no modifier)
+ReloadKey=7A           ; Press to reload INI (default: 7A = F11, 00 = disabled)
+ControllerButton=0000  ; XInput controller button (0000 = disabled)
+ControllerModifier=0000 ; Hold this button first (0000 = no modifier)
+PSButton=none          ; PS5/PS4 button: Circle, Triangle, Square, Cross, L1, R1, etc. (none = disabled)[/code]
+
+Key codes use Windows Virtual Key Codes in hex format. A full reference table covering letters, numbers, F1-F24, numpad, navigation, modifiers, punctuation, mouse buttons, and media keys is included at the bottom of the INI file.
+
+[size=3][b]Controller Setup[/b][/size]
+
+To use a controller button, assign a button in the INI:
+
+[code][Settings]
+ControllerModifier=0100  ; Hold LB before pressing the button
+ControllerButton=0001    ; D-Pad Up[/code]
+
+In this example, [b]LB + D-Pad Up[/b] opens Private Storage.
+
+[b]Controller button values:[/b] DPAD_UP=0001, DPAD_DOWN=0002, DPAD_LEFT=0004, DPAD_RIGHT=0008, START/MENU=0010, BACK/VIEW=0020, LEFT_STICK=0040, RIGHT_STICK=0080, LB=0100, RB=0200, A=1000, B=2000, X=4000, Y=8000
+
+[b]Non-Xbox controllers via Steam Input:[/b] Switch and other non-Sony controllers are supported through Steam Input, which translates them to XInput automatically.
+
+[size=3][b]PS5 / PS4 Controller Setup[/b][/size]
+
+PS5 DualSense and PS4 DualShock 4 controllers are supported natively via HID Raw Input — no Steam Input required. Set a button in the INI:
+
+[code][Settings]
+PSButton=Circle[/code]
+
+[b]Supported PSButton values:[/b] Share, Options, Circle, Triangle, Square, Cross, L1, R1, L3, R3, Touchpad, PS, Mute, none
+
+The close action is deferred to button release to prevent triggering a dodge roll in gameplay. Supports DualSense, DualSense Edge, and DualShock 4 v1/v2 over USB and Bluetooth.
+
+[line]
+
+[size=3][color=orange][b]⚠ Inventory Expander Mods[/b][/color][/size]
+
+This mod has [b]not been tested[/b] with any inventory slot expansion or Private Storage expansion mods. If conflicts arise with those mods, compatibility support will not be added.
+
+[line]
+
+[size=3][b]Antivirus Notice[/b][/size]
+
+Some antivirus programs may flag this mod because it relies on low-level hooking to access the game's internal panel functions directly.
+
+Crimson Desert does not provide an official mod API for this functionality, so the mod has to locate and call internal game functions in memory. That kind of behavior can look suspicious to antivirus software even when the mod itself is not malicious.
+
+[line]
+
+[size=3][b]Uninstall[/b][/size]
+
+Delete [b]PrivateStorageAnywhere.asi[/b] and [b]PrivateStorageAnywhere.ini[/b] from the game's [b]bin64[/b] folder. Optionally delete [b]PrivateStorageAnywhere.log[/b] if present.
+
+[line]
+
+[size=3][b]Changelog[/b][/size]
+
+[b]v1.2.0[/b]
+[list]
+[*]New: Localized warehouse titles — automatically matches game language (14 languages)
+[*]New: Top title now set correctly via CSS tree scan
+[*]New: Native PS5/PS4 controller support via HID Raw Input (DualSense, DualSense Edge, DualShock 4)
+[*]New: Configurable PSButton (Circle, Triangle, Square, Cross, L1, R1, L3, R3, Share, Options, Touchpad, PS, Mute)
+[*]New: Deferred close on button release to prevent dodge roll
+[*]New: Game-initiated close detection — properly restores mode bytes and cursor
+[*]Includes all v1.1.2 improvements
+[/list]
+
+[b]v1.1.2[/b]
+[list]
+[*]Fixed: Auto-capture now identifies warehouse controller by vtable instead of panelId (compatible with UI-mods like "No Letterbox" that change panel registration order)
+[*]Fixed: PanelId resolved dynamically from the warehouse handler object (no longer hardcoded)
+[*]Improved: FindFunctionStart now recognizes INT3 padding (0xCC) as function boundary
+[*]Improved: FindFunctionStart supports additional prolog patterns for better update resilience
+[*]Improved: Hook installation aborts safely if RIP-relative instructions detected (prevents corruption on game updates)
+[*]Improved: Mode byte access protected by spinlock to prevent race conditions
+[*]Changed: Removed ControllerEnabled toggle — controller works automatically when a ControllerButton is configured
+[/list]
+
+[b]v1.1.1[/b]
+[list]
+[*]New: Mouse cursor now appears automatically when opening warehouse with keyboard
+[*]New: Cursor is hidden again when closing warehouse
+[*]Changed: ESC close now uses the same PostMessage path as all other triggers
+[/list]
+
+[b]v1.1[/b]
+[list]
+[*]Fixed: CanShow hook now correctly suppresses only competing store panels (IndulgenceView/BountyShop) while letting non-store UI work normally
+[*]Fixed: Removed unsafe brute-force SetTitle scan that could cause silent memory corruption
+[*]Fixed: SetTitle pattern now matches exact function start (off-by-one corrected)
+[*]Fixed: DLL unload now properly restores all game hooks (prevents use-after-free crashes)
+[*]Fixed: WndProc hook no longer falsely reports failure when previous WndProc was class-level
+[*]Fixed: B button on controller now always closes warehouse (like ESC on keyboard), no ControllerButton config needed
+[*]Improved: Function resolution now uses string cross-references instead of fragile byte patterns (survives game updates)
+[*]Improved: Pattern scans kept as fallback if string-xref fails
+[*]Improved: ModeSwitcher pattern scan now validates matches (was 9 matches, only 1 correct)
+[*]Changed: Bottom inventory label correctly set to "Private Storage" via verified offset
+[/list]
+
+[b]v1.0.0[/b]
+[list]
+[*]Initial release
+[*]Open Private Storage from anywhere with F6
+[*]ESC or F6 to close
+[*]Auto-capture via panel ID — no chest visit required
+[*]Pattern-scan based function detection (update-proof)
+[*]Safety system: blocked during cutscenes, minigames, and interactions
+[*]Controller support via XInput with optional modifier button
+[*]Keyboard modifier support (e.g. Shift+I)
+[*]INI hot-reload with F11
+[*]Configurable hotkey via INI file
+[/list]
+
+[line]
+
+[size=3][b]Also check out[/b][/size]
+
+[url=https://www.nexusmods.com/crimsondesert/mods/57][b]Quick Menu Hotkeys[/b][/url] — Direct keyboard and controller shortcuts for all game menus (Inventory, Quest Book, Skills, Map, and more). Fully compatible with Private Storage Anywhere — use Shift+I for storage and plain I for inventory.
+
+[line]

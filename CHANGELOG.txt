@@ -1,0 +1,49 @@
+Private Storage Anywhere — Changelog
+
+v1.2.0 (2026-04-01)
+- New: Localization — warehouse title now automatically matches the game language (14 languages: KR, EN, JP, RU, TR, ES, MX, FR, DE, IT, PL, BR, TW, CN)
+- New: Top title (handler+0x0E0) now set correctly via SetTitle — found live text setter node through CSS tree scan
+- New: Bottom label (handler+0x300) uses localized title instead of hardcoded English
+- New: Close warehouse with Circle button on PS5 DualSense / DualShock 4 controllers (HID Raw Input)
+- New: Registers for WM_INPUT HID GamePad + Joystick to receive controller data independently of game's input system
+- New: Supports DualSense (USB/BT), DualSense Edge, DualShock 4 v1/v2 (USB/BT) via Sony VID 0x054C detection
+- New: Deferred close — warehouse closes on Circle release (not press) to prevent dodge roll in gameplay
+- New: Configurable PSButton for PS5/PS4 controllers (Share, Options, Circle, Triangle, Square, Cross, L1, R1, L3, R3, Touchpad, PS, Mute, none)
+- New: Game-initiated close detection via +0x118 flag transition (1→0) — properly restores mode bytes and cursor
+- Includes all v1.1.2 improvements: vtable auto-capture, dynamic panelId, INT3 padding, RIP-relative detection, spinlock, pre-activation
+
+v1.1.2 (2026-03-31)
+- Fixed: Auto-capture now identifies warehouse controller by vtable instead of panelId (compatible with UI-mods like "No Letterbox" that change panel registration order)
+- Fixed: PanelId resolved dynamically from the warehouse handler object (no longer hardcoded 0x59)
+- Improved: FindFunctionStart now recognizes INT3 padding (0xCC) as function boundary (MSVC standard)
+- Improved: FindFunctionStart supports 3 additional prolog patterns (mov [rsp+8],rbx / push rbp;mov rbp,rsp / push rbp;sub rsp)
+- Improved: Hook installation aborts safely if RIP-relative instructions detected in first 14-15 bytes (prevents silent corruption on game updates)
+- Improved: Mode byte read/write protected by spinlock to prevent race condition between mod and game thread
+- Changed: Removed ControllerEnabled toggle — controller works automatically when a ControllerButton is configured
+
+v1.1.1 (2026-03-30)
+- New: Mouse cursor now appears automatically when opening warehouse with keyboard (vanilla hides it)
+- New: Cursor is hidden again when closing warehouse
+- Changed: ESC close now uses the same PostMessage path as all other triggers (consistent behavior)
+
+v1.1 (2026-03-30)
+- Fixed: CanShow hook now correctly suppresses only competing store panels (IndulgenceView/BountyShop) while letting non-store UI work normally
+- Fixed: Removed unsafe brute-force SetTitle scan that could cause silent memory corruption
+- Fixed: SetTitle pattern now matches exact function start (off-by-one corrected)
+- Fixed: DLL unload now properly restores all game hooks (prevents use-after-free crashes)
+- Fixed: WndProc hook no longer falsely reports failure when previous WndProc was class-level
+- Fixed: B button on controller now always closes warehouse (like ESC on keyboard), no ControllerButton config needed
+- Improved: Function resolution now uses string cross-references instead of fragile byte patterns (survives game updates)
+- Improved: Pattern scans kept as fallback if string-xref fails
+- Improved: ModeSwitcher pattern scan now validates matches (was 9 matches, only 1 correct)
+- Changed: Bottom inventory label correctly set to "Private Storage"
+- Known issue: Top header may still show previous NPC name (e.g. "Camp Provisions") — cosmetic only, items are correct
+
+v1.0.0 (2026-03-29)
+- Initial release
+- Open Private Storage from anywhere with F6
+- ESC or F6 to close
+- Auto-capture via panel ID — no chest visit required
+- Pattern-scan based function detection (update-proof)
+- Safety system: blocked during cutscenes, minigames, and interactions
+- Configurable hotkey via INI file
