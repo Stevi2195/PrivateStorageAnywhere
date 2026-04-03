@@ -45,12 +45,6 @@ static volatile LONG g_canShowSeen118 = 0;  // set to 1 once +0x118 has been see
 static volatile LONG g_warehousePanelId = 0x0059;  // default, verified dynamically at runtime
 static const char* WAREHOUSE_INIT_STRING = "Character,Focus,True;CampWareHouse,Focus,True";
 
-// Sub-dialog detection offsets (from Ghidra analysis of warehouse handler)
-// handler+0x330 = confirm modal (e.g. move-to-vehicle/camp)
-// handler+0x338 = counting modal (quantity dialog)
-static const int MODAL_OFFSETS[] = { 0x330, 0x338 };
-static const int MODAL_OFFSET_COUNT = 2;
-
 // Saved mode bytes for restore on close
 static uint8_t g_savedModes[7] = {};
 static uint8_t g_savedSubtypes[15] = {};
@@ -60,63 +54,8 @@ static volatile LONG g_modeSwitchByMod = 0;  // 1 when WE call fnMode, 0 otherwi
 static volatile ULONGLONG g_openTimestamp = 0;  // GetTickCount64 at warehouse open (grace period)
 static volatile LONG64 g_lastModalPassed = 0;   // +0x240 value when ESC was last passed to game for a modal
 
-// Delayed bridge+8 check state
-static volatile LONG64 g_delayCheckChild = 0;   // child of parent+0x060
-static volatile LONG64 g_delayCheckNode060 = 0;  // parent+0x060 node itself
-
 // Forward declaration (defined later in Utilities section)
 static void Log(const char* fmt, ...);
-
-static DWORD WINAPI DelayedBridgeCheck(LPVOID /*param*/) {
-    DWORD delays[] = { 200, 300, 500, 1000, 2000 };
-    for (int i = 0; i < 5; i++) {
-        Sleep(delays[i]);
-        if (!InterlockedCompareExchange(&g_warehouseActive, 0, 0)) {
-            Log("  DELAY[%dms]: warehouse closed, aborting", delays[i]);
-            break;
-        }
-        uintptr_t child = (uintptr_t)InterlockedCompareExchange64(&g_delayCheckChild, 0, 0);
-        uintptr_t node060 = (uintptr_t)InterlockedCompareExchange64(&g_delayCheckNode060, 0, 0);
-        if (!child || !node060) break;
-        __try {
-            uintptr_t na8 = *(uintptr_t*)(node060 + 0xa8);
-            uintptr_t nb8 = 0;
-            if (na8 > 0x10000 && na8 < 0x7FFFFFFFFFFF)
-                nb8 = *(uintptr_t*)(na8 + 8);
-            uintptr_t ca8 = *(uintptr_t*)(child + 0xa8);
-            uintptr_t cb8 = 0;
-            if (ca8 > 0x10000 && ca8 < 0x7FFFFFFFFFFF)
-                cb8 = *(uintptr_t*)(ca8 + 8);
-            int32_t c38 = *(int32_t*)(child + 0x38);
-            uintptr_t cp30 = *(uintptr_t*)(child + 0x30);
-            uintptr_t gc0b8 = 0, gc1b8 = 0;
-            if (c38 >= 1 && cp30 > 0x10000 && cp30 < 0x7FFFFFFFFFFF) {
-                uintptr_t gc0 = *(uintptr_t*)cp30;
-                if (gc0 > 0x10000 && gc0 < 0x7FFFFFFFFFFF) {
-                    uintptr_t ga8 = *(uintptr_t*)(gc0 + 0xa8);
-                    if (ga8 > 0x10000 && ga8 < 0x7FFFFFFFFFFF)
-                        gc0b8 = *(uintptr_t*)(ga8 + 8);
-                }
-                if (c38 >= 2) {
-                    uintptr_t gc1 = *(uintptr_t*)(cp30 + 8);
-                    if (gc1 > 0x10000 && gc1 < 0x7FFFFFFFFFFF) {
-                        uintptr_t ga8 = *(uintptr_t*)(gc1 + 0xa8);
-                        if (ga8 > 0x10000 && ga8 < 0x7FFFFFFFFFFF)
-                            gc1b8 = *(uintptr_t*)(ga8 + 8);
-                    }
-                }
-            }
-            Log("  DELAY[%dms]: node.b8=%p child.b8=%p gc0.b8=%p gc1.b8=%p",
-                delays[i], (void*)nb8, (void*)cb8, (void*)gc0b8, (void*)gc1b8);
-            if (nb8 || cb8 || gc0b8 || gc1b8)
-                Log("  DELAY[%dms]: *** BRIDGE+8 APPEARED! ***", delays[i]);
-        } __except(EXCEPTION_EXECUTE_HANDLER) {
-            Log("  DELAY[%dms]: EXCEPTION", delays[i]);
-            break;
-        }
-    }
-    return 0;
-}
 
 // Hook cleanup: saved original bytes for safe DLL unload
 static uint8_t g_origHandlerBytes[15] = {};
@@ -411,43 +350,6 @@ static bool SetTitleOnRenderer(uintptr_t node, const char* utf8Title, int depth)
     return false;
 }
 
-// Check if the warehouse handler has an active sub-dialog (counting modal, confirm dialog, etc.)
-// These dialogs are stored at handler+0x330 and handler+0x338.
-// Each points to a modal object with a back-reference at modal+0x20 → handler.
-static bool IsSubDialogActive() {
-    uintptr_t handler = (uintptr_t)InterlockedCompareExchange64(&g_handlerThis, 0, 0);
-    if (!handler) return false;
-    __try {
-        // Known offsets first
-        for (int i = 0; i < MODAL_OFFSET_COUNT; i++) {
-            uintptr_t modal = *(uintptr_t*)(handler + MODAL_OFFSETS[i]);
-            if (modal > 0x10000 && modal < 0x7FFFFFFFFFFF) {
-                uintptr_t backRef = *(uintptr_t*)(modal + 0x20);
-                if (backRef == handler) {
-                    Log("  IsSubDialogActive: YES at handler+0x%X modal=%p", MODAL_OFFSETS[i], (void*)modal);
-                    return true;
-                }
-            }
-        }
-        // Diagnostic: dump a wider range of handler offsets to find modal pointer
-        // Log non-null pointer-like values from handler+0x300..+0x400
-        Log("  IsSubDialogActive: scanning handler=%p +0x300..+0x400:", (void*)handler);
-        for (int off = 0x300; off < 0x400; off += 8) {
-            uintptr_t val = *(uintptr_t*)(handler + off);
-            if (val > 0x10000 && val < 0x7FFFFFFFFFFF) {
-                // Check back-reference at val+0x20
-                uintptr_t br = 0;
-                __try { br = *(uintptr_t*)(val + 0x20); } __except(EXCEPTION_EXECUTE_HANDLER) {}
-                Log("    +0x%03X = %p (backref+0x20=%p %s)",
-                    off, (void*)val, (void*)br, (br == handler) ? "MATCH!" : "");
-            }
-        }
-    } __except(EXCEPTION_EXECUTE_HANDLER) {
-        Log("  IsSubDialogActive: EXCEPTION");
-    }
-    return false;
-}
-
 // Check if a NEW sub-dialog (quantity/confirm) is visible that we haven't dismissed yet.
 // The ModalMessageView at handler+0x240 changes address each time a dialog opens.
 // After we pass ESC to the game once (dismissing it), we record the address so that
@@ -637,69 +539,6 @@ extern "C" void __fastcall CaptureOnHandler(void* thisPtr, void* rdx) {
                 if (realId != 0xFFFF && realId != 0) {
                     InterlockedExchange(&g_warehousePanelId, (LONG)realId);
                     Log("  Dynamic panelId: 0x%04X", realId);
-                }
-            }
-        } __except(EXCEPTION_EXECUTE_HANDLER) {}
-    }
-
-    // Log game-driven handler calls (diagnostics, not used for title fix anymore)
-    if (!InterlockedCompareExchange(&g_warehouseActive, 0, 0)) {
-        __try {
-            uint8_t* cmd = (uint8_t*)rdx;
-            uint8_t cmdByte = cmd ? cmd[0] : 0xFF;
-            if (g_handlerHitCount <= 20 || cmdByte == 0x15 || cmdByte == 0x0E) {
-                Log("  Handler(game): cmd=0x%02X hitCount=%ld",
-                    cmdByte, (long)g_handlerHitCount);
-            }
-            // After game-driven 0x0E, dump the NPC key list to see what keys
-            // produce "Privates Lager"
-            if (cmdByte == 0x0E) {
-                uintptr_t handler = (uintptr_t)thisPtr;
-                uintptr_t parent = *(uintptr_t*)(handler + 8);
-                if (parent > 0x10000) {
-                    uint16_t idx92 = *(uint16_t*)(parent + 0x92);
-                    if (idx92 != 0xFFFF) {
-                        uintptr_t p50 = *(uintptr_t*)(parent + 0x50);
-                        uintptr_t pb0 = *(uintptr_t*)(p50 + 0xb0);
-                        uintptr_t pd8 = *(uintptr_t*)(pb0 + 0xd8);
-                        uint32_t cap = *(uint32_t*)(pd8 + 8);
-                        if ((uint32_t)idx92 < cap) {
-                            uintptr_t ns = *(uintptr_t*)(*(uintptr_t*)pd8 + (uintptr_t)idx92 * 8);
-                            if (ns > 0x10000) {
-                                uintptr_t a8 = *(uintptr_t*)(ns + 0xa8);
-                                uintptr_t vo = (a8 > 0x10000) ? *(uintptr_t*)(a8 + 0x10) : 0;
-                                if (vo > 0x10000) {
-                                    uintptr_t ine = *(uintptr_t*)(vo + 0x120);
-                                    if (ine > 0x10000) {
-                                        uintptr_t lsp = *(uintptr_t*)(ine + 0x150);
-                                        if (lsp > 0x10000) {
-                                            uint32_t cnt = *(uint32_t*)(lsp + 8);
-                                            uintptr_t dp = *(uintptr_t*)lsp;
-                                            Log("  0x0E post: innerNpc=%p list count=%u", (void*)ine, cnt);
-                                            uintptr_t gObj = *(uintptr_t*)(g_gameBase + 0x5BBAED8);
-                                            uintptr_t sArr = (gObj > 0x10000) ? *(uintptr_t*)(gObj + 0x58) : 0;
-                                            if (dp > 0x10000 && cnt > 0 && cnt < 100) {
-                                                for (uint32_t i = 0; i < cnt && i < 10; i++) {
-                                                    int k = *(int*)(dp + i * 4);
-                                                    char* nm = "";
-                                                    if (sArr > 0x10000) {
-                                                        char* n2 = *(char**)(sArr + (uint32_t)k * 0x10);
-                                                        if (n2 > (char*)0x10000 && n2 < (char*)0x7FFFFFFFFFFF)
-                                                            nm = n2;
-                                                    }
-                                                    Log("  0x0E list[%u] key=%d => [%.60s]", i, k, nm);
-                                                }
-                                            }
-                                            // Also check handler+0x110 (NPC ID set by base handler)
-                                            uintptr_t npcId110 = *(uintptr_t*)(handler + 0x110);
-                                            Log("  0x0E handler+0x110=%llu (0x%llX)",
-                                                (unsigned long long)npcId110, (unsigned long long)npcId110);
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
                 }
             }
         } __except(EXCEPTION_EXECUTE_HANDLER) {}
