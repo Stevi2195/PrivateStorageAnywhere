@@ -1,5 +1,9 @@
 Private Storage Anywhere — Changelog
 
+v1.2.2 (2026-04-03)
+- Improved: Modal dialog detection (quantity/confirm dialogs) is now update-proof — the handler struct offset is resolved dynamically at runtime via string-xref + code pattern scan instead of being hardcoded
+- Technical: Finds "ModalMessageView" string → LEA xref near warehouse class → MOV [REG+disp32] store with back-pointer validation → extracts struct offset automatically
+
 v1.2.1 (2026-04-03)
 - Fixed: ESC now correctly closes the quantity dialog ("How many do you want to move?") before closing the warehouse — previously ESC closed the warehouse while the dialog stayed visible
 - Fixed: Window detection now uses the exact game window class name instead of blind enumeration, preventing WndProc hook failures (error=1400) caused by overlays

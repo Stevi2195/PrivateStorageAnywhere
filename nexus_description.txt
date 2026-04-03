@@ -111,6 +111,11 @@ Delete [b]PrivateStorageAnywhere.asi[/b] and [b]PrivateStorageAnywhere.ini[/b] f
 
 [size=3][b]Changelog[/b][/size]
 
+[b]v1.2.2[/b]
+[list]
+[*]Improved: Modal dialog detection (quantity/confirm dialogs) is now update-proof — struct offset resolved dynamically at runtime instead of hardcoded
+[/list]
+
 [b]v1.2.1[/b]
 [list]
 [*]Fixed: ESC now correctly closes the quantity dialog before closing the warehouse — previously the warehouse closed while the dialog stayed visible

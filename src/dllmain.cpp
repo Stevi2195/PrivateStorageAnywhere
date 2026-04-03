@@ -6,7 +6,7 @@
 #include <string>
 
 // ============================================================
-//  Private Storage Anywhere v1.2.0
+//  Private Storage Anywhere v1.2.2
 //
 //  Opens the Camp Warehouse (Private Storage) from anywhere
 //  with a hotkey (default F6) or controller button.
@@ -32,6 +32,7 @@ static uintptr_t g_fnSetTitleDirect = 0;  // FUN_1434159c0: UTF-8 aware wchar te
 static uintptr_t g_fnSetCursorVisible = 0;  // thunk_FUN_1524be5a0(cursorObj, show, force)
 static uintptr_t g_warehouseVtableEntry = 0;  // vtable address containing handler — used for auto-capture verification
 static uintptr_t g_warehouseVtableStart = 0;  // vtable start of warehouse class — set on first successful capture
+static uint32_t  g_modalDialogOff = 0;     // handler+N stores active dialog pointer (0x338 in current build, was 0x240)
 
 // Captured game state (accessed from multiple threads via Interlocked ops)
 static volatile LONG64 g_mainChar = 0;
@@ -52,7 +53,7 @@ static bool g_cursorShownByMod = false;
 static volatile LONG g_modeByteLock = 0;  // Spinlock for mode byte read/write
 static volatile LONG g_modeSwitchByMod = 0;  // 1 when WE call fnMode, 0 otherwise
 static volatile ULONGLONG g_openTimestamp = 0;  // GetTickCount64 at warehouse open (grace period)
-static volatile LONG64 g_lastModalPassed = 0;   // +0x240 value when ESC was last passed to game for a modal
+static volatile LONG64 g_lastModalPassed = 0;   // ModalMessageView addr when ESC was last passed to game for a modal
 
 // Forward declaration (defined later in Utilities section)
 static void Log(const char* fmt, ...);
@@ -350,15 +351,24 @@ static bool SetTitleOnRenderer(uintptr_t node, const char* utf8Title, int depth)
     return false;
 }
 
+// Read the active modal dialog pointer from the handler struct.
+// Offset found dynamically from the move-item handler's code at init.
+static uintptr_t ReadModalDialog(uintptr_t handler) {
+    if (!g_modalDialogOff) return 0;
+    __try {
+        return *(uintptr_t*)(handler + g_modalDialogOff);
+    } __except(EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+
 // Check if a NEW sub-dialog (quantity/confirm) is visible that we haven't dismissed yet.
-// The ModalMessageView at handler+0x240 changes address each time a dialog opens.
+// The ModalMessageView address changes each time a dialog opens.
 // After we pass ESC to the game once (dismissing it), we record the address so that
 // further ESC presses don't keep passing through (children cleanup is async).
 static bool IsNewModalDialogVisible() {
     uintptr_t handler = (uintptr_t)InterlockedCompareExchange64(&g_handlerThis, 0, 0);
     if (!handler) return false;
     __try {
-        uintptr_t modalView = *(uintptr_t*)(handler + 0x240);
+        uintptr_t modalView = ReadModalDialog(handler);
         if (modalView > 0x10000 && modalView < 0x7FFFFFFFFFFF) {
             uint32_t childCount = *(uint32_t*)(modalView + 0x30);
             if (childCount == 0) {
@@ -1026,7 +1036,7 @@ static LRESULT CALLBACK HookedWndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             uintptr_t handler = (uintptr_t)InterlockedCompareExchange64(&g_handlerThis, 0, 0);
             if (handler) {
                 __try {
-                    uintptr_t mv = *(uintptr_t*)(handler + 0x240);
+                    uintptr_t mv = ReadModalDialog(handler);
                     InterlockedExchange64(&g_lastModalPassed, (LONG64)mv);
                 } __except(EXCEPTION_EXECUTE_HANDLER) {}
             }
@@ -1306,6 +1316,55 @@ static bool ResolveAddresses() {
     Log("CanShow:      %s base+0x%llX (vtable)", g_fnCanShow?"OK":"FAIL",
         g_fnCanShow?(unsigned long long)(g_fnCanShow-g_gameBase):0);
 
+    // Step 4b: Find modal dialog offset in handler struct (update-proof modal detection)
+    // Multiple handler functions find ModalMessageView via findChildByName, create a dialog,
+    // and store it at handler+N. The store pattern is: MOV [REG+disp32], RAX; TEST RAX, RAX
+    // We iterate LEA xrefs to "ModalMessageView" and find the one with this store pattern.
+    {
+        uintptr_t strMV = FindString("ModalMessageView");
+        if (strMV) {
+            uintptr_t leaModal = 0;
+            uintptr_t searchFrom = g_fnHandler > 0x10000 ? g_fnHandler - 0x10000 : 0;
+            while ((leaModal = FindLEA(strMV, searchFrom)) != 0) {
+                // Only consider LEAs near the warehouse handler (same class)
+                if (g_fnHandler && leaModal > g_fnHandler + 0x10000) break;
+                uint8_t* p = (uint8_t*)leaModal;
+                for (int i = 0; i < 0xC00 && !g_modalDialogOff; i++) {
+                    uint8_t* q = p + i;
+                    // Match: REX.W MOV [REG+disp32], RAX
+                    if ((q[0] & 0xFE) != 0x48 || q[1] != 0x89) continue;
+                    uint8_t modrm = q[2];
+                    if ((modrm & 0xF8) != 0x80) continue;  // mod=10, reg=000 (RAX src)
+                    int dispOff = 3;
+                    if ((modrm & 0x07) == 0x04) dispOff = 4;  // SIB byte present
+                    uint32_t disp = *(uint32_t*)(q + dispOff);
+                    if (disp < 0x100 || disp >= 0x1000) continue;
+                    // Validate: TEST RAX,RAX (48 85 C0) within 16 bytes, then JZ, then MOV [RAX+0x20],REG
+                    uint8_t* a = q + dispOff + 4;
+                    bool found = false;
+                    for (int t = 0; t < 16 && !found; t++) {
+                        if (a[t] != 0x48 || a[t+1] != 0x85 || a[t+2] != 0xC0) continue;
+                        uint8_t* jz = a + t + 3;
+                        int jzLen = 0;
+                        if (jz[0] == 0x74) jzLen = 2;
+                        else if (jz[0] == 0x0F && jz[1] == 0x84) jzLen = 6;
+                        if (!jzLen) continue;
+                        uint8_t* bp = jz + jzLen;
+                        if ((bp[0] & 0xFC) == 0x48 && bp[1] == 0x89 &&
+                            (bp[2] & 0xC7) == 0x40 && bp[3] == 0x20) {
+                            found = true;
+                        }
+                    }
+                    if (found) g_modalDialogOff = disp;
+                }
+                if (g_modalDialogOff) break;
+                searchFrom = leaModal + 1;
+            }
+        }
+    }
+    Log("ModalDlgOff:  %s offset=0x%X (string-xref → MOV [REG+N])",
+        g_modalDialogOff?"OK":"FAIL", g_modalDialogOff);
+
     // Step 5: ModeSwitcher — pattern scan + post-validation (no string anchor available)
     static const uint8_t pMS[] = {
         0x48,0x89,0x5C,0x24,0x08, 0x48,0x89,0x6C,0x24,0x10,
@@ -1471,7 +1530,7 @@ static DWORD WINAPI ModThread(LPVOID) {
     if(!g_enabled)return 0;
     if(g_debugLog){std::string lp=ip.substr(0,ip.rfind('.'))+".log";g_logFile=fopen(lp.c_str(),"w");}
 
-    Log("=== Private Storage Anywhere v1.2.0 ===");
+    Log("=== Private Storage Anywhere v1.2.2 ===");
     {char cls[256]={};char ttl[256]={};GetClassNameA(g_gameWindow,cls,256);GetWindowTextA(g_gameWindow,ttl,256);
     Log("Game window: class='%s' title='%s'",cls,ttl);}
     g_gameBase=(uintptr_t)GetModuleHandleA("CrimsonDesert.exe");
