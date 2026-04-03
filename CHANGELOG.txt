@@ -2,7 +2,6 @@ Private Storage Anywhere — Changelog
 
 v1.2.1 (2026-04-03)
 - Fixed: ESC now correctly closes the quantity dialog ("How many do you want to move?") before closing the warehouse — previously ESC closed the warehouse while the dialog stayed visible
-- Applies to ESC, Circle (PS5/PS4), PSButton, and B button (XInput)
 - Fixed: Window detection now uses the exact game window class name instead of blind enumeration, preventing WndProc hook failures (error=1400) caused by overlays
 - Added: Game window class/title logged on startup for easier troubleshooting
 
