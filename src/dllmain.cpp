@@ -28,6 +28,7 @@ static char g_iniPath[MAX_PATH] = {};
 static uintptr_t g_fnHandler = 0;
 static uintptr_t g_fnModeSwitcher = 0, g_fnCanShow = 0, g_fnSetInventory = 0;
 static uintptr_t g_fnSetTitle = 0;
+static uintptr_t g_fnSetTitleDirect = 0;  // FUN_1434159c0: UTF-8 aware wchar text setter (bypasses bridge check)
 static uintptr_t g_fnSetCursorVisible = 0;  // thunk_FUN_1524be5a0(cursorObj, show, force)
 static uintptr_t g_warehouseVtableEntry = 0;  // vtable address containing handler — used for auto-capture verification
 static uintptr_t g_warehouseVtableStart = 0;  // vtable start of warehouse class — set on first successful capture
@@ -44,6 +45,12 @@ static volatile LONG g_canShowSeen118 = 0;  // set to 1 once +0x118 has been see
 static volatile LONG g_warehousePanelId = 0x0059;  // default, verified dynamically at runtime
 static const char* WAREHOUSE_INIT_STRING = "Character,Focus,True;CampWareHouse,Focus,True";
 
+// Sub-dialog detection offsets (from Ghidra analysis of warehouse handler)
+// handler+0x330 = confirm modal (e.g. move-to-vehicle/camp)
+// handler+0x338 = counting modal (quantity dialog)
+static const int MODAL_OFFSETS[] = { 0x330, 0x338 };
+static const int MODAL_OFFSET_COUNT = 2;
+
 // Saved mode bytes for restore on close
 static uint8_t g_savedModes[7] = {};
 static uint8_t g_savedSubtypes[15] = {};
@@ -51,6 +58,7 @@ static bool g_cursorShownByMod = false;
 static volatile LONG g_modeByteLock = 0;  // Spinlock for mode byte read/write
 static volatile LONG g_modeSwitchByMod = 0;  // 1 when WE call fnMode, 0 otherwise
 static volatile ULONGLONG g_openTimestamp = 0;  // GetTickCount64 at warehouse open (grace period)
+static volatile LONG64 g_lastModalPassed = 0;   // +0x240 value when ESC was last passed to game for a modal
 
 // Delayed bridge+8 check state
 static volatile LONG64 g_delayCheckChild = 0;   // child of parent+0x060
@@ -262,11 +270,64 @@ static void Log(const char* fmt, ...) {
     va_end(a);
 }
 
+// CRC32 of a file (for detecting modded game files in logs)
+static uint32_t FileCRC32(const char* path) {
+    static const uint32_t table[256] = {
+        0x00000000,0x77073096,0xEE0E612C,0x990951BA,0x076DC419,0x706AF48F,0xE963A535,0x9E6495A3,
+        0x0EDB8832,0x79DCB8A4,0xE0D5E91B,0x97D2D988,0x09B64C2B,0x7EB17CBF,0xE7B82D09,0x90BF1D9F,
+        0x1DB71064,0x6AB020F2,0xF3B97148,0x84BE41DE,0x1ADAD47D,0x6DDDE4EB,0xF4D4B551,0x83D385C7,
+        0x136C9856,0x646BA8C0,0xFD62F97A,0x8A65C9EC,0x14015C4F,0x63066CD9,0xFA0F3D63,0x8D080DF5,
+        0x3B6E20C8,0x4C69105E,0xD56041E4,0xA2677172,0x3C03E4D1,0x4B04D447,0xD20D85FD,0xA50AB56B,
+        0x35B5A8FA,0x42B2986C,0xDBBBC9D6,0xACBCF940,0x32D86CE3,0x45DF5C75,0xDCD60DCF,0xABD13D59,
+        0x26D930AC,0x51DE003A,0xC8D75180,0xBFD06116,0x21B4F0B5,0x56B3C423,0xCFBA9599,0xB8BDA50F,
+        0x2802B89E,0x5F058808,0xC60CD9B2,0xB10BE924,0x2F6F7C87,0x58684C11,0xC1611DAB,0xB6662D3D,
+        0x76DC4190,0x01DB7106,0x98D220BC,0xEFD5102A,0x71B18589,0x06B6B51F,0x9FBFE4A5,0xE8B8D433,
+        0x7807C9A2,0x0F00F934,0x9609A88E,0xE10E9818,0x7F6A0D6B,0x086D3D2D,0x91646C97,0xE6635C01,
+        0x6B6B51F4,0x1C6C6162,0x856530D8,0xF262004E,0x6C0695ED,0x1B01A57B,0x8208F4C1,0xF50FC457,
+        0x65B0D9C6,0x12B7E950,0x8BBEB8EA,0xFCB9887C,0x62DD1DDF,0x15DA2D49,0x8CD37CF3,0xFBD44C65,
+        0x4DB26158,0x3AB551CE,0xA3BC0074,0xD4BB30E2,0x4ADFA541,0x3DD895D7,0xA4D1C46D,0xD3D6F4FB,
+        0x4369E96A,0x346ED9FC,0xAD678846,0xDA60B8D0,0x44042D73,0x33031DE5,0xAA0A4C5F,0xDD0D7822,
+        0x5005713C,0x270241AA,0xBE0B1010,0xC90C2086,0x5768B525,0x206F85B3,0xB966D409,0xCE61E49F,
+        0x5EDEF90E,0x29D9C998,0xB0D09822,0xC7D7A8B4,0x59B33D17,0x2EB40D81,0xB7BD5C3B,0xC0BA6CAD,
+        0xEDB88320,0x9ABFB3B6,0x03B6E20C,0x74B1D29A,0xEAD54739,0x9DD277AF,0x04DB2615,0x73DC1683,
+        0xE3630B12,0x94643B84,0x0D6D6A3E,0x7A6A5AA8,0xE40ECF0B,0x9309FF9D,0x0A00AE27,0x7D079EB1,
+        0xF00F9344,0x8708A3D2,0x1E01F268,0x6906C2FE,0xF762575D,0x806567CB,0x196C3671,0x6E6B06E7,
+        0xFED41B76,0x89D32BE0,0x10DA7A5A,0x67DD4ACC,0xF9B9DF6F,0x8EBEEFF9,0x17B7BE43,0x60B08ED5,
+        0xD6D6A3E8,0xA1D1937E,0x38D8C2C4,0x4FDFF252,0xD1BB67F1,0xA6BC5767,0x3FB506DD,0x48B2364B,
+        0xD80D2BDA,0xAF0A1B4C,0x36034AF6,0x41047A60,0xDF60EFC3,0xA867DF55,0x316E8EEF,0x4669BE79,
+        0xCB61B38C,0xBC66831A,0x256FD2A0,0x5268E236,0xCC0C7795,0xBB0B4703,0x220216B9,0x5505262F,
+        0xC5BA3BBE,0xB2BD0B28,0x2BB45A92,0x5CB36A04,0xC2D7FFA7,0xB5D0CF31,0x2CD99E8B,0x5BDEAE1D,
+        0x9B64C2B0,0xEC63F226,0x756AA39C,0x026D930A,0x9C0906A9,0xEB0E363F,0x72076785,0x05005713,
+        0x95BF4A82,0xE2B87A14,0x7BB12BAE,0x0CB61B38,0x92D28E9B,0xE5D5BE0D,0x7CDCEFB7,0x0BDBDF21,
+        0x86D3D2D4,0xF1D4E242,0x68DDB3F6,0x1FDA836E,0x81BE16CD,0xF6B9265B,0x6FB077E1,0x18B74777,
+        0x88085AE6,0xFF0F6B70,0x66063BCA,0x11010B5C,0x8F659EFF,0xF862AE69,0x616BFFD3,0x166CCF45,
+        0xA00AE278,0xD70DD2EE,0x4E048354,0x3903B3C2,0xA7672661,0xD06016F7,0x4969474D,0x3E6E77DB,
+        0xAED16A4A,0xD9D65ADC,0x40DF0B66,0x37D83BF0,0xA9BCAE53,0xDEBB9EC5,0x47B2CF7F,0x30B5FFE9,
+        0xBDBDF21C,0xCABAC28A,0x53B39330,0x24B4A3A6,0xBAD03605,0xCDD706FF,0x54DE5729,0x23D967BF,
+        0xB3667A2E,0xC4614AB8,0x5D681B02,0x2A6F2B94,0xB40BBE37,0xC30C8EA1,0x5A05DF1B,0x2D02EF8D
+    };
+    FILE* f = fopen(path, "rb");
+    if (!f) return 0;
+    uint32_t crc = 0xFFFFFFFF;
+    uint8_t buf[4096];
+    size_t n;
+    while ((n = fread(buf, 1, sizeof(buf), f)) > 0)
+        for (size_t i = 0; i < n; i++)
+            crc = table[(crc ^ buf[i]) & 0xFF] ^ (crc >> 8);
+    fclose(f);
+    return crc ^ 0xFFFFFFFF;
+}
+
 // ============================================================
 //  Localization — read game language and return translated title
 //  Language byte at gameBase+0x599772D (DAT_14599772d)
 //  Set by FUN_1404864a0 from Steam API language detection.
-//  SetTitle's internal char→wchar uses UTF-8 decoding (FUN_141010f90).
+//  SetTitle (FUN_1433ab4b0) stores text as raw char bytes in nodes.
+//  Only the bridge/redirect path (FUN_1434159c0 via node+0xA8)
+//  properly decodes UTF-8 to wchar_t (via FUN_141010f90).
+//  When no bridge exists, the renderer zero-extends each byte,
+//  garbling multi-byte UTF-8 (Korean/CJK/Cyrillic/accented chars).
+//  Fix: after SetTitle, call SetTitleDirect on node renderers.
 // ============================================================
 static int GetGameLanguage() {
     if (!g_gameBase) return 1; // EN
@@ -280,23 +341,140 @@ static int GetGameLanguage() {
 }
 
 static const char* GetWarehouseTitle() {
+    // NOTE: Do NOT use u8"" prefix with \x hex escapes!
+    // MSVC /utf-8 + u8"" double-encodes bytes > 0x7F (\xEA → C3 AA instead of EA).
+    // Plain "" with \x escapes produces the raw bytes we need.
     switch (GetGameLanguage()) {
-        case  0: return u8"\xEA\xB0\x9C\xEC\x9D\xB8 \xEC\xB0\xBD\xEA\xB3\xA0";   // KR: 개인 창고
+        case  0: return "\xEA\xB0\x9C\xEC\x9D\xB8 \xEC\xB0\xBD\xEA\xB3\xA0";     // KR: 개인 창고
         case  1: return "Private Storage";                                            // EN
-        case  2: return u8"\xE5\x80\x8B\xE4\xBA\xBA\xE5\x80\x89\xE5\xBA\xAB";     // JP: 個人倉庫
-        case  3: return u8"\xD0\x9B\xD0\xB8\xD1\x87\xD0\xBD\xD0\xBE\xD0\xB5 \xD1\x85\xD1\x80\xD0\xB0\xD0\xBD\xD0\xB8\xD0\xBB\xD0\xB8\xD1\x89\xD0\xB5"; // RU
-        case  4: return u8"\xC3\x96zel Depo";                                        // TR: Özel Depo
-        case  5: return u8"Almac\xC3\xA9n Privado";                                  // ES: Almacén Privado
-        case  6: return u8"Almac\xC3\xA9n Privado";                                  // MX: Almacén Privado
-        case  7: return u8"Entrep\xC3\xB4t Priv\xC3\xA9";                           // FR: Entrepôt Privé
+        case  2: return "\xE5\x80\x8B\xE4\xBA\xBA\xE5\x80\x89\xE5\xBA\xAB";       // JP: 個人倉庫
+        case  3: return "\xD0\x9B\xD0\xB8\xD1\x87\xD0\xBD\xD0\xBE\xD0\xB5 \xD1\x85\xD1\x80\xD0\xB0\xD0\xBD\xD0\xB8\xD0\xBB\xD0\xB8\xD1\x89\xD0\xB5"; // RU
+        case  4: return "\xC3\x96zel Depo";                                          // TR: Özel Depo
+        case  5: return "Almac\xC3\xA9n Privado";                                    // ES: Almacén Privado
+        case  6: return "Almac\xC3\xA9n Privado";                                    // MX: Almacén Privado
+        case  7: return "Entrep\xC3\xB4t Priv\xC3\xA9";                             // FR: Entrepôt Privé
         case  8: return "Privates Lager";                                             // DE
         case  9: return "Magazzino Privato";                                          // IT
         case 10: return "Prywatny Magazyn";                                           // PL
-        case 11: return u8"Armaz\xC3\xA9m Privado";                                  // BR: Armazém Privado
-        case 12: return u8"\xE5\x80\x8B\xE4\xBA\xBA\xE5\x80\x89\xE5\xBA\xAB";     // TW: 個人倉庫
-        case 13: return u8"\xE4\xB8\xAA\xE4\xBA\xBA\xE4\xBB\x93\xE5\xBA\x93";     // CN: 个人仓库
+        case 11: return "Armaz\xC3\xA9m Privado";                                    // BR: Armazém Privado
+        case 12: return "\xE5\x80\x8B\xE4\xBA\xBA\xE5\x80\x89\xE5\xBA\xAB";       // TW: 個人倉庫
+        case 13: return "\xE4\xB8\xAA\xE4\xBA\xBA\xE4\xBB\x93\xE5\xBA\x93";       // CN: 个人仓库
         default: return "Private Storage";
     }
+}
+
+// ============================================================
+//  UTF-8 title fix — call SetTitleDirect (FUN_1434159c0) on
+//  renderers found via bridge chain for proper UTF-8→wchar_t.
+// ============================================================
+static bool IsAscii(const char* s) {
+    for (; *s; s++)
+        if ((unsigned char)*s > 0x7F) return false;
+    return true;
+}
+
+// Walk a UI node tree and call SetTitleDirect on any renderer found
+// through the bridge chain: node+0xA8 → bridge → *(bridge+8) → renderer.
+static bool SetTitleOnRenderer(uintptr_t node, const char* utf8Title, int depth) {
+    if (!node || depth > 5) return false;
+    __try {
+        uintptr_t bridge = *(uintptr_t*)(node + 0xA8);
+        if (bridge > 0x10000 && bridge < 0x7FFFFFFFFFFF) {
+            uintptr_t renderer = *(uintptr_t*)(bridge + 8);
+            if (renderer > 0x10000 && renderer < 0x7FFFFFFFFFFF) {
+                if (g_fnSetTitleDirect) {
+                    typedef uint8_t (__fastcall *PFN_STD)(uintptr_t, const char*, uint64_t, uint64_t);
+                    ((PFN_STD)g_fnSetTitleDirect)(renderer, utf8Title, 0, 0);
+                    Log("    SetTitleOnRenderer: OK depth=%d renderer=0x%llX",
+                        depth, (unsigned long long)renderer);
+                    return true;
+                }
+            }
+        }
+        // Recurse into children
+        int32_t childCount = *(int32_t*)(node + 0x38);
+        if (childCount > 0 && childCount < 100) {
+            uintptr_t childArr = *(uintptr_t*)(node + 0x30);
+            if (childArr > 0x10000 && childArr < 0x7FFFFFFFFFFF) {
+                for (int i = 0; i < childCount; i++) {
+                    uintptr_t child = *(uintptr_t*)(childArr + i * 8);
+                    if (child > 0x10000 && child < 0x7FFFFFFFFFFF) {
+                        if (SetTitleOnRenderer(child, utf8Title, depth + 1))
+                            return true;
+                    }
+                }
+            }
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        Log("    SetTitleOnRenderer: EXCEPTION depth=%d", depth);
+    }
+    return false;
+}
+
+// Check if the warehouse handler has an active sub-dialog (counting modal, confirm dialog, etc.)
+// These dialogs are stored at handler+0x330 and handler+0x338.
+// Each points to a modal object with a back-reference at modal+0x20 → handler.
+static bool IsSubDialogActive() {
+    uintptr_t handler = (uintptr_t)InterlockedCompareExchange64(&g_handlerThis, 0, 0);
+    if (!handler) return false;
+    __try {
+        // Known offsets first
+        for (int i = 0; i < MODAL_OFFSET_COUNT; i++) {
+            uintptr_t modal = *(uintptr_t*)(handler + MODAL_OFFSETS[i]);
+            if (modal > 0x10000 && modal < 0x7FFFFFFFFFFF) {
+                uintptr_t backRef = *(uintptr_t*)(modal + 0x20);
+                if (backRef == handler) {
+                    Log("  IsSubDialogActive: YES at handler+0x%X modal=%p", MODAL_OFFSETS[i], (void*)modal);
+                    return true;
+                }
+            }
+        }
+        // Diagnostic: dump a wider range of handler offsets to find modal pointer
+        // Log non-null pointer-like values from handler+0x300..+0x400
+        Log("  IsSubDialogActive: scanning handler=%p +0x300..+0x400:", (void*)handler);
+        for (int off = 0x300; off < 0x400; off += 8) {
+            uintptr_t val = *(uintptr_t*)(handler + off);
+            if (val > 0x10000 && val < 0x7FFFFFFFFFFF) {
+                // Check back-reference at val+0x20
+                uintptr_t br = 0;
+                __try { br = *(uintptr_t*)(val + 0x20); } __except(EXCEPTION_EXECUTE_HANDLER) {}
+                Log("    +0x%03X = %p (backref+0x20=%p %s)",
+                    off, (void*)val, (void*)br, (br == handler) ? "MATCH!" : "");
+            }
+        }
+    } __except(EXCEPTION_EXECUTE_HANDLER) {
+        Log("  IsSubDialogActive: EXCEPTION");
+    }
+    return false;
+}
+
+// Check if a NEW sub-dialog (quantity/confirm) is visible that we haven't dismissed yet.
+// The ModalMessageView at handler+0x240 changes address each time a dialog opens.
+// After we pass ESC to the game once (dismissing it), we record the address so that
+// further ESC presses don't keep passing through (children cleanup is async).
+static bool IsNewModalDialogVisible() {
+    uintptr_t handler = (uintptr_t)InterlockedCompareExchange64(&g_handlerThis, 0, 0);
+    if (!handler) return false;
+    __try {
+        uintptr_t modalView = *(uintptr_t*)(handler + 0x240);
+        if (modalView > 0x10000 && modalView < 0x7FFFFFFFFFFF) {
+            uint32_t childCount = *(uint32_t*)(modalView + 0x30);
+            if (childCount == 0) {
+                // Children cleaned up — clear tracking so next modal is detected fresh
+                InterlockedExchange64(&g_lastModalPassed, 0);
+                return false;
+            }
+            // children > 0: is this a modal we already passed ESC for?
+            uintptr_t lastPassed = (uintptr_t)InterlockedCompareExchange64(&g_lastModalPassed, 0, 0);
+            if (lastPassed == modalView) {
+                // Same modal view, already handled — async cleanup still pending
+                return false;
+            }
+            return true;  // New modal, not yet dismissed
+        }
+    } __except(EXCEPTION_EXECUTE_HANDLER) {}
+    InterlockedExchange64(&g_lastModalPassed, 0);
+    return false;
 }
 
 static DWORD ReadHexValue(const char* section, const char* key, DWORD defaultVal, const char* iniPath) {
@@ -815,6 +993,7 @@ static void TriggerWarehouse(bool fromKeyboard = false) {
         InterlockedExchange(&g_modeByteLock, 0);
 
         InterlockedExchange(&g_canShowSeen118, 0);
+        InterlockedExchange64(&g_lastModalPassed, 0);
         InterlockedExchange(&g_warehouseActive, 1);
         g_openTimestamp = GetTickCount64();
 
@@ -884,35 +1063,47 @@ static void TriggerWarehouse(bool fromKeyboard = false) {
 
         // Fix bottom inventory label using verified offset from Ghidra:
         // handler+0x300 = selector-warehouse-inventory-title (.cpp-ware-house-inventory-title)
-        // Verified: handler decompilation shows FUN_1433aadf0(handler+0x300, text) for SetWareHouseInventoryName
+        // Verified: handler decompilation shows FUN_1433ab4b0(handler+0x300, text) for SetWareHouseInventoryName
         if (handler && g_fnSetTitle) {
             typedef uint8_t (__fastcall *PFN_SetTitle)(uintptr_t, const char*);
             PFN_SetTitle setTitle = (PFN_SetTitle)g_fnSetTitle;
+            const char* title = GetWarehouseTitle();
+            bool needUtf8Fix = !IsAscii(title);
 
             __try {
                 uintptr_t bottomLabel = *(uintptr_t*)(handler + 0x300);
                 if (bottomLabel) {
-                    const char* title = GetWarehouseTitle();
                     setTitle(bottomLabel, title);
-                    Log("  Bottom label (+0x300) set: lang=%d", GetGameLanguage());
+                    Log("  Bottom label (+0x300) set: lang=%d needFix=%d", GetGameLanguage(), needUtf8Fix);
+                    // For non-ASCII titles: ensure the renderer has correct
+                    // wchar_t text.  SetTitle's direct path stores raw UTF-8
+                    // bytes which the renderer zero-extends (garbling CJK/accented).
+                    // SetTitleOnRenderer calls FUN_1434159c0 which properly
+                    // decodes UTF-8 → wchar_t via FUN_141010f90.
+                    if (needUtf8Fix) {
+                        bool fixed = SetTitleOnRenderer(bottomLabel, title, 0);
+                        Log("  Bottom label UTF-8 fix: %s", fixed ? "OK" : "no renderer found");
+                    }
                 }
             } __except(EXCEPTION_EXECUTE_HANDLER) {}
 
             // === FIX TOP TITLE: SetTitle on handler+0x0E0 ===
-            // SCAN found handler+0x0E0.c[0] has a live text setter (bridge+8 != 0).
-            // SetTitle will use safe redirect path (like +0x300 bottom label).
             __try {
                 uintptr_t topNode = *(uintptr_t*)(handler + 0x0E0);
                 if (topNode > 0x10000 && topNode < 0x7FFFFFFFFFFF) {
-                    const char* title = GetWarehouseTitle();
                     uint8_t ret = setTitle(topNode, title);
                     Log("  Top title (+0x0E0) set: lang=%d ret=%u", GetGameLanguage(), (unsigned)ret);
+                    if (needUtf8Fix) {
+                        bool fixed = SetTitleOnRenderer(topNode, title, 0);
+                        Log("  Top title UTF-8 fix: %s", fixed ? "OK" : "no renderer found");
+                    }
                 } else {
                     Log("  Top title (+0x0E0) invalid pointer");
                 }
             } __except(EXCEPTION_EXECUTE_HANDLER) {
                 Log("  Top title (+0x0E0) EXCEPTION");
             }
+
         }
 
         // Show mouse cursor for keyboard+mouse players
@@ -991,6 +1182,18 @@ static volatile LONG g_pendingCircleClose = 0;  // 1 = waiting for Circle releas
 static LRESULT CALLBACK HookedWndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     if (m==WM_TRIGGER_WAREHOUSE) { TriggerWarehouse((bool)w); return 0; }
     if (InterlockedCompareExchange(&g_warehouseActive, 0, 0) && m==WM_KEYDOWN && w==VK_ESCAPE) {
+        if (IsNewModalDialogVisible()) {
+            // Record which modal we're dismissing so next ESC closes warehouse
+            uintptr_t handler = (uintptr_t)InterlockedCompareExchange64(&g_handlerThis, 0, 0);
+            if (handler) {
+                __try {
+                    uintptr_t mv = *(uintptr_t*)(handler + 0x240);
+                    InterlockedExchange64(&g_lastModalPassed, (LONG64)mv);
+                } __except(EXCEPTION_EXECUTE_HANDLER) {}
+            }
+            Log("ESC: sub-dialog active, passing to game");
+            return CallWindowProcA(g_originalWndProc, h, m, w, l);
+        }
         PostMessageA(h,WM_TRIGGER_WAREHOUSE,1,0); return 0;
     }
     // --- Raw Input: DualSense / DualShock buttons ---
@@ -1003,9 +1206,13 @@ static LRESULT CALLBACK HookedWndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         // PSButton rising edge → toggle warehouse open/close
         if (psDown && !g_psButtonWasDown && g_psButtonEnabled) {
             if (InterlockedCompareExchange(&g_warehouseActive, 0, 0)) {
-                // Warehouse is open → close it
-                Log("PSButton pressed → closing warehouse");
-                PostMessageA(h, WM_TRIGGER_WAREHOUSE, 1, 0);
+                // Warehouse is open → close modal first, or close warehouse
+                if (IsNewModalDialogVisible()) {
+                    Log("PSButton pressed → sub-dialog active, ignoring close");
+                } else {
+                    Log("PSButton pressed → closing warehouse");
+                    PostMessageA(h, WM_TRIGGER_WAREHOUSE, 1, 0);
+                }
             } else {
                 // Warehouse is closed → open it
                 Log("PSButton pressed → opening warehouse");
@@ -1016,8 +1223,12 @@ static LRESULT CALLBACK HookedWndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
 
         // Circle pressed while warehouse open → mark pending close (don't close yet)
         if (circleDown && !g_circleWasDown && InterlockedCompareExchange(&g_warehouseActive, 0, 0)) {
-            Log("Circle pressed → pending close (waiting for release)");
-            InterlockedExchange(&g_pendingCircleClose, 1);
+            if (IsNewModalDialogVisible()) {
+                Log("Circle pressed → sub-dialog active, ignoring");
+            } else {
+                Log("Circle pressed → pending close (waiting for release)");
+                InterlockedExchange(&g_pendingCircleClose, 1);
+            }
         }
 
         // Circle released after pending close → NOW actually close
@@ -1087,7 +1298,11 @@ static DWORD WINAPI InputThread(LPVOID) {
 
                 // B button closes warehouse on RELEASE (not press) to prevent dodge roll
                 if (InterlockedCompareExchange(&g_warehouseActive, 0, 0) && (released & 0x2000)) {
-                    trigger = true;
+                    if (IsNewModalDialogVisible()) {
+                        Log("B button → sub-dialog active, ignoring");
+                    } else {
+                        trigger = true;
+                    }
                 }
                 // Open/toggle with configured button
                 else if (g_controllerButton && (pressed & g_controllerButton)) {
@@ -1109,10 +1324,15 @@ static DWORD WINAPI InputThread(LPVOID) {
     return 0;
 }
 
-struct FWD{DWORD p;HWND r;};
-static BOOL CALLBACK EWP(HWND h,LPARAM l){FWD*d=(FWD*)l;DWORD p=0;GetWindowThreadProcessId(h,&p);
-if(p==d->p&&IsWindowVisible(h)){char t[256];GetWindowTextA(h,t,256);if(t[0]){d->r=h;return FALSE;}}return TRUE;}
-static HWND FindGameWindow(){FWD d={GetCurrentProcessId(),nullptr};EnumWindows(EWP,(LPARAM)&d);return d.r;}
+static HWND FindGameWindow(){
+    DWORD myPid=GetCurrentProcessId();
+    HWND h=nullptr;
+    while((h=FindWindowExW(nullptr,h,L"WindowsLauncherClassName",L"Crimson Desert"))!=nullptr){
+        DWORD pid=0;GetWindowThreadProcessId(h,&pid);
+        if(pid==myPid)return h;
+    }
+    return nullptr;
+}
 
 // ============================================================
 //  Pattern Scanning + Init
@@ -1186,6 +1406,32 @@ static bool ResolveAddresses() {
     }
     Log("SetTitle:     %s base+0x%llX (string-xref)", g_fnSetTitle?"OK":"FAIL",
         g_fnSetTitle?(unsigned long long)(g_fnSetTitle-g_gameBase):0);
+
+    // Step 3b: Find SetTitleDirect (FUN_1434159c0) from inside SetTitle.
+    // SetTitle checks node+0xA8 (bridge). If bridge+8 (renderer) exists,
+    // it calls SetTitleDirect(renderer, text) — which does proper UTF-8→wchar.
+    // In the assembly: 1st E8 CALL = __chkstk, 2nd E8 CALL = SetTitleDirect.
+    if (g_fnSetTitle) {
+        uint8_t* p = (uint8_t*)g_fnSetTitle;
+        int callNum = 0;
+        for (int i = 0; i < 120; i++) {
+            if (p[i] == 0xE8) {
+                int32_t rel = *(int32_t*)(p + i + 1);
+                uintptr_t target = (uintptr_t)(p + i + 5) + rel;
+                if (target > g_gameBase && target < g_gameBase + g_imageSize) {
+                    callNum++;
+                    if (callNum == 2) {
+                        g_fnSetTitleDirect = target;
+                        break;
+                    }
+                }
+                i += 4; // skip rel32
+            }
+        }
+    }
+    Log("SetTitleDir:  %s base+0x%llX (SetTitle internal)",
+        g_fnSetTitleDirect?"OK":"FAIL",
+        g_fnSetTitleDirect?(unsigned long long)(g_fnSetTitleDirect-g_gameBase):0);
 
     // Step 4: Find CanShow via Handler's vtable (offset +0xE0 from Handler entry)
     if (g_fnHandler) {
@@ -1387,12 +1633,30 @@ static DWORD WINAPI ModThread(LPVOID) {
     if(g_debugLog){std::string lp=ip.substr(0,ip.rfind('.'))+".log";g_logFile=fopen(lp.c_str(),"w");}
 
     Log("=== Private Storage Anywhere v1.2.0 ===");
+    {char cls[256]={};char ttl[256]={};GetClassNameA(g_gameWindow,cls,256);GetWindowTextA(g_gameWindow,ttl,256);
+    Log("Game window: class='%s' title='%s'",cls,ttl);}
     g_gameBase=(uintptr_t)GetModuleHandleA("CrimsonDesert.exe");
     if(!g_gameBase){Log("FATAL: no game base");return 0;}
     MODULEINFO mi;GetModuleInformation(GetCurrentProcess(),(HMODULE)g_gameBase,&mi,sizeof(mi));
     g_imageSize=mi.SizeOfImage;
     Log("Base: 0x%llX  Size: 0x%X  Hotkey: 0x%02X",
         (unsigned long long)g_gameBase, g_imageSize, g_hotkey);
+
+    // Hash meta/0.papgt to detect modded game files (JSON mods etc.)
+    {
+        std::string metaPath(dp);
+        size_t bs = metaPath.rfind('\\');
+        if (bs != std::string::npos) {
+            metaPath = metaPath.substr(0, bs);           // strip filename
+            bs = metaPath.rfind('\\');
+            if (bs != std::string::npos)
+                metaPath = metaPath.substr(0, bs);       // strip bin64
+        }
+        metaPath += "\\meta\\0.papgt";
+        uint32_t crc = FileCRC32(metaPath.c_str());
+        if (crc) Log("meta/0.papgt CRC32: %08X", crc);
+        else     Log("meta/0.papgt: NOT FOUND");
+    }
 
     if(!ResolveAddresses()){Log("FATAL: pattern scan failed");return 0;}
 
@@ -1415,6 +1679,10 @@ static DWORD WINAPI ModThread(LPVOID) {
             Log("Controller: XInput loaded (B to close, no open button configured)");
     }
 
+    if(!IsWindow(g_gameWindow)){
+        g_gameWindow=FindGameWindow();
+        if(!g_gameWindow||!IsWindow(g_gameWindow)){Log("FATAL: game window invalid before WndProc hook");return 0;}
+    }
     SetLastError(0);
     g_originalWndProc=(WNDPROC)SetWindowLongPtrA(g_gameWindow,GWLP_WNDPROC,(LONG_PTR)HookedWndProc);
     if(!g_originalWndProc&&GetLastError()!=0){Log("FATAL: WndProc hook failed (error=%lu)",GetLastError());return 0;}
