@@ -114,7 +114,6 @@ Delete [b]PrivateStorageAnywhere.asi[/b] and [b]PrivateStorageAnywhere.ini[/b] f
 [b]v1.2.1[/b]
 [list]
 [*]Fixed: ESC now correctly closes the quantity dialog before closing the warehouse — previously the warehouse closed while the dialog stayed visible
-[*]Fixed: Multiple quantity dialogs in a row are handled correctly (each ESC closes one dialog, final ESC closes warehouse)
 [*]Applies to all close methods: ESC, Circle (PS5/PS4), PSButton, and B button (XInput)
 [*]Fixed: Window detection now uses exact game window class name instead of blind enumeration, preventing WndProc hook failures caused by overlays
 [/list]
