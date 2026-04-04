@@ -6,7 +6,7 @@
 #include <string>
 
 // ============================================================
-//  Private Storage Anywhere v1.2.2
+//  Private Storage Anywhere v1.2.3
 //
 //  Opens the Camp Warehouse (Private Storage) from anywhere
 //  with a hotkey (default F6) or controller button.
@@ -29,10 +29,11 @@ static uintptr_t g_fnHandler = 0;
 static uintptr_t g_fnModeSwitcher = 0, g_fnCanShow = 0, g_fnSetInventory = 0;
 static uintptr_t g_fnSetTitle = 0;
 static uintptr_t g_fnSetTitleDirect = 0;  // FUN_1434159c0: UTF-8 aware wchar text setter (bypasses bridge check)
-static uintptr_t g_fnSetCursorVisible = 0;  // thunk_FUN_1524be5a0(cursorObj, show, force)
+static uintptr_t g_fnSetCursorVisible = 0;  // QOL: hides cursor immediately on warehouse close
 static uintptr_t g_warehouseVtableEntry = 0;  // vtable address containing handler — used for auto-capture verification
 static uintptr_t g_warehouseVtableStart = 0;  // vtable start of warehouse class — set on first successful capture
 static uint32_t  g_modalDialogOff = 0;     // handler+N stores active dialog pointer (0x338 in current build, was 0x240)
+static uintptr_t g_langByteAddr = 0;      // address of language byte (resolved dynamically from Steam API init function)
 
 // Captured game state (accessed from multiple threads via Interlocked ops)
 static volatile LONG64 g_mainChar = 0;
@@ -49,7 +50,7 @@ static const char* WAREHOUSE_INIT_STRING = "Character,Focus,True;CampWareHouse,F
 // Saved mode bytes for restore on close
 static uint8_t g_savedModes[7] = {};
 static uint8_t g_savedSubtypes[15] = {};
-static bool g_cursorShownByMod = false;
+// NOTE: g_cursorShownByMod removed — not needed, we always hide cursor on close
 static volatile LONG g_modeByteLock = 0;  // Spinlock for mode byte read/write
 static volatile LONG g_modeSwitchByMod = 0;  // 1 when WE call fnMode, 0 otherwise
 static volatile ULONGLONG g_openTimestamp = 0;  // GetTickCount64 at warehouse open (grace period)
@@ -260,8 +261,11 @@ static uint32_t FileCRC32(const char* path) {
 
 // ============================================================
 //  Localization — read game language and return translated title
-//  Language byte at gameBase+0x599772D (DAT_14599772d)
-//  Set by FUN_1404864a0 from Steam API language detection.
+//  Language byte is resolved dynamically via FindLanguageByte():
+//    1. FindString("koreana") → Steam language string (index 0)
+//    2. Scan .rdata for pointer to "koreana" → language table start
+//    3. Find code referencing the table → Steam API init function
+//    4. Scan forward for MOV byte [rip+disp32], reg → language byte write
 //  SetTitle (FUN_1433ab4b0) stores text as raw char bytes in nodes.
 //  Only the bridge/redirect path (FUN_1434159c0 via node+0xA8)
 //  properly decodes UTF-8 to wchar_t (via FUN_141010f90).
@@ -270,9 +274,9 @@ static uint32_t FileCRC32(const char* path) {
 //  Fix: after SetTitle, call SetTitleDirect on node renderers.
 // ============================================================
 static int GetGameLanguage() {
-    if (!g_gameBase) return 1; // EN
+    if (!g_langByteAddr) return 1; // EN
     __try {
-        uint8_t lang = *(uint8_t*)(g_gameBase + 0x599772D);
+        uint8_t lang = *(uint8_t*)g_langByteAddr;
         if (lang > 13) return 1; // unknown → EN
         return (int)lang;
     } __except(EXCEPTION_EXECUTE_HANDLER) {
@@ -612,14 +616,6 @@ extern "C" void __fastcall CaptureModeSwitcher(void* rcx) {
             memcpy(mc + 0xCB8, g_savedSubtypes, 15);
             InterlockedExchange(&g_modeByteLock, 0);
         }
-        if (g_cursorShownByMod && g_fnSetCursorVisible) {
-            uintptr_t cursor = (uintptr_t)InterlockedCompareExchange64(&g_cursorObj, 0, 0);
-            if (cursor) {
-                typedef void (__fastcall *PFN_SCV)(void*, char, char);
-                ((PFN_SCV)g_fnSetCursorVisible)((void*)cursor, 0, 1);
-            }
-            g_cursorShownByMod = false;
-        }
     }
 }
 
@@ -701,14 +697,6 @@ extern "C" char __fastcall HookedCanShow(void* thisPtr) {
                         memcpy((uint8_t*)mc + 0xCB1, g_savedModes, 7);
                         memcpy((uint8_t*)mc + 0xCB8, g_savedSubtypes, 15);
                         InterlockedExchange(&g_modeByteLock, 0);
-                    }
-                    if (g_cursorShownByMod && g_fnSetCursorVisible) {
-                        uintptr_t cursor = (uintptr_t)InterlockedCompareExchange64(&g_cursorObj, 0, 0);
-                        if (cursor) {
-                            typedef void (__fastcall *PFN_SCV)(void*, char, char);
-                            ((PFN_SCV)g_fnSetCursorVisible)((void*)cursor, 0, 1);
-                        }
-                        g_cursorShownByMod = false;
                     }
                     return g_origCanShow(thisPtr);
                 }
@@ -846,28 +834,23 @@ static void TriggerWarehouse(bool fromKeyboard = false) {
         InterlockedExchange(&g_warehouseActive, 1);
         g_openTimestamp = GetTickCount64();
 
-        // Pre-activate warehouse handler BEFORE fnMode so the game sees it as the active panel.
-        // Without this, stale +0x118=1 on other store panels (IndulgenceView) can cause
-        // the game to show the wrong panel during mode switch.
+        // Activate warehouse panel via the game's own base-class handler (command 0x0e).
+        // This properly sets +0x118, attaches the scene object, and calls the
+        // scene registration functions (FUN_1433c4100 + thunk_FUN_1558a7380).
+        // Manual +0x118/+0x21A setting is no longer sufficient after the game update.
         uintptr_t handler = (uintptr_t)InterlockedCompareExchange64(&g_handlerThis, 0, 0);
-        if (handler) {
+        if (handler && g_fnHandler) {
             __try {
-                // Set active flag (what CanShow reads)
-                *(uint8_t*)(handler + 0x118) = 1;
-                // Set visibility bit on sub-object (what scene system reads)
-                uintptr_t sub = *(uintptr_t*)((uint8_t*)handler + 0x08);
-                if (sub) {
-                    uintptr_t linked = *(uintptr_t*)(sub + 0xA8);
-                    if (linked) {
-                        uintptr_t sceneObj = *(uintptr_t*)(linked + 0x10);
-                        if (sceneObj) {
-                            *(uint8_t*)(sceneObj + 0x21A) |= 1;
-                            Log("  Pre-activated warehouse (+0x118=1, +0x21a bit set)");
-                        }
-                    }
-                }
+                uint8_t showPacket[24] = {};
+                showPacket[0] = 0x0e;  // base-class "show panel" command
+                typedef void (__fastcall *PFN_Handler)(void*, void*);
+                ((PFN_Handler)g_fnHandler)((void*)handler, (void*)showPacket);
+                Log("  Panel shown via 0x0e command");
             } __except(EXCEPTION_EXECUTE_HANDLER) {
-                Log("  Pre-activate: partial (only +0x118)");
+                Log("  Panel show via 0x0e EXCEPTION, falling back to manual");
+                __try {
+                    *(uint8_t*)(handler + 0x118) = 1;
+                } __except(EXCEPTION_EXECUTE_HANDLER) {}
             }
         }
 
@@ -884,20 +867,12 @@ static void TriggerWarehouse(bool fromKeyboard = false) {
             return;
         }
 
-        // Post-open: call handler with empty 0x15 to clear cached NPC state
-        // (resets title, donate buttons, inventory from previous NPC interaction)
+        // NOTE: The old 0x15 cache-clear was removed. After the game update, the
+        // 0x15 handler path dereferences sub-objects at handler+0x2c8/0x2d0/0x2f8
+        // that are only initialized after NPC interaction, causing a crash.
+        // SetInventory below overwrites inventory data completely, and titles
+        // are set explicitly afterward, so the cache-clear is unnecessary.
         if (!handler) handler = (uintptr_t)InterlockedCompareExchange64(&g_handlerThis, 0, 0);
-        if (handler && g_fnHandler) {
-            __try {
-                uint8_t cmdPacket[24] = {};
-                cmdPacket[0] = 0x15;  // warehouse command, 0 entries → only clearing code runs
-                typedef void (__fastcall *PFN_Handler)(void*, void*);
-                ((PFN_Handler)g_fnHandler)((void*)handler, (void*)cmdPacket);
-                Log("  Handler: cache cleared via empty 0x15");
-            } __except(EXCEPTION_EXECUTE_HANDLER) {
-                Log("  Handler: cache clear EXCEPTION");
-            }
-        }
 
         // Load inventory items
         if (handler && g_fnSetInventory) {
@@ -955,60 +930,52 @@ static void TriggerWarehouse(bool fromKeyboard = false) {
 
         }
 
-        // Show mouse cursor for keyboard+mouse players
-        // Uses the game's own SetCursorVisible to properly switch input mode
-        // (releases ClipCursor, shows cursor, fires InputCursorModeEvent)
-        if (fromKeyboard && g_fnSetCursorVisible) {
-            uintptr_t cursor = (uintptr_t)InterlockedCompareExchange64(&g_cursorObj, 0, 0);
-            if (cursor) {
-                typedef void (__fastcall *PFN_SetCursorVisible)(void*, char, char);
-                ((PFN_SetCursorVisible)g_fnSetCursorVisible)((void*)cursor, 1, 1);
-                g_cursorShownByMod = true;
-                Log("  Cursor shown via SetCursorVisible (keyboard trigger)");
-            }
-        }
-
         Log("  Warehouse opened (mode=0x%02X sub=0x%02X)", mc[0xCA8], mc[0xCA9]);
 
     } else {
         Log("=== CLOSING WAREHOUSE ===");
         InterlockedExchange(&g_warehouseActive, 0);
 
-        // Clear stale active flags on warehouse handler to prevent it from
-        // appearing during future NPC interactions (origCanShow reads +0x118)
+        // Hide warehouse panel via the game's base-class handler (command 0x0f).
+        // This properly clears +0x118, detaches the scene object, and calls
+        // scene deregistration — symmetric to the 0x0e show command on open.
         uintptr_t closeHandler = (uintptr_t)InterlockedCompareExchange64(&g_handlerThis, 0, 0);
-        if (closeHandler) {
+        if (closeHandler && g_fnHandler) {
+            __try {
+                uint8_t hidePacket[24] = {};
+                hidePacket[0] = 0x0f;  // base-class "hide panel" command
+                typedef void (__fastcall *PFN_Handler)(void*, void*);
+                ((PFN_Handler)g_fnHandler)((void*)closeHandler, (void*)hidePacket);
+                Log("  Panel hidden via 0x0f command");
+            } __except(EXCEPTION_EXECUTE_HANDLER) {
+                // Fallback: manual cleanup
+                __try {
+                    *(uint8_t*)(closeHandler + 0x118) = 0;
+                } __except(EXCEPTION_EXECUTE_HANDLER) {}
+                Log("  Panel hide via 0x0f EXCEPTION, manual fallback");
+            }
+        } else if (closeHandler) {
             __try {
                 *(uint8_t*)(closeHandler + 0x118) = 0;
-                uintptr_t sub = *(uintptr_t*)((uint8_t*)closeHandler + 0x08);
-                if (sub) {
-                    uintptr_t linked = *(uintptr_t*)(sub + 0xA8);
-                    if (linked) {
-                        uintptr_t sceneObj = *(uintptr_t*)(linked + 0x10);
-                        if (sceneObj) {
-                            *(uint8_t*)(sceneObj + 0x21A) &= ~1;
-                            Log("  Cleared stale flags (+0x118=0, +0x21a bit cleared)");
-                        }
-                    }
-                }
-            } __except(EXCEPTION_EXECUTE_HANDLER) {
-                Log("  Cleared +0x118 only (scene obj access failed)");
-            }
+                Log("  Cleared +0x118 manually (no handler func)");
+            } __except(EXCEPTION_EXECUTE_HANDLER) {}
         }
 
         while (InterlockedCompareExchange(&g_modeByteLock, 1, 0) != 0) { _mm_pause(); }
         memcpy(mc + 0xCB1, g_savedModes, 7);
         memcpy(mc + 0xCB8, g_savedSubtypes, 15);
         InterlockedExchange(&g_modeByteLock, 0);
-        // Hide cursor if we showed it
-        if (g_cursorShownByMod && g_fnSetCursorVisible) {
+
+        // QOL: Hide cursor immediately when closing warehouse
+        if (g_fnSetCursorVisible) {
             uintptr_t cursor = (uintptr_t)InterlockedCompareExchange64(&g_cursorObj, 0, 0);
             if (cursor) {
-                typedef void (__fastcall *PFN_SetCursorVisible)(void*, char, char);
-                ((PFN_SetCursorVisible)g_fnSetCursorVisible)((void*)cursor, 0, 1);
-                Log("  Cursor hidden via SetCursorVisible");
+                __try {
+                    typedef void (__fastcall *PFN_SetCursorVisible)(void*, char, char);
+                    ((PFN_SetCursorVisible)g_fnSetCursorVisible)((void*)cursor, 0, 1);
+                    Log("  Cursor hidden via SetCursorVisible");
+                } __except(EXCEPTION_EXECUTE_HANDLER) {}
             }
-            g_cursorShownByMod = false;
         }
 
         __try {
@@ -1282,33 +1249,70 @@ static bool ResolveAddresses() {
         g_fnSetTitleDirect?"OK":"FAIL",
         g_fnSetTitleDirect?(unsigned long long)(g_fnSetTitleDirect-g_gameBase):0);
 
-    // Step 4: Find CanShow via Handler's vtable (offset +0xE0 from Handler entry)
+    // Step 4: Find CanShow via Handler's vtable (update-proof — scans all vtable entries)
+    // CanShow signature: contains MOVZX reg, byte [reg+0x118] (reads the active flag).
+    // We find ALL data references to g_fnHandler (could be in vtables, reloc tables, etc.),
+    // verify each is a real vtable (adjacent entries are valid code pointers), then scan
+    // the vtable for a function matching the CanShow signature.
     if (g_fnHandler) {
-        // Handler is registered in a vtable. Find DATA xref to handler address.
         uint8_t* base = (uint8_t*)g_gameBase;
-        for (DWORD i = 0; i + 8 <= g_imageSize; i += 8) {
-            uintptr_t val = *(uintptr_t*)(base + i);
-            if (val == g_fnHandler) {
-                // Found vtable entry pointing to Handler. CanShow thunk is at +0xE0
-                uintptr_t vtableEntry = g_gameBase + i;
-                g_warehouseVtableEntry = vtableEntry;
-                uintptr_t canShowThunk = *(uintptr_t*)(vtableEntry + 0xE0);
-                if (canShowThunk > g_gameBase && canShowThunk < g_gameBase + g_imageSize) {
-                    // Thunk is JMP to real CanShow — resolve if it's a JMP [rip+0]
-                    uint8_t* t = (uint8_t*)canShowThunk;
-                    if (t[0] == 0xFF && t[1] == 0x25) {
-                        int32_t disp = *(int32_t*)(t + 2);
-                        g_fnCanShow = *(uintptr_t*)(canShowThunk + 6 + disp);
-                    } else if (t[0] == 0xE9) {
-                        int32_t rel = *(int32_t*)(t + 1);
-                        g_fnCanShow = canShowThunk + 5 + rel;
-                    } else {
-                        g_fnCanShow = canShowThunk;
+        for (DWORD i = 0; i + 8 <= g_imageSize && !g_fnCanShow; i += 8) {
+            if (*(uintptr_t*)(base + i) != g_fnHandler) continue;
+            uintptr_t vtableEntry = g_gameBase + i;
+            // Verify this is a real vtable: at least 4 adjacent entries should be valid code pointers
+            int validCount = 0;
+            for (int check = -4; check <= 4; check++) {
+                uintptr_t addr = vtableEntry + check * 8;
+                if (addr < g_gameBase || addr >= g_gameBase + g_imageSize - 8) continue;
+                uintptr_t ptr = *(uintptr_t*)addr;
+                if (ptr > g_gameBase && ptr < g_gameBase + g_imageSize) validCount++;
+            }
+            if (validCount < 4) continue;  // not a real vtable, skip
+            if (!g_warehouseVtableEntry) g_warehouseVtableEntry = vtableEntry;
+            // Scan vtable entries around the handler (±0x800 = up to 256 entries each way)
+            uintptr_t vtableBase = (vtableEntry > g_gameBase + 0x800) ? vtableEntry - 0x800 : g_gameBase;
+            uintptr_t vtableEnd = vtableEntry + 0x800;
+            if (vtableEnd > g_gameBase + g_imageSize - 8) vtableEnd = g_gameBase + g_imageSize - 8;
+            for (uintptr_t v = vtableBase; v <= vtableEnd && !g_fnCanShow; v += 8) {
+                uintptr_t candidate = *(uintptr_t*)v;
+                if (candidate <= g_gameBase || candidate >= g_gameBase + g_imageSize) continue;
+                if (candidate == g_fnHandler) continue;
+                // Resolve thunks (JMP [rip+disp32] or E9 rel32)
+                uintptr_t resolved = candidate;
+                uint8_t* t = (uint8_t*)candidate;
+                if (t[0] == 0xFF && t[1] == 0x25) {
+                    int32_t disp = *(int32_t*)(t + 2);
+                    resolved = *(uintptr_t*)(candidate + 6 + disp);
+                } else if (t[0] == 0xE9) {
+                    int32_t rel = *(int32_t*)(t + 1);
+                    resolved = candidate + 5 + rel;
+                }
+                if (resolved <= g_gameBase || resolved >= g_gameBase + g_imageSize) continue;
+                // Check CanShow signature: MOVZX reg, byte [reg+0x118] anywhere in first 0x200 bytes
+                // Encoding: (optional REX 41-44) 0F B6 modrm 18 01 00 00, modrm mod=10 (disp32)
+                uint8_t* fn = (uint8_t*)resolved;
+                for (int j = 0; j < 0x200; j++) {
+                    bool found = false;
+                    if (fn[j] == 0x0F && fn[j+1] == 0xB6 &&
+                        (fn[j+2] & 0xC0) == 0x80 &&
+                        *(uint32_t*)(fn + j + 3) == 0x118) {
+                        found = true;
                     }
-                    Log("  Vtable at base+0x%llX, CanShow thunk at base+0x%llX",
-                        (unsigned long long)(vtableEntry - g_gameBase),
-                        (unsigned long long)(canShowThunk - g_gameBase));
-                    break;
+                    if (!found && (fn[j] & 0xFC) == 0x40 &&  // any REX prefix (40-4F)
+                        fn[j+1] == 0x0F && fn[j+2] == 0xB6 &&
+                        (fn[j+3] & 0xC0) == 0x80 &&
+                        *(uint32_t*)(fn + j + 4) == 0x118) {
+                        found = true;
+                    }
+                    if (found) {
+                        g_fnCanShow = resolved;
+                        g_warehouseVtableEntry = vtableEntry;
+                        Log("  Vtable at base+0x%llX, CanShow at base+0x%llX (vtable offset 0x%llX)",
+                            (unsigned long long)(vtableEntry - g_gameBase),
+                            (unsigned long long)(resolved - g_gameBase),
+                            (unsigned long long)(v - vtableEntry));
+                        break;
+                    }
                 }
             }
         }
@@ -1398,38 +1402,15 @@ static bool ResolveAddresses() {
     if (!g_fnModeSwitcher) Log("ModeSwitcher: FAIL (no validated match)");
 
     // Step 6: Find SetCursorVisible — called from ModeSwitcher via thunk
-    // ModeSwitcher calls it near the end with pattern: CALL thunk → thunk JMPs to real function
-    // The call passes (cursorObj, 0, 0) to hide cursor. We search for CALL targets in ModeSwitcher
-    // that themselves are thunks (start with JMP or CALL to far address).
+    // QOL: Hides cursor immediately when closing warehouse
     if (g_fnModeSwitcher) {
         uintptr_t targets[32];
         int n = FindAllCALLsAfter(g_fnModeSwitcher, 0x200, targets, 32);
         for (int i = 0; i < n; i++) {
             uint8_t* t = (uint8_t*)targets[i];
-            // SetCursorVisible thunk starts with a JMP to the real function (E9 rel32)
-            // or is a direct function. The real function does GetClipCursor + ShowCursor.
-            // Check if target calls GetClipCursor (imported) within first 0x100 bytes
-            uintptr_t subTargets[16];
-            int sn = FindAllCALLsAfter(targets[i], 0x100, subTargets, 16);
-            for (int j = 0; j < sn; j++) {
-                // Follow one more level for thunks
-                uint8_t* st = (uint8_t*)subTargets[j];
-                if (st[0] == 0xE9) {
-                    int32_t rel = *(int32_t*)(st + 1);
-                    subTargets[j] = (uintptr_t)(st + 5) + rel;
-                }
-            }
-            // The thunk itself might be a JMP
             if (t[0] == 0xE9) {
                 int32_t rel = *(int32_t*)(t + 1);
                 uintptr_t realFn = (uintptr_t)(t + 5) + rel;
-                // Check if real function references GetClipCursor/EqualRect within 0x80 bytes
-                uintptr_t innerCalls[16];
-                int in2 = FindAllCALLsAfter(realFn, 0x80, innerCalls, 16);
-                // SetCursorVisible is identifiable: it has exactly the pattern of
-                // checking param, calling vtable+0x38 or vtable+0x40, then firing event
-                // For now, accept the first thunk-JMP target from ModeSwitcher that is
-                // in a high address range (the real SetCursorVisible is at 0x152xxxxxx)
                 if (realFn > g_gameBase + 0x10000000) {
                     g_fnSetCursorVisible = targets[i];
                     Log("SetCursorVisible: OK base+0x%llX (thunk from ModeSwitcher)",
@@ -1515,6 +1496,62 @@ static bool ResolveAddresses() {
             g_fnSetTitle?(unsigned long long)(g_fnSetTitle-g_gameBase):0);
     }
 
+    // Step 7: Find language byte dynamically
+    // The Steam API init function (FUN_140487400) compares Steam's language string
+    // against a table of known languages ("koreana", "english", ...) and stores the
+    // matching index as a single byte in a global variable.
+    // Algorithm: find "koreana" string → find pointer table → find code reference →
+    // scan forward for MOV byte [rip+disp32], reg (the write to the global).
+    {
+        uintptr_t strKoreana = FindString("koreana");
+        if (strKoreana) {
+            // Find pointer to "koreana" in .rdata (first entry of the language string table)
+            uint8_t* base = (uint8_t*)g_gameBase;
+            uintptr_t tableAddr = 0;
+            for (DWORD i = 0; i + 8 <= g_imageSize; i += 8) {
+                if (*(uintptr_t*)(base + i) == strKoreana) {
+                    tableAddr = g_gameBase + i;
+                    break;
+                }
+            }
+            if (tableAddr) {
+                // Find code that loads from this table: [reg + reg*8 + tableDisp]
+                // The displacement is tableAddr - gameBase, encoded as 4 LE bytes in the instruction
+                uint32_t tableDisp = (uint32_t)(tableAddr - g_gameBase);
+                uint8_t* dispBytes = (uint8_t*)&tableDisp;
+                uintptr_t codeRef = 0;
+                // Scan code section (first ~60% of image) for the 4-byte displacement
+                DWORD codeLimit = (DWORD)(g_imageSize * 6 / 10);
+                for (DWORD i = 0; i + 4 <= codeLimit; i++) {
+                    if (base[i] == dispBytes[0] && base[i+1] == dispBytes[1] &&
+                        base[i+2] == dispBytes[2] && base[i+3] == dispBytes[3]) {
+                        codeRef = g_gameBase + i + 4;  // right after the displacement
+                        break;
+                    }
+                }
+                if (codeRef) {
+                    // Scan forward for MOV byte ptr [rip+disp32], reg8
+                    // Encoding: (optional REX 40-4F) 88 modrm, where modrm & 0xC7 == 0x05
+                    uint8_t* scan = (uint8_t*)codeRef;
+                    for (int j = 0; j < 80; j++) {
+                        bool hasRex = (scan[j] >= 0x40 && scan[j] <= 0x4F);
+                        int opOff = hasRex ? j + 1 : j;
+                        if (scan[opOff] == 0x88 && (scan[opOff+1] & 0xC7) == 0x05) {
+                            int32_t disp = *(int32_t*)(scan + opOff + 2);
+                            uintptr_t addr = (uintptr_t)(scan + opOff + 6) + disp;
+                            if (addr > g_gameBase && addr < g_gameBase + g_imageSize) {
+                                g_langByteAddr = addr;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Log("LangByte:     %s base+0x%llX (koreana table scan)", g_langByteAddr?"OK":"FAIL",
+            g_langByteAddr?(unsigned long long)(g_langByteAddr-g_gameBase):0);
+    }
+
     return g_fnHandler && g_fnModeSwitcher && g_fnCanShow && g_fnSetInventory;
 }
 
@@ -1530,7 +1567,7 @@ static DWORD WINAPI ModThread(LPVOID) {
     if(!g_enabled)return 0;
     if(g_debugLog){std::string lp=ip.substr(0,ip.rfind('.'))+".log";g_logFile=fopen(lp.c_str(),"w");}
 
-    Log("=== Private Storage Anywhere v1.2.2 ===");
+    Log("=== Private Storage Anywhere v1.2.3 ===");
     {char cls[256]={};char ttl[256]={};GetClassNameA(g_gameWindow,cls,256);GetWindowTextA(g_gameWindow,ttl,256);
     Log("Game window: class='%s' title='%s'",cls,ttl);}
     g_gameBase=(uintptr_t)GetModuleHandleA("CrimsonDesert.exe");

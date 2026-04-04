@@ -1,8 +1,16 @@
 Private Storage Anywhere — Changelog
 
-v1.2.2 (2026-04-03)
+v1.2.3 (2026-04-04)
+- QOL: Cursor is hidden immediately when closing the warehouse
+- Improved: CanShow detection is now update-proof — primary vtable scan identifies CanShow by its +0x118 signature instead of relying on a fixed vtable offset, fallback pattern scan kept as safety net
+
+v1.2.2 (2026-04-04)
+- Fixed: Compatible with game update 2026-04-04 — warehouse panel now renders correctly after the update changed the scene registration system
+- Fixed: Panel show/hide now uses the game's own base-class handler commands (0x0e/0x0f) instead of manually setting internal flags — this is more robust and survives future game updates
+- Removed: Unsafe 0x15 cache-clear call that crashed after the update (sub-objects at handler+0x2c8/0x2d0/0x2f8 are only initialized after NPC interaction)
+- Removed: Cursor force-show/hide — game now handles cursor visibility in storage menus natively
+- Improved: Language detection is now update-proof — the language byte address is resolved dynamically at runtime by scanning the Steam API language init function
 - Improved: Modal dialog detection (quantity/confirm dialogs) is now update-proof — the handler struct offset is resolved dynamically at runtime via string-xref + code pattern scan instead of being hardcoded
-- Technical: Finds "ModalMessageView" string → LEA xref near warehouse class → MOV [REG+disp32] store with back-pointer validation → extracts struct offset automatically
 
 v1.2.1 (2026-04-03)
 - Fixed: ESC now correctly closes the quantity dialog ("How many do you want to move?") before closing the warehouse — previously ESC closed the warehouse while the dialog stayed visible
