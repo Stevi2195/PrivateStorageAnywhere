@@ -111,6 +111,12 @@ Delete [b]PrivateStorageAnywhere.asi[/b] and [b]PrivateStorageAnywhere.ini[/b] f
 
 [size=3][b]Changelog[/b][/size]
 
+[b]v1.2.5[/b]
+[list]
+[*]Fixed: Warehouse panel sometimes not opening after game update (HUD disappeared but no storage UI) — caused by auto-capture permanently locking onto a wrong UI controller
+[*]Improved: Auto-capture now uses exact vtable match via RTTI scan instead of offset-based range check — eliminates false positives from nearby base-class vtables
+[/list]
+
 [b]v1.2.4[/b]
 [list]
 [*]Fixed: Auto-capture no longer grabs the wrong UI controller when other panels share the same base class — now validates warehouse-specific UI nodes before accepting

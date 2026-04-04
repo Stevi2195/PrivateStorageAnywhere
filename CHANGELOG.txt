@@ -1,5 +1,9 @@
 Private Storage Anywhere — Changelog
 
+v1.2.5 (2026-04-04)
+- Fixed: Auto-capture no longer locks permanently onto the wrong panel — the previous vtable range check was tautological (always matched any nearby panel) and the reset after failed validation was a no-op, causing the warehouse controller to never be found after a wrong panel was checked first
+- Improved: Auto-capture now uses exact vtable match instead of offset-based range check — vtable start is resolved at init via RTTI Complete Object Locator scan, uniquely identifying the UIGamePlayControlRootWarehouse2 class
+
 v1.2.4 (2026-04-04)
 - Fixed: Auto-capture no longer grabs the wrong UI controller when other panels share the same vtable (base class) — now validates warehouse-specific UI nodes (+0x0E0 top title, +0x300 bottom label) before accepting a controller
 - Fixed: Modal dialog offset scan now collects all matches and picks the largest (warehouse-specific) offset instead of stopping at the first match (base class offset)

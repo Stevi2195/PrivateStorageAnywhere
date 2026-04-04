@@ -6,7 +6,7 @@
 #include <string>
 
 // ============================================================
-//  Private Storage Anywhere v1.2.4
+//  Private Storage Anywhere v1.2.5
 //
 //  Opens the Camp Warehouse (Private Storage) from anywhere
 //  with a hotkey (default F6) or controller button.
@@ -628,69 +628,22 @@ static PFN_CanShow g_origCanShow = nullptr;
 extern "C" char __fastcall HookedCanShow(void* thisPtr) {
     uintptr_t handler = (uintptr_t)InterlockedCompareExchange64(&g_handlerThis, 0, 0);
 
-    // Auto-capture: identify warehouse controller by vtable, not panelId.
-    // PanelIds are assigned dynamically and can shift when UI-mods (e.g. No Letterbox)
-    // replace uigameconfig2.xml. The vtable address is in the code section and never changes.
+    // Auto-capture: identify warehouse controller by exact vtable match.
+    // g_warehouseVtableStart is resolved during init via RTTI scan — it's the unique
+    // vtable for UIGamePlayControlRootWarehouse2.  No offset math, no false positives.
     // Also detects save-load when warehouse controller is recreated at a new address.
-    if (g_warehouseVtableEntry && (uintptr_t)thisPtr != handler) {
+    if (g_warehouseVtableStart && (uintptr_t)thisPtr != handler) {
         __try {
             uintptr_t objVtable = *(uintptr_t*)thisPtr;
-            bool vtableMatch = false;
-            if (g_warehouseVtableStart) {
-                // After first capture: only accept exact same vtable
-                vtableMatch = (objVtable == g_warehouseVtableStart);
-            } else if (objVtable > g_gameBase && objVtable < g_gameBase + g_imageSize &&
-                       g_warehouseVtableEntry > objVtable &&
-                       (g_warehouseVtableEntry - objVtable) < 0x1000 &&
-                       ((g_warehouseVtableEntry - objVtable) % 8) == 0 &&
-                       *(uintptr_t*)(objVtable + (g_warehouseVtableEntry - objVtable)) == g_fnHandler) {
-                // First capture: verify function pointer + reasonable offset (<0x1000)
-                g_warehouseVtableStart = objVtable;
-                vtableMatch = true;
-            }
-            if (vtableMatch) {
-                // Validate: real warehouse has valid UI nodes at +0x0E0 (top title)
-                // and +0x300 (bottom label). Other panels sharing the same vtable
-                // (base class) won't have these initialized.
-                uintptr_t topNode = *(uintptr_t*)((uint8_t*)thisPtr + 0x0E0);
-                uintptr_t bottomNode = *(uintptr_t*)((uint8_t*)thisPtr + 0x300);
-                if (topNode < 0x10000 || topNode > 0x7FFFFFFFFFFF ||
-                    bottomNode < 0x10000 || bottomNode > 0x7FFFFFFFFFFF) {
-                    // Not the warehouse — skip, don't lock vtable on first attempt
-                    if (!g_warehouseVtableStart) g_warehouseVtableStart = 0;
-                } else {
-                    InterlockedExchange64(&g_handlerThis, (LONG64)(uintptr_t)thisPtr);
-                    handler = (uintptr_t)thisPtr;
-                    uintptr_t sub = *(uintptr_t*)((uint8_t*)thisPtr + 0x08);
-                    uint16_t panelId = sub ? *(uint16_t*)((uint8_t*)sub + 0x92) : 0xFFFF;
-                    if (panelId != 0xFFFF && panelId != 0)
-                        InterlockedExchange(&g_warehousePanelId, (LONG)panelId);
-                    Log("AUTO-CAPTURED warehouse controller: 0x%llX (vtable match, panelId=0x%04X)",
-                        (unsigned long long)thisPtr, panelId);
-                }
-            }
-        } __except(EXCEPTION_EXECUTE_HANDLER) {}
-    }
-
-    // Fallback: panelId-based auto-capture if vtable not available
-    if (!handler && !g_warehouseVtableEntry) {
-        __try {
-            uintptr_t sub = *(uintptr_t*)((uint8_t*)thisPtr + 0x08);
-            if (sub) {
-                uint16_t panelId = *(uint16_t*)((uint8_t*)sub + 0x92);
-                LONG expectedId = InterlockedCompareExchange(&g_warehousePanelId, 0, 0);
-                if (panelId == (uint16_t)expectedId) {
-                    // Validate warehouse-specific UI nodes before accepting
-                    uintptr_t topNode = *(uintptr_t*)((uint8_t*)thisPtr + 0x0E0);
-                    uintptr_t bottomNode = *(uintptr_t*)((uint8_t*)thisPtr + 0x300);
-                    if (topNode > 0x10000 && topNode < 0x7FFFFFFFFFFF &&
-                        bottomNode > 0x10000 && bottomNode < 0x7FFFFFFFFFFF) {
-                        InterlockedExchange64(&g_handlerThis, (LONG64)(uintptr_t)thisPtr);
-                        handler = (uintptr_t)thisPtr;
-                        Log("AUTO-CAPTURED warehouse controller: 0x%llX (panelId=0x%04X)",
-                            (unsigned long long)thisPtr, panelId);
-                    }
-                }
+            if (objVtable == g_warehouseVtableStart) {
+                InterlockedExchange64(&g_handlerThis, (LONG64)(uintptr_t)thisPtr);
+                handler = (uintptr_t)thisPtr;
+                uintptr_t sub = *(uintptr_t*)((uint8_t*)thisPtr + 0x08);
+                uint16_t panelId = sub ? *(uint16_t*)((uint8_t*)sub + 0x92) : 0xFFFF;
+                if (panelId != 0xFFFF && panelId != 0)
+                    InterlockedExchange(&g_warehousePanelId, (LONG)panelId);
+                Log("AUTO-CAPTURED warehouse controller: 0x%llX (exact vtable, panelId=0x%04X)",
+                    (unsigned long long)thisPtr, panelId);
             }
         } __except(EXCEPTION_EXECUTE_HANDLER) {}
     }
@@ -1337,6 +1290,35 @@ static bool ResolveAddresses() {
     Log("CanShow:      %s base+0x%llX (vtable)", g_fnCanShow?"OK":"FAIL",
         g_fnCanShow?(unsigned long long)(g_fnCanShow-g_gameBase):0);
 
+    // Step 4a: Find vtable start via RTTI Complete Object Locator (vtable[-1])
+    // In MSVC x64, vtable[-1] is a pointer to the RTTICompleteObjectLocator.
+    // The COL has signature=1 (DWORD at offset 0) and pTypeDescriptor (RVA at offset 12)
+    // pointing to a TypeDescriptor whose name starts with ".?AV".
+    // Scan backwards from the handler entry to find this boundary.
+    if (g_warehouseVtableEntry) {
+        for (uintptr_t scan = g_warehouseVtableEntry - 8; scan > g_warehouseVtableEntry - 0x2000; scan -= 8) {
+            uintptr_t colPtr = *(uintptr_t*)(scan - 8);  // candidate vtable[-1]
+            if (colPtr <= g_gameBase || colPtr >= g_gameBase + g_imageSize - 24) continue;
+            // Check RTTI COL signature (must be 1 for x64)
+            if (*(uint32_t*)colPtr != 1) continue;
+            // Check pTypeDescriptor RVA (offset 12 in COL) points to valid TypeDescriptor
+            uint32_t tdRVA = *(uint32_t*)(colPtr + 12);
+            uintptr_t tdAddr = g_gameBase + tdRVA;
+            if (tdAddr <= g_gameBase || tdAddr >= g_gameBase + g_imageSize - 20) continue;
+            // TypeDescriptor: vfptr(8) + spare(8) + name[0..3] = ".?AV"
+            const char* tdName = (const char*)(tdAddr + 16);
+            if (tdName[0] == '.' && tdName[1] == '?' && tdName[2] == 'A') {
+                g_warehouseVtableStart = scan;
+                Log("  Vtable start at base+0x%llX (handler offset 0x%llX, class=%.60s)",
+                    (unsigned long long)(scan - g_gameBase),
+                    (unsigned long long)(g_warehouseVtableEntry - scan), tdName);
+                break;
+            }
+        }
+        if (!g_warehouseVtableStart)
+            Log("  Vtable start: FAIL (RTTI scan)");
+    }
+
     // Step 4b: Find modal dialog offset in handler struct (update-proof modal detection)
     // Multiple handler functions find ModalMessageView via findChildByName, create a dialog,
     // and store it at handler+N. The store pattern is: MOV [REG+disp32], RAX; TEST RAX, RAX
@@ -1585,7 +1567,7 @@ static DWORD WINAPI ModThread(LPVOID) {
     if(!g_enabled)return 0;
     if(g_debugLog){std::string lp=ip.substr(0,ip.rfind('.'))+".log";g_logFile=fopen(lp.c_str(),"w");}
 
-    Log("=== Private Storage Anywhere v1.2.4 ===");
+    Log("=== Private Storage Anywhere v1.2.5 ===");
     {char cls[256]={};char ttl[256]={};GetClassNameA(g_gameWindow,cls,256);GetWindowTextA(g_gameWindow,ttl,256);
     Log("Game window: class='%s' title='%s'",cls,ttl);}
     g_gameBase=(uintptr_t)GetModuleHandleA("CrimsonDesert.exe");
