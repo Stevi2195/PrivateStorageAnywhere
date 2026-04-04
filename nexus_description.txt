@@ -111,6 +111,12 @@ Delete [b]PrivateStorageAnywhere.asi[/b] and [b]PrivateStorageAnywhere.ini[/b] f
 
 [size=3][b]Changelog[/b][/size]
 
+[b]v1.2.4[/b]
+[list]
+[*]Fixed: Auto-capture no longer grabs the wrong UI controller when other panels share the same base class — now validates warehouse-specific UI nodes before accepting
+[*]Fixed: Modal dialog offset scan now picks the correct (warehouse-specific) offset instead of a base class offset
+[/list]
+
 [b]v1.2.3[/b]
 [list]
 [*]QOL: Cursor is hidden immediately when closing the warehouse

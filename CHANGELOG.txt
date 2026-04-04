@@ -1,5 +1,9 @@
 Private Storage Anywhere — Changelog
 
+v1.2.4 (2026-04-04)
+- Fixed: Auto-capture no longer grabs the wrong UI controller when other panels share the same vtable (base class) — now validates warehouse-specific UI nodes (+0x0E0 top title, +0x300 bottom label) before accepting a controller
+- Fixed: Modal dialog offset scan now collects all matches and picks the largest (warehouse-specific) offset instead of stopping at the first match (base class offset)
+
 v1.2.3 (2026-04-04)
 - QOL: Cursor is hidden immediately when closing the warehouse
 - Improved: CanShow detection is now update-proof — primary vtable scan identifies CanShow by its +0x118 signature instead of relying on a fixed vtable offset, fallback pattern scan kept as safety net

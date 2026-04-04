@@ -6,7 +6,7 @@
 #include <string>
 
 // ============================================================
-//  Private Storage Anywhere v1.2.3
+//  Private Storage Anywhere v1.2.4
 //
 //  Opens the Camp Warehouse (Private Storage) from anywhere
 //  with a hotkey (default F6) or controller button.
@@ -649,14 +649,25 @@ extern "C" char __fastcall HookedCanShow(void* thisPtr) {
                 vtableMatch = true;
             }
             if (vtableMatch) {
-                InterlockedExchange64(&g_handlerThis, (LONG64)(uintptr_t)thisPtr);
-                handler = (uintptr_t)thisPtr;
-                uintptr_t sub = *(uintptr_t*)((uint8_t*)thisPtr + 0x08);
-                uint16_t panelId = sub ? *(uint16_t*)((uint8_t*)sub + 0x92) : 0xFFFF;
-                if (panelId != 0xFFFF && panelId != 0)
-                    InterlockedExchange(&g_warehousePanelId, (LONG)panelId);
-                Log("AUTO-CAPTURED warehouse controller: 0x%llX (vtable match, panelId=0x%04X)",
-                    (unsigned long long)thisPtr, panelId);
+                // Validate: real warehouse has valid UI nodes at +0x0E0 (top title)
+                // and +0x300 (bottom label). Other panels sharing the same vtable
+                // (base class) won't have these initialized.
+                uintptr_t topNode = *(uintptr_t*)((uint8_t*)thisPtr + 0x0E0);
+                uintptr_t bottomNode = *(uintptr_t*)((uint8_t*)thisPtr + 0x300);
+                if (topNode < 0x10000 || topNode > 0x7FFFFFFFFFFF ||
+                    bottomNode < 0x10000 || bottomNode > 0x7FFFFFFFFFFF) {
+                    // Not the warehouse — skip, don't lock vtable on first attempt
+                    if (!g_warehouseVtableStart) g_warehouseVtableStart = 0;
+                } else {
+                    InterlockedExchange64(&g_handlerThis, (LONG64)(uintptr_t)thisPtr);
+                    handler = (uintptr_t)thisPtr;
+                    uintptr_t sub = *(uintptr_t*)((uint8_t*)thisPtr + 0x08);
+                    uint16_t panelId = sub ? *(uint16_t*)((uint8_t*)sub + 0x92) : 0xFFFF;
+                    if (panelId != 0xFFFF && panelId != 0)
+                        InterlockedExchange(&g_warehousePanelId, (LONG)panelId);
+                    Log("AUTO-CAPTURED warehouse controller: 0x%llX (vtable match, panelId=0x%04X)",
+                        (unsigned long long)thisPtr, panelId);
+                }
             }
         } __except(EXCEPTION_EXECUTE_HANDLER) {}
     }
@@ -669,10 +680,16 @@ extern "C" char __fastcall HookedCanShow(void* thisPtr) {
                 uint16_t panelId = *(uint16_t*)((uint8_t*)sub + 0x92);
                 LONG expectedId = InterlockedCompareExchange(&g_warehousePanelId, 0, 0);
                 if (panelId == (uint16_t)expectedId) {
-                    InterlockedExchange64(&g_handlerThis, (LONG64)(uintptr_t)thisPtr);
-                    handler = (uintptr_t)thisPtr;
-                    Log("AUTO-CAPTURED warehouse controller: 0x%llX (panelId=0x%04X)",
-                        (unsigned long long)thisPtr, panelId);
+                    // Validate warehouse-specific UI nodes before accepting
+                    uintptr_t topNode = *(uintptr_t*)((uint8_t*)thisPtr + 0x0E0);
+                    uintptr_t bottomNode = *(uintptr_t*)((uint8_t*)thisPtr + 0x300);
+                    if (topNode > 0x10000 && topNode < 0x7FFFFFFFFFFF &&
+                        bottomNode > 0x10000 && bottomNode < 0x7FFFFFFFFFFF) {
+                        InterlockedExchange64(&g_handlerThis, (LONG64)(uintptr_t)thisPtr);
+                        handler = (uintptr_t)thisPtr;
+                        Log("AUTO-CAPTURED warehouse controller: 0x%llX (panelId=0x%04X)",
+                            (unsigned long long)thisPtr, panelId);
+                    }
                 }
             }
         } __except(EXCEPTION_EXECUTE_HANDLER) {}
@@ -1333,7 +1350,7 @@ static bool ResolveAddresses() {
                 // Only consider LEAs near the warehouse handler (same class)
                 if (g_fnHandler && leaModal > g_fnHandler + 0x10000) break;
                 uint8_t* p = (uint8_t*)leaModal;
-                for (int i = 0; i < 0xC00 && !g_modalDialogOff; i++) {
+                for (int i = 0; i < 0xC00; i++) {
                     uint8_t* q = p + i;
                     // Match: REX.W MOV [REG+disp32], RAX
                     if ((q[0] & 0xFE) != 0x48 || q[1] != 0x89) continue;
@@ -1359,9 +1376,10 @@ static bool ResolveAddresses() {
                             found = true;
                         }
                     }
-                    if (found) g_modalDialogOff = disp;
+                    // Keep the largest matching offset (warehouse-specific > base class)
+                    if (found && disp > g_modalDialogOff) g_modalDialogOff = disp;
                 }
-                if (g_modalDialogOff) break;
+                // Continue scanning all LEAs — don't stop at first match
                 searchFrom = leaModal + 1;
             }
         }
@@ -1567,7 +1585,7 @@ static DWORD WINAPI ModThread(LPVOID) {
     if(!g_enabled)return 0;
     if(g_debugLog){std::string lp=ip.substr(0,ip.rfind('.'))+".log";g_logFile=fopen(lp.c_str(),"w");}
 
-    Log("=== Private Storage Anywhere v1.2.3 ===");
+    Log("=== Private Storage Anywhere v1.2.4 ===");
     {char cls[256]={};char ttl[256]={};GetClassNameA(g_gameWindow,cls,256);GetWindowTextA(g_gameWindow,ttl,256);
     Log("Game window: class='%s' title='%s'",cls,ttl);}
     g_gameBase=(uintptr_t)GetModuleHandleA("CrimsonDesert.exe");
