@@ -6,7 +6,7 @@
 #include <string>
 
 // ============================================================
-//  Private Storage Anywhere v1.2.5
+//  Private Storage Anywhere v1.2.6
 //
 //  Opens the Camp Warehouse (Private Storage) from anywhere
 //  with a hotkey (default F6) or controller button.
@@ -809,6 +809,16 @@ static void TriggerWarehouse(bool fromKeyboard = false) {
         // scene registration functions (FUN_1433c4100 + thunk_FUN_1558a7380).
         // Manual +0x118/+0x21A setting is no longer sufficient after the game update.
         uintptr_t handler = (uintptr_t)InterlockedCompareExchange64(&g_handlerThis, 0, 0);
+
+        // Clear stale modal dialog pointer from previous warehouse sessions
+        // State checks above guarantee no menu is open, so pointer is safe to null
+        if (handler && g_modalDialogOff) {
+            __try {
+                *(uintptr_t*)(handler + g_modalDialogOff) = 0;
+                Log("  Cleared stale modal pointer at +0x%X", g_modalDialogOff);
+            } __except(EXCEPTION_EXECUTE_HANDLER) {}
+        }
+
         if (handler && g_fnHandler) {
             __try {
                 uint8_t showPacket[24] = {};
@@ -903,6 +913,11 @@ static void TriggerWarehouse(bool fromKeyboard = false) {
         Log("  Warehouse opened (mode=0x%02X sub=0x%02X)", mc[0xCA8], mc[0xCA9]);
 
     } else {
+        // Block close while modal dialog is active (fixes F6 + controller toggle)
+        if (IsNewModalDialogVisible()) {
+            Log("CLOSE BLOCKED: modal dialog still active");
+            return;
+        }
         Log("=== CLOSING WAREHOUSE ===");
         InterlockedExchange(&g_warehouseActive, 0);
 
@@ -1567,7 +1582,7 @@ static DWORD WINAPI ModThread(LPVOID) {
     if(!g_enabled)return 0;
     if(g_debugLog){std::string lp=ip.substr(0,ip.rfind('.'))+".log";g_logFile=fopen(lp.c_str(),"w");}
 
-    Log("=== Private Storage Anywhere v1.2.5 ===");
+    Log("=== Private Storage Anywhere v1.2.6 ===");
     {char cls[256]={};char ttl[256]={};GetClassNameA(g_gameWindow,cls,256);GetWindowTextA(g_gameWindow,ttl,256);
     Log("Game window: class='%s' title='%s'",cls,ttl);}
     g_gameBase=(uintptr_t)GetModuleHandleA("CrimsonDesert.exe");

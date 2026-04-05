@@ -111,6 +111,12 @@ Delete [b]PrivateStorageAnywhere.asi[/b] and [b]PrivateStorageAnywhere.ini[/b] f
 
 [size=3][b]Changelog[/b][/size]
 
+[b]v1.2.6[/b]
+[list]
+[*]Fixed: F6 and controller toggle button could close the warehouse while a quantity/confirm dialog was still open
+[*]Fixed: Phantom modal bug — after visiting the camp NPC warehouse, ESC sometimes wouldn't close the mod-opened warehouse until you manually opened and closed a dialog first
+[/list]
+
 [b]v1.2.5[/b]
 [list]
 [*]Fixed: Warehouse panel sometimes not opening after game update (HUD disappeared but no storage UI) — caused by auto-capture permanently locking onto a wrong UI controller

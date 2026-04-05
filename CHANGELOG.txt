@@ -1,5 +1,9 @@
 Private Storage Anywhere — Changelog
 
+v1.2.6 (2026-04-05)
+- Fixed: F6 and controller toggle button could close the warehouse while a modal dialog (quantity/confirm) was still open — now blocks close when any modal is active
+- Fixed: Phantom modal bug — stale dialog pointer from previous camp NPC warehouse visits could make the mod think a modal was active when nothing was visible, preventing ESC from closing the warehouse. Modal pointer is now cleared on every F6 open.
+
 v1.2.5 (2026-04-04)
 - Fixed: Auto-capture no longer locks permanently onto the wrong panel — the previous vtable range check was tautological (always matched any nearby panel) and the reset after failed validation was a no-op, causing the warehouse controller to never be found after a wrong panel was checked first
 - Improved: Auto-capture now uses exact vtable match instead of offset-based range check — vtable start is resolved at init via RTTI Complete Object Locator scan, uniquely identifying the UIGamePlayControlRootWarehouse2 class
