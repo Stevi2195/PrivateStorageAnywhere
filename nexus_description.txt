@@ -111,6 +111,12 @@ Delete [b]PrivateStorageAnywhere.asi[/b] and [b]PrivateStorageAnywhere.ini[/b] f
 
 [size=3][b]Changelog[/b][/size]
 
+[b]v1.3.0[/b]
+[list]
+[*]Fixed: Random crashes after 2026-04-11 game update — the warehouse handler struct was reorganized, shifting the bottom-label pointer by 8 bytes; the mod was writing text to the wrong address
+[*]Improved: All struct offsets (active flag, mainChar mode bytes, bottom label) are now resolved dynamically from game code at startup instead of being hardcoded — future updates that shift these offsets no longer require a mod rebuild
+[/list]
+
 [b]v1.2.6[/b]
 [list]
 [*]Fixed: F6 and controller toggle button could close the warehouse while a quantity/confirm dialog was still open

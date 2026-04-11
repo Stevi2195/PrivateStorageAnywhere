@@ -1,5 +1,9 @@
 Private Storage Anywhere — Changelog
 
+v1.3.0 (2026-04-11)
+- Fixed: Random crashes after 2026-04-11 game update — the warehouse handler struct was reorganized, shifting the bottom-label pointer from +0x300 to +0x308; the mod was writing UI text to the wrong address (a sub-object pointer), corrupting memory
+- Improved: All struct offsets are now resolved dynamically at startup instead of being hardcoded constants — the mod scans CanShow, ModeSwitcher and the warehouse handler to extract active flag, mainChar mode bytes, and bottom-label offsets directly from the game code. Future updates that shift these offsets should no longer require a mod rebuild.
+
 v1.2.6 (2026-04-05)
 - Fixed: F6 and controller toggle button could close the warehouse while a modal dialog (quantity/confirm) was still open — now blocks close when any modal is active
 - Fixed: Phantom modal bug — stale dialog pointer from previous camp NPC warehouse visits could make the mod think a modal was active when nothing was visible, preventing ESC from closing the warehouse. Modal pointer is now cleared on every F6 open.

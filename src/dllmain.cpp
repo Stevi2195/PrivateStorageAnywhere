@@ -6,7 +6,7 @@
 #include <string>
 
 // ============================================================
-//  Private Storage Anywhere v1.2.6
+//  Private Storage Anywhere v1.3.0
 //
 //  Opens the Camp Warehouse (Private Storage) from anywhere
 //  with a hotkey (default F6) or controller button.
@@ -34,6 +34,21 @@ static uintptr_t g_warehouseVtableEntry = 0;  // vtable address containing handl
 static uintptr_t g_warehouseVtableStart = 0;  // vtable start of warehouse class — set on first successful capture
 static uint32_t  g_modalDialogOff = 0;     // handler+N stores active dialog pointer (0x338 in current build, was 0x240)
 static uintptr_t g_langByteAddr = 0;      // address of language byte (resolved dynamically from Steam API init function)
+
+// Struct offsets — all resolved dynamically from game code at runtime (update-proof).
+// Defaults match the build in which each offset was first discovered; they serve as
+// a sane fallback if the dynamic resolver fails.  DO NOT use the default values
+// directly in code — always go through these variables.
+static uint32_t g_offActiveFlag   = 0x118;  // handler+N: u8 active flag (read by CanShow)
+static uint32_t g_offPanelValue   = 0x110;  // handler+N: panel value (set by base-class 0x0e)
+static uint32_t g_offBottomLabel  = 0x308;  // handler+N: cpp-ware-house-inventory-title node
+static uint32_t g_offTopTitle     = 0x0E0;  // handler+N: top title / NpcInteractionTitle node
+static uint32_t g_offSubObject    = 0x08;   // handler+N: ptr to sub-object (contains panelId)
+static uint32_t g_offSubPanelId   = 0x92;   // subObject+N: u16 panelId
+static uint32_t g_offModeByte     = 0xCA8;  // mainChar+N: u8 current mode
+static uint32_t g_offSubByte      = 0xCA9;  // mainChar+N: u8 current sub-mode
+static uint32_t g_offModeFlags    = 0xCB1;  // mainChar+N: mode flag array (7 bytes)
+static uint32_t g_offSubtypes     = 0xCB8;  // mainChar+N: subtype array (16 bytes)
 
 // Captured game state (accessed from multiple threads via Interlocked ops)
 static volatile LONG64 g_mainChar = 0;
@@ -547,9 +562,9 @@ extern "C" void __fastcall CaptureOnHandler(void* thisPtr, void* rdx) {
         // Resolve panelId dynamically from the handler's sub-object
         // This makes the mod compatible with UI-mods that change panel registration order
         __try {
-            uintptr_t sub = *(uintptr_t*)((uint8_t*)thisPtr + 0x08);
+            uintptr_t sub = *(uintptr_t*)((uint8_t*)thisPtr + g_offSubObject);
             if (sub) {
-                uint16_t realId = *(uint16_t*)((uint8_t*)sub + 0x92);
+                uint16_t realId = *(uint16_t*)((uint8_t*)sub + g_offSubPanelId);
                 if (realId != 0xFFFF && realId != 0) {
                     InterlockedExchange(&g_warehousePanelId, (LONG)realId);
                     Log("  Dynamic panelId: 0x%04X", realId);
@@ -612,8 +627,8 @@ extern "C" void __fastcall CaptureModeSwitcher(void* rcx) {
         uint8_t* mc = (uint8_t*)(uintptr_t)InterlockedCompareExchange64(&g_mainChar, 0, 0);
         if (mc) {
             while (InterlockedCompareExchange(&g_modeByteLock, 1, 0) != 0) { _mm_pause(); }
-            memcpy(mc + 0xCB1, g_savedModes, 7);
-            memcpy(mc + 0xCB8, g_savedSubtypes, 15);
+            memcpy(mc + g_offModeFlags, g_savedModes, 7);
+            memcpy(mc + g_offSubtypes, g_savedSubtypes, 15);
             InterlockedExchange(&g_modeByteLock, 0);
         }
     }
@@ -638,8 +653,8 @@ extern "C" char __fastcall HookedCanShow(void* thisPtr) {
             if (objVtable == g_warehouseVtableStart) {
                 InterlockedExchange64(&g_handlerThis, (LONG64)(uintptr_t)thisPtr);
                 handler = (uintptr_t)thisPtr;
-                uintptr_t sub = *(uintptr_t*)((uint8_t*)thisPtr + 0x08);
-                uint16_t panelId = sub ? *(uint16_t*)((uint8_t*)sub + 0x92) : 0xFFFF;
+                uintptr_t sub = *(uintptr_t*)((uint8_t*)thisPtr + g_offSubObject);
+                uint16_t panelId = sub ? *(uint16_t*)((uint8_t*)sub + g_offSubPanelId) : 0xFFFF;
                 if (panelId != 0xFFFF && panelId != 0)
                     InterlockedExchange(&g_warehousePanelId, (LONG)panelId);
                 Log("AUTO-CAPTURED warehouse controller: 0x%llX (exact vtable, panelId=0x%04X)",
@@ -651,21 +666,21 @@ extern "C" char __fastcall HookedCanShow(void* thisPtr) {
     if (InterlockedCompareExchange(&g_warehouseActive, 0, 0)) {
         if (handler && (uintptr_t)thisPtr == handler) {
             __try {
-                uint8_t activeFlag = *(uint8_t*)((uint8_t*)thisPtr + 0x118);
+                uint8_t activeFlag = *(uint8_t*)((uint8_t*)thisPtr + g_offActiveFlag);
                 if (activeFlag == 1) {
                     // Panel is alive — remember we've seen it active
                     InterlockedExchange(&g_canShowSeen118, 1);
                 } else if (activeFlag == 0 && InterlockedCompareExchange(&g_canShowSeen118, 0, 0)) {
-                    // +0x118 went from 1→0: game closed the panel (B/Circle/Cancel3)
-                    Log("  CanShow: game-initiated close detected (+0x118: 1→0)");
+                    // active flag went from 1→0: game closed the panel (B/Circle/Cancel3)
+                    Log("  CanShow: game-initiated close detected (active flag 1→0)");
                     InterlockedExchange(&g_warehouseActive, 0);
                     InterlockedExchange(&g_canShowSeen118, 0);
                     InterlockedExchange(&g_modeSwitchByMod, 0);
                     uintptr_t mc = (uintptr_t)InterlockedCompareExchange64(&g_mainChar, 0, 0);
                     if (mc) {
                         while (InterlockedCompareExchange(&g_modeByteLock, 1, 0) != 0) { _mm_pause(); }
-                        memcpy((uint8_t*)mc + 0xCB1, g_savedModes, 7);
-                        memcpy((uint8_t*)mc + 0xCB8, g_savedSubtypes, 15);
+                        memcpy((uint8_t*)mc + g_offModeFlags, g_savedModes, 7);
+                        memcpy((uint8_t*)mc + g_offSubtypes, g_savedSubtypes, 15);
                         InterlockedExchange(&g_modeByteLock, 0);
                     }
                     return g_origCanShow(thisPtr);
@@ -675,15 +690,15 @@ extern "C" char __fastcall HookedCanShow(void* thisPtr) {
         }
         // Blanket suppress ALL other panels while warehouse is active.
         // Do NOT delegate to origCanShow here — it has internal side-effects
-        // (CALL 0x1433af8c0) that corrupt game state and cause the warehouse
-        // to reappear during subsequent NPC interactions.
+        // that corrupt game state and cause the warehouse to reappear during
+        // subsequent NPC interactions.
         __try {
-            uintptr_t sub = *(uintptr_t*)((uint8_t*)thisPtr + 0x08);
-            uint16_t pid = sub ? *(uint16_t*)((uint8_t*)sub + 0x92) : 0xFFFF;
-            uint8_t flag118 = *(uint8_t*)((uint8_t*)thisPtr + 0x118);
-            if (flag118)
-                Log("  CanShow: suppressed panel 0x%04X (+0x118=%d, thisPtr=0x%llX)",
-                    pid, flag118, (unsigned long long)thisPtr);
+            uintptr_t sub = *(uintptr_t*)((uint8_t*)thisPtr + g_offSubObject);
+            uint16_t pid = sub ? *(uint16_t*)((uint8_t*)sub + g_offSubPanelId) : 0xFFFF;
+            uint8_t flag = *(uint8_t*)((uint8_t*)thisPtr + g_offActiveFlag);
+            if (flag)
+                Log("  CanShow: suppressed panel 0x%04X (active=%d, thisPtr=0x%llX)",
+                    pid, flag, (unsigned long long)thisPtr);
         } __except(EXCEPTION_EXECUTE_HANDLER) {}
         return 0;
     }
@@ -785,18 +800,18 @@ static void TriggerWarehouse(bool fromKeyboard = false) {
     PFN_ModeSwitcher fnMode = (PFN_ModeSwitcher)g_fnModeSwitcher;
 
     if (!InterlockedCompareExchange(&g_warehouseActive, 0, 0)) {
-        uint8_t curSub = mc[0xCA9];
+        uint8_t curSub = mc[g_offSubByte];
         if (curSub != 0x0E && curSub != 0x0F) { Log("BLOCKED: unsafe state (sub=0x%02X)", curSub); return; }
 
         Log("=== OPENING WAREHOUSE ===");
         // Acquire spinlock for mode byte access (prevents race with game thread)
         while (InterlockedCompareExchange(&g_modeByteLock, 1, 0) != 0) { _mm_pause(); }
-        memcpy(g_savedModes, mc + 0xCB1, 7);
-        memcpy(g_savedSubtypes, mc + 0xCB8, 15);
-        memset(mc + 0xCB1, 0, 7);
-        memset(mc + 0xCB8, 0, 15);
-        mc[0xCB1 + 4] = 1;
-        mc[0xCB8 + 5] = 1;
+        memcpy(g_savedModes, mc + g_offModeFlags, 7);
+        memcpy(g_savedSubtypes, mc + g_offSubtypes, 15);
+        memset(mc + g_offModeFlags, 0, 7);
+        memset(mc + g_offSubtypes, 0, 15);
+        mc[g_offModeFlags + 4] = 1;
+        mc[g_offSubtypes + 5] = 1;
         InterlockedExchange(&g_modeByteLock, 0);
 
         InterlockedExchange(&g_canShowSeen118, 0);
@@ -805,9 +820,8 @@ static void TriggerWarehouse(bool fromKeyboard = false) {
         g_openTimestamp = GetTickCount64();
 
         // Activate warehouse panel via the game's own base-class handler (command 0x0e).
-        // This properly sets +0x118, attaches the scene object, and calls the
-        // scene registration functions (FUN_1433c4100 + thunk_FUN_1558a7380).
-        // Manual +0x118/+0x21A setting is no longer sufficient after the game update.
+        // This properly sets the active flag, attaches the scene object, and calls the
+        // scene registration functions.  Manual flag setting is not sufficient.
         uintptr_t handler = (uintptr_t)InterlockedCompareExchange64(&g_handlerThis, 0, 0);
 
         // Clear stale modal dialog pointer from previous warehouse sessions
@@ -829,7 +843,7 @@ static void TriggerWarehouse(bool fromKeyboard = false) {
             } __except(EXCEPTION_EXECUTE_HANDLER) {
                 Log("  Panel show via 0x0e EXCEPTION, falling back to manual");
                 __try {
-                    *(uint8_t*)(handler + 0x118) = 1;
+                    *(uint8_t*)(handler + g_offActiveFlag) = 1;
                 } __except(EXCEPTION_EXECUTE_HANDLER) {}
             }
         }
@@ -865,9 +879,8 @@ static void TriggerWarehouse(bool fromKeyboard = false) {
             }
         }
 
-        // Fix bottom inventory label using verified offset from Ghidra:
-        // handler+0x300 = selector-warehouse-inventory-title (.cpp-ware-house-inventory-title)
-        // Verified: handler decompilation shows FUN_1433ab4b0(handler+0x300, text) for SetWareHouseInventoryName
+        // Fix bottom inventory label using dynamically-resolved offset
+        // (cpp-ware-house-inventory-title node pointer — handler+g_offBottomLabel)
         if (handler && g_fnSetTitle) {
             typedef uint8_t (__fastcall *PFN_SetTitle)(uintptr_t, const char*);
             PFN_SetTitle setTitle = (PFN_SetTitle)g_fnSetTitle;
@@ -875,42 +888,43 @@ static void TriggerWarehouse(bool fromKeyboard = false) {
             bool needUtf8Fix = !IsAscii(title);
 
             __try {
-                uintptr_t bottomLabel = *(uintptr_t*)(handler + 0x300);
-                if (bottomLabel) {
+                uintptr_t bottomLabel = *(uintptr_t*)(handler + g_offBottomLabel);
+                if (bottomLabel > 0x10000 && bottomLabel < 0x7FFFFFFFFFFF) {
                     setTitle(bottomLabel, title);
-                    Log("  Bottom label (+0x300) set: lang=%d needFix=%d", GetGameLanguage(), needUtf8Fix);
-                    // For non-ASCII titles: ensure the renderer has correct
-                    // wchar_t text.  SetTitle's direct path stores raw UTF-8
-                    // bytes which the renderer zero-extends (garbling CJK/accented).
-                    // SetTitleOnRenderer calls FUN_1434159c0 which properly
-                    // decodes UTF-8 → wchar_t via FUN_141010f90.
+                    Log("  Bottom label (+0x%X) set: lang=%d needFix=%d",
+                        g_offBottomLabel, GetGameLanguage(), needUtf8Fix);
+                    // For non-ASCII titles: ensure the renderer has correct wchar_t text.
                     if (needUtf8Fix) {
                         bool fixed = SetTitleOnRenderer(bottomLabel, title, 0);
                         Log("  Bottom label UTF-8 fix: %s", fixed ? "OK" : "no renderer found");
                     }
+                } else {
+                    Log("  Bottom label (+0x%X) invalid pointer", g_offBottomLabel);
                 }
-            } __except(EXCEPTION_EXECUTE_HANDLER) {}
+            } __except(EXCEPTION_EXECUTE_HANDLER) {
+                Log("  Bottom label (+0x%X) EXCEPTION", g_offBottomLabel);
+            }
 
-            // === FIX TOP TITLE: SetTitle on handler+0x0E0 ===
+            // Top title — pointer validated at runtime since offset is not dynamically resolved
             __try {
-                uintptr_t topNode = *(uintptr_t*)(handler + 0x0E0);
+                uintptr_t topNode = *(uintptr_t*)(handler + g_offTopTitle);
                 if (topNode > 0x10000 && topNode < 0x7FFFFFFFFFFF) {
                     uint8_t ret = setTitle(topNode, title);
-                    Log("  Top title (+0x0E0) set: lang=%d ret=%u", GetGameLanguage(), (unsigned)ret);
+                    Log("  Top title (+0x%X) set: lang=%d ret=%u",
+                        g_offTopTitle, GetGameLanguage(), (unsigned)ret);
                     if (needUtf8Fix) {
                         bool fixed = SetTitleOnRenderer(topNode, title, 0);
                         Log("  Top title UTF-8 fix: %s", fixed ? "OK" : "no renderer found");
                     }
                 } else {
-                    Log("  Top title (+0x0E0) invalid pointer");
+                    Log("  Top title (+0x%X) invalid pointer — skipping", g_offTopTitle);
                 }
             } __except(EXCEPTION_EXECUTE_HANDLER) {
-                Log("  Top title (+0x0E0) EXCEPTION");
+                Log("  Top title (+0x%X) EXCEPTION", g_offTopTitle);
             }
-
         }
 
-        Log("  Warehouse opened (mode=0x%02X sub=0x%02X)", mc[0xCA8], mc[0xCA9]);
+        Log("  Warehouse opened (mode=0x%02X sub=0x%02X)", mc[g_offModeByte], mc[g_offSubByte]);
 
     } else {
         // Block close while modal dialog is active (fixes F6 + controller toggle)
@@ -922,7 +936,7 @@ static void TriggerWarehouse(bool fromKeyboard = false) {
         InterlockedExchange(&g_warehouseActive, 0);
 
         // Hide warehouse panel via the game's base-class handler (command 0x0f).
-        // This properly clears +0x118, detaches the scene object, and calls
+        // This properly clears the active flag, detaches the scene object, and calls
         // scene deregistration — symmetric to the 0x0e show command on open.
         uintptr_t closeHandler = (uintptr_t)InterlockedCompareExchange64(&g_handlerThis, 0, 0);
         if (closeHandler && g_fnHandler) {
@@ -935,20 +949,20 @@ static void TriggerWarehouse(bool fromKeyboard = false) {
             } __except(EXCEPTION_EXECUTE_HANDLER) {
                 // Fallback: manual cleanup
                 __try {
-                    *(uint8_t*)(closeHandler + 0x118) = 0;
+                    *(uint8_t*)(closeHandler + g_offActiveFlag) = 0;
                 } __except(EXCEPTION_EXECUTE_HANDLER) {}
                 Log("  Panel hide via 0x0f EXCEPTION, manual fallback");
             }
         } else if (closeHandler) {
             __try {
-                *(uint8_t*)(closeHandler + 0x118) = 0;
-                Log("  Cleared +0x118 manually (no handler func)");
+                *(uint8_t*)(closeHandler + g_offActiveFlag) = 0;
+                Log("  Cleared active flag manually (no handler func)");
             } __except(EXCEPTION_EXECUTE_HANDLER) {}
         }
 
         while (InterlockedCompareExchange(&g_modeByteLock, 1, 0) != 0) { _mm_pause(); }
-        memcpy(mc + 0xCB1, g_savedModes, 7);
-        memcpy(mc + 0xCB8, g_savedSubtypes, 15);
+        memcpy(mc + g_offModeFlags, g_savedModes, 7);
+        memcpy(mc + g_offSubtypes, g_savedSubtypes, 15);
         InterlockedExchange(&g_modeByteLock, 0);
 
         // QOL: Hide cursor immediately when closing warehouse
@@ -971,7 +985,7 @@ static void TriggerWarehouse(bool fromKeyboard = false) {
             InterlockedExchange(&g_modeSwitchByMod, 0);
         }
 
-        Log("  Warehouse closed (mode=0x%02X sub=0x%02X)", mc[0xCA8], mc[0xCA9]);
+        Log("  Warehouse closed (mode=0x%02X sub=0x%02X)", mc[g_offModeByte], mc[g_offSubByte]);
     }
 }
 
@@ -1065,7 +1079,7 @@ static DWORD WINAPI InputThread(LPVOID) {
         // Don't poll in unsafe states
         uintptr_t mc = (uintptr_t)InterlockedCompareExchange64(&g_mainChar, 0, 0);
         if (mc && !InterlockedCompareExchange(&g_warehouseActive, 0, 0)) {
-            uint8_t curSub = ((uint8_t*)mc)[0xCA9];
+            uint8_t curSub = ((uint8_t*)mc)[g_offSubByte];
             if (curSub != 0x0E && curSub != 0x0F) continue;
         }
 
@@ -1208,6 +1222,51 @@ static bool ResolveAddresses() {
     Log("SetTitle:     %s base+0x%llX (string-xref)", g_fnSetTitle?"OK":"FAIL",
         g_fnSetTitle?(unsigned long long)(g_fnSetTitle-g_gameBase):0);
 
+    // Step 3a: Extract bottom-label offset from the handler's SetWareHouseInventoryName branch.
+    // The handler does:  uVar3 = *(undefined8 *)(param_1 + OFFSET);  ...  SetTitle(uVar3, text);
+    // The LOAD ("mov r64, [rXX+disp32]", opcode 48 8B, ModRM mod=10) sits within ~0x100 bytes
+    // before the CALL to SetTitle.  Take the MATCH NEAREST to the CALL.
+    if (g_fnHandler && g_fnSetTitle) {
+        uintptr_t strSetName = FindString("SetWareHouseInventoryName");
+        if (strSetName) {
+            uintptr_t leaAddr = FindLEA(strSetName, g_fnHandler);
+            if (leaAddr && leaAddr < g_fnHandler + 0x1000) {
+                // Locate the CALL to g_fnSetTitle after leaAddr
+                uintptr_t callSite = 0;
+                for (int i = 0; i < 400; i++) {
+                    uint8_t* p = (uint8_t*)(leaAddr + i);
+                    if (p[0] != 0xE8) continue;
+                    int32_t rel = *(int32_t*)(p + 1);
+                    if ((uintptr_t)(p + 5) + rel == g_fnSetTitle) {
+                        callSite = leaAddr + i;
+                        break;
+                    }
+                }
+                if (callSite) {
+                    // Walk backwards from callSite looking for MOV r64, [rXX+disp32]
+                    // Encoding: REX.W (48-4F), 8B, ModRM (mod=10 → 0x80-0xBF), optional SIB, disp32
+                    uint32_t bestDisp = 0;
+                    for (uintptr_t a = callSite - 3; a > leaAddr; a--) {
+                        uint8_t* p = (uint8_t*)a;
+                        if (p[0] < 0x48 || p[0] > 0x4F) continue;
+                        if (p[1] != 0x8B) continue;
+                        if ((p[2] & 0xC0) != 0x80) continue;      // mod must be 10
+                        int dispOff = 3;
+                        if ((p[2] & 0x07) == 0x04) dispOff = 4;    // SIB byte present
+                        uint32_t disp = *(uint32_t*)(p + dispOff);
+                        if (disp >= 0x100 && disp < 0x1000) {
+                            bestDisp = disp;
+                            break;  // closest match wins
+                        }
+                    }
+                    if (bestDisp) g_offBottomLabel = bestDisp;
+                }
+            }
+        }
+    }
+    Log("BottomLabel:  %s offset=0x%X (handler → SetTitle callsite)",
+        g_offBottomLabel ? "OK" : "FAIL", g_offBottomLabel);
+
     // Step 3b: Find SetTitleDirect (FUN_1434159c0) from inside SetTitle.
     // SetTitle checks node+0xA8 (bridge). If bridge+8 (renderer) exists,
     // it calls SetTitleDirect(renderer, text) — which does proper UTF-8→wchar.
@@ -1273,31 +1332,54 @@ static bool ResolveAddresses() {
                     resolved = candidate + 5 + rel;
                 }
                 if (resolved <= g_gameBase || resolved >= g_gameBase + g_imageSize) continue;
-                // Check CanShow signature: MOVZX reg, byte [reg+0x118] anywhere in first 0x200 bytes
-                // Encoding: (optional REX 41-44) 0F B6 modrm 18 01 00 00, modrm mod=10 (disp32)
+                // Check CanShow signature.  CanShow's hot path ends with:
+                //     movzx eax, byte ptr [thisPtr+disp32]
+                //     ret                              (optionally preceded by stack cleanup)
+                // We require: MOVZX destination is EAX (reg field = 000), mod = 10 (disp32),
+                // r/m != 100 (no SIB), and the instruction is followed within a few bytes by
+                // a RET (C3).  Constraining reg=000 rules out the many unrelated MOVZX uses
+                // that would otherwise produce false positives on arbitrary virtual functions.
                 uint8_t* fn = (uint8_t*)resolved;
-                for (int j = 0; j < 0x200; j++) {
-                    bool found = false;
-                    if (fn[j] == 0x0F && fn[j+1] == 0xB6 &&
-                        (fn[j+2] & 0xC0) == 0x80 &&
-                        *(uint32_t*)(fn + j + 3) == 0x118) {
-                        found = true;
+                uint32_t matchDisp = 0;
+                for (int j = 0; j < 0x200 - 8 && !matchDisp; j++) {
+                    uint8_t* p = fn + j;
+                    int instrLen = 0;
+                    uint32_t d = 0;
+                    // Case A: 0F B6 8X disp32  (MOVZX eax/ecx/edx... from [reg+disp32])
+                    // We want reg=000 (EAX), so modrm in 0x80-0x87 (but not 0x84 = SIB)
+                    if (p[0] == 0x0F && p[1] == 0xB6 &&
+                        (p[2] & 0xF8) == 0x80 && p[2] != 0x84) {
+                        d = *(uint32_t*)(p + 3);
+                        instrLen = 7;
                     }
-                    if (!found && (fn[j] & 0xFC) == 0x40 &&  // any REX prefix (40-4F)
-                        fn[j+1] == 0x0F && fn[j+2] == 0xB6 &&
-                        (fn[j+3] & 0xC0) == 0x80 &&
-                        *(uint32_t*)(fn + j + 4) == 0x118) {
-                        found = true;
+                    // Case B: REX prefix + MOVZX (8 bytes total)
+                    // REX byte 0x44 adds R bit to target reg — for EAX target no REX.R needed.
+                    // REX 0x48 is W (64-bit), but MOVZX doesn't use W.  Only REX.B (0x41) would
+                    // change the source base register.  Accept REX bytes 0x40-0x47 (no R bit).
+                    else if (p[0] >= 0x40 && p[0] <= 0x47 &&
+                             p[1] == 0x0F && p[2] == 0xB6 &&
+                             (p[3] & 0xF8) == 0x80 && p[3] != 0x84) {
+                        d = *(uint32_t*)(p + 4);
+                        instrLen = 8;
                     }
-                    if (found) {
-                        g_fnCanShow = resolved;
-                        g_warehouseVtableEntry = vtableEntry;
-                        Log("  Vtable at base+0x%llX, CanShow at base+0x%llX (vtable offset 0x%llX)",
-                            (unsigned long long)(vtableEntry - g_gameBase),
-                            (unsigned long long)(resolved - g_gameBase),
-                            (unsigned long long)(v - vtableEntry));
-                        break;
+                    if (!instrLen || d < 0x40 || d >= 0x2000) continue;
+                    // Require a RET within 6 bytes after the MOVZX (allows short epilog like
+                    // `add rsp, XX; ret` or `pop rbp; ret`).
+                    bool retNearby = false;
+                    for (int k = 0; k < 6; k++) {
+                        if (p[instrLen + k] == 0xC3) { retNearby = true; break; }
                     }
+                    if (!retNearby) continue;
+                    matchDisp = d;
+                }
+                if (matchDisp) {
+                    g_fnCanShow = resolved;
+                    g_warehouseVtableEntry = vtableEntry;
+                    g_offActiveFlag = matchDisp;
+                    Log("  Vtable at base+0x%llX, CanShow at base+0x%llX (vtable offset 0x%llX), active flag offset 0x%X",
+                        (unsigned long long)(vtableEntry - g_gameBase),
+                        (unsigned long long)(resolved - g_gameBase),
+                        (unsigned long long)(v - vtableEntry), matchDisp);
                 }
             }
         }
@@ -1384,33 +1466,49 @@ static bool ResolveAddresses() {
     Log("ModalDlgOff:  %s offset=0x%X (string-xref → MOV [REG+N])",
         g_modalDialogOff?"OK":"FAIL", g_modalDialogOff);
 
-    // Step 5: ModeSwitcher — pattern scan + post-validation (no string anchor available)
+    // Step 5: ModeSwitcher — pattern scan + dynamic offset extraction
+    // The ModeSwitcher function references 4 mainChar offsets in the 0x0C00-0x0D00 range:
+    //   mode byte (u8), sub byte (u8), mode flags array (7 bytes), subtypes array (16 bytes)
+    // Find any disp32 in that range — take min and max, derive the other offsets.
     static const uint8_t pMS[] = {
         0x48,0x89,0x5C,0x24,0x08, 0x48,0x89,0x6C,0x24,0x10,
         0x48,0x89,0x74,0x24,0x18, 0x57, 0x48,0x81,0xEC,0xA0,0x00,0x00,0x00
     };
-    // Scan all matches and validate each (pattern has 9 matches, only 1 references 0xCB1)
     {
         uint8_t* base = (uint8_t*)g_gameBase;
         for (DWORD i = 0; (DWORD)(i + sizeof(pMS)) <= g_imageSize; i++) {
-            if (memcmp(base + i, pMS, sizeof(pMS)) == 0) {
-                uintptr_t candidate = g_gameBase + i;
-                // Validate: the correct ModeSwitcher references offset 0xCB1 within first 0x80 bytes
-                bool valid = false;
-                uint8_t* fn = (uint8_t*)candidate;
-                for (int k = 0; k < 0x80; k++) {
-                    if (fn[k] == 0xB1 && fn[k+1] == 0x0C && fn[k+2] == 0x00 && fn[k+3] == 0x00) {
-                        // Found 0x00000CB1 displacement (little-endian)
-                        valid = true;
-                        break;
-                    }
-                }
-                if (valid) {
-                    g_fnModeSwitcher = candidate;
-                    Log("ModeSwitcher: OK base+0x%llX (pattern+validated, match #%d)",
-                        (unsigned long long)(candidate - g_gameBase), i);
-                    break;
-                }
+            if (memcmp(base + i, pMS, sizeof(pMS)) != 0) continue;
+            uintptr_t candidate = g_gameBase + i;
+            uint8_t* fn = (uint8_t*)candidate;
+            // Scan first 0x200 bytes for disp32 values in plausible mainChar mode-byte range.
+            // Two possible encodings for `[reg+disp32]` memory operand:
+            //   A) ModRM @ k-1 with mod=10 and r/m != 100 (no SIB)
+            //   B) ModRM @ k-2 with mod=10 and r/m == 100, SIB @ k-1 (for indexed access
+            //      like [rcx+rax+disp32] used by the loops reading flag/subtype arrays)
+            uint32_t minDisp = 0, maxDisp = 0;
+            for (int k = 2; k < 0x200 - 4; k++) {
+                uint8_t modrmA = fn[k - 1];
+                uint8_t modrmB = fn[k - 2];
+                bool caseA = ((modrmA & 0xC0) == 0x80) && ((modrmA & 0x07) != 0x04);
+                bool caseB = ((modrmB & 0xC0) == 0x80) && ((modrmB & 0x07) == 0x04);
+                if (!caseA && !caseB) continue;
+                uint32_t disp = *(uint32_t*)(fn + k);
+                if (disp < 0xC00 || disp >= 0xD00) continue;
+                if (!minDisp || disp < minDisp) minDisp = disp;
+                if (disp > maxDisp) maxDisp = disp;
+            }
+            if (minDisp && maxDisp && maxDisp > minDisp) {
+                // minDisp = mode byte (e.g. 0xCA8), minDisp+1 = sub byte
+                // maxDisp = subtypes start, maxDisp-7 = mode flags start
+                g_fnModeSwitcher = candidate;
+                g_offModeByte  = minDisp;
+                g_offSubByte   = minDisp + 1;
+                g_offSubtypes  = maxDisp;
+                g_offModeFlags = maxDisp - 7;
+                Log("ModeSwitcher: OK base+0x%llX (mode=0x%X sub=0x%X flags=0x%X subtypes=0x%X)",
+                    (unsigned long long)(candidate - g_gameBase),
+                    g_offModeByte, g_offSubByte, g_offModeFlags, g_offSubtypes);
+                break;
             }
         }
     }
@@ -1582,7 +1680,7 @@ static DWORD WINAPI ModThread(LPVOID) {
     if(!g_enabled)return 0;
     if(g_debugLog){std::string lp=ip.substr(0,ip.rfind('.'))+".log";g_logFile=fopen(lp.c_str(),"w");}
 
-    Log("=== Private Storage Anywhere v1.2.6 ===");
+    Log("=== Private Storage Anywhere v1.3.0 ===");
     {char cls[256]={};char ttl[256]={};GetClassNameA(g_gameWindow,cls,256);GetWindowTextA(g_gameWindow,ttl,256);
     Log("Game window: class='%s' title='%s'",cls,ttl);}
     g_gameBase=(uintptr_t)GetModuleHandleA("CrimsonDesert.exe");
