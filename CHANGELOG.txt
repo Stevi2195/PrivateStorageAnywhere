@@ -1,5 +1,13 @@
 Private Storage Anywhere — Changelog
 
+v1.3.1 (2026-04-11)
+- Fixed: Wrong keyguide shown after visiting a donation NPC (e.g. "Donate Funds" instead of "Store") — the mod's direct SetInventory call bypassed the game's 0x15 command dispatch, which runs three "prepare" methods on sub-objects at +0x2c8/+0x2d8/+0x300 that reset stale UI state including keyguide bindings. Now sends an empty 0x15 command to trigger these prepare calls before loading inventory.
+- Fixed: On the very first F6 after loading a save the 0x0e "show panel" command was skipped because the warehouse controller had not been captured yet (auto-capture only fires once the game calls CanShow on the panel, which happens during ModeSwitcher). The command is now retried after ModeSwitcher once the handler becomes available.
+- Fixed: Dynamic bottom-label offset resolver — handles the +8 shift from +0x300 to +0x308 introduced by the 2026-04-11 update, and is now derived at runtime from the handler's SetWareHouseInventoryName branch (previously the 2026-04-11 update caused random crashes because the mod was writing text to a sub-object pointer at +0x300).
+- Fixed: Dynamic ModeSwitcher offset resolver — scans for disp32 values in the mainChar mode-byte range using both plain [reg+disp32] and SIB-encoded [reg+index+disp32] operand forms (the array loops use SIB).
+- Fixed: Dynamic CanShow active-flag resolver — strict pattern (MOVZX EAX from byte field followed by RET within 6 bytes) rules out unrelated virtual functions that previously matched loose MOVZX heuristics.
+- Improved: All struct offsets (active flag, mainChar mode bytes, bottom label, donation state) are now resolved dynamically from game code at startup, so future updates that shift these offsets no longer require a rebuild.
+
 v1.3.0 (2026-04-11)
 - Fixed: Random crashes after 2026-04-11 game update — the warehouse handler struct was reorganized, shifting the bottom-label pointer from +0x300 to +0x308; the mod was writing UI text to the wrong address (a sub-object pointer), corrupting memory
 - Improved: All struct offsets are now resolved dynamically at startup instead of being hardcoded constants — the mod scans CanShow, ModeSwitcher and the warehouse handler to extract active flag, mainChar mode bytes, and bottom-label offsets directly from the game code. Future updates that shift these offsets should no longer require a mod rebuild.

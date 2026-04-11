@@ -6,7 +6,7 @@
 #include <string>
 
 // ============================================================
-//  Private Storage Anywhere v1.3.0
+//  Private Storage Anywhere v1.3.1
 //
 //  Opens the Camp Warehouse (Private Storage) from anywhere
 //  with a hotkey (default F6) or controller button.
@@ -49,6 +49,8 @@ static uint32_t g_offModeByte     = 0xCA8;  // mainChar+N: u8 current mode
 static uint32_t g_offSubByte      = 0xCA9;  // mainChar+N: u8 current sub-mode
 static uint32_t g_offModeFlags    = 0xCB1;  // mainChar+N: mode flag array (7 bytes)
 static uint32_t g_offSubtypes     = 0xCB8;  // mainChar+N: subtype array (16 bytes)
+static uint32_t g_offDonationState = 0x330; // handler+N: first of 3 donation faction shorts (cleared on open)
+static uintptr_t g_fnSetDonationFaction = 0; // handler for "SetDonationFaction" command — scanned for donation-state offset
 
 // Captured game state (accessed from multiple threads via Interlocked ops)
 static volatile LONG64 g_mainChar = 0;
@@ -833,6 +835,10 @@ static void TriggerWarehouse(bool fromKeyboard = false) {
             } __except(EXCEPTION_EXECUTE_HANDLER) {}
         }
 
+        // Track whether 0x0e was successfully sent — on first F6 after a fresh game
+        // start the handler may still be NULL here (auto-capture fires during
+        // ModeSwitcher below).  In that case retry 0x0e after the mode switch.
+        bool showSent = false;
         if (handler && g_fnHandler) {
             __try {
                 uint8_t showPacket[24] = {};
@@ -840,6 +846,7 @@ static void TriggerWarehouse(bool fromKeyboard = false) {
                 typedef void (__fastcall *PFN_Handler)(void*, void*);
                 ((PFN_Handler)g_fnHandler)((void*)handler, (void*)showPacket);
                 Log("  Panel shown via 0x0e command");
+                showSent = true;
             } __except(EXCEPTION_EXECUTE_HANDLER) {
                 Log("  Panel show via 0x0e EXCEPTION, falling back to manual");
                 __try {
@@ -861,12 +868,72 @@ static void TriggerWarehouse(bool fromKeyboard = false) {
             return;
         }
 
-        // NOTE: The old 0x15 cache-clear was removed. After the game update, the
-        // 0x15 handler path dereferences sub-objects at handler+0x2c8/0x2d0/0x2f8
-        // that are only initialized after NPC interaction, causing a crash.
-        // SetInventory below overwrites inventory data completely, and titles
-        // are set explicitly afterward, so the cache-clear is unnecessary.
+        // Re-fetch handler after ModeSwitcher — auto-capture may have fired during
+        // the mode switch (game re-registers UI panels and calls CanShow on them,
+        // which is when our hook captures the warehouse controller for the first time).
         if (!handler) handler = (uintptr_t)InterlockedCompareExchange64(&g_handlerThis, 0, 0);
+
+        // Retry 0x0e if it was skipped earlier because the handler hadn't been
+        // captured yet.  Without the 0x0e command the base-class scene registration
+        // never runs and the panel re-opens with stale UI state from the last save
+        // (e.g. the "Donate Funds" keyguide after a donation NPC interaction).
+        if (!showSent && handler && g_fnHandler) {
+            __try {
+                uint8_t showPacket[24] = {};
+                showPacket[0] = 0x0e;
+                typedef void (__fastcall *PFN_Handler)(void*, void*);
+                ((PFN_Handler)g_fnHandler)((void*)handler, (void*)showPacket);
+                Log("  Panel shown via 0x0e command (post-ModeSwitcher)");
+            } __except(EXCEPTION_EXECUTE_HANDLER) {
+                Log("  Panel show via 0x0e (retry) EXCEPTION");
+                __try {
+                    *(uint8_t*)(handler + g_offActiveFlag) = 1;
+                } __except(EXCEPTION_EXECUTE_HANDLER) {}
+            }
+        }
+
+        // Reset faction-donation state (3 shorts, 0xFFFF = no faction selected).
+        if (handler && g_offDonationState) {
+            __try {
+                uint16_t* ds = (uint16_t*)(handler + g_offDonationState);
+                if (ds[0] != 0xFFFF || ds[1] != 0xFFFF || ds[2] != 0xFFFF) {
+                    ds[0] = 0xFFFF;
+                    ds[1] = 0xFFFF;
+                    ds[2] = 0xFFFF;
+                    Log("  Cleared donation state at +0x%X", g_offDonationState);
+                }
+            } __except(EXCEPTION_EXECUTE_HANDLER) {}
+        }
+
+        // Send an empty 0x15 command to the handler.  The 0x15 dispatch calls three
+        // virtual "prepare" methods on sub-objects at +0x2c8/+0x2d8/+0x300 BEFORE
+        // iterating sub-commands.  These prepare calls are how the NPC interaction
+        // resets stale UI state (e.g. the "Donate Funds" keyguide carried over from
+        // a previous donation NPC visit).  With count=0 the sub-command loop is
+        // skipped, so only the prepare calls run.
+        // Guarded — old sub-objects used to be NULL before the first NPC interaction;
+        // verify the three pointers are non-NULL before dispatching.
+        if (handler && g_fnHandler) {
+            __try {
+                uintptr_t sub2c8 = *(uintptr_t*)(handler + 0x2c8);
+                uintptr_t sub2d8 = *(uintptr_t*)(handler + 0x2d8);
+                uintptr_t sub300 = *(uintptr_t*)(handler + 0x300);
+                if (sub2c8 > 0x10000 && sub2d8 > 0x10000 && sub300 > 0x10000) {
+                    uint8_t emptyPacket[24] = {};
+                    emptyPacket[0] = 0x15;  // list command with count=0 → just runs prepare calls
+                    typedef void (__fastcall *PFN_Handler)(void*, void*);
+                    ((PFN_Handler)g_fnHandler)((void*)handler, (void*)emptyPacket);
+                    Log("  Empty 0x15 sent (prepare calls triggered)");
+                } else {
+                    Log("  Empty 0x15 SKIPPED (sub-objects null: %llX/%llX/%llX)",
+                        (unsigned long long)sub2c8,
+                        (unsigned long long)sub2d8,
+                        (unsigned long long)sub300);
+                }
+            } __except(EXCEPTION_EXECUTE_HANDLER) {
+                Log("  Empty 0x15 EXCEPTION");
+            }
+        }
 
         // Load inventory items
         if (handler && g_fnSetInventory) {
@@ -1266,6 +1333,53 @@ static bool ResolveAddresses() {
     }
     Log("BottomLabel:  %s offset=0x%X (handler → SetTitle callsite)",
         g_offBottomLabel ? "OK" : "FAIL", g_offBottomLabel);
+
+    // Step 3c: Find SetDonationFaction handler via "SetDonationFaction" string-xref in
+    // the main warehouse handler, and extract the donation-state struct offset.
+    // The donation handler writes 3 shorts (faction type) and on the failure path
+    // resets them to 0xFFFF via `MOV word [RDI+disp32], BX` where BX = 0xFFFF.
+    // Encoding: 66 89 9F disp32 (ModRM 0x9F = mod=10, reg=011 (BX), r/m=111 (RDI)).
+    // Generalize to any base register: 66 89 9X disp32 with mod=10, reg=011.
+    if (g_fnHandler) {
+        uintptr_t strDonation = FindString("SetDonationFaction");
+        if (strDonation) {
+            uintptr_t leaAddr = FindLEA(strDonation, g_fnHandler);
+            if (leaAddr && leaAddr < g_fnHandler + 0x1000) {
+                uintptr_t targets[16];
+                int n = FindAllCALLsAfter(leaAddr, 200, targets, 16);
+                for (int i = 0; i < n; i++) {
+                    uint8_t* p = (uint8_t*)targets[i];
+                    // SetDonationFaction prolog: `MOV [RSP+8],RBX` (48 89 5C 24 08)
+                    if (p[0] == 0x48 && p[1] == 0x89 && p[2] == 0x5C && p[3] == 0x24 && p[4] == 0x08 &&
+                        targets[i] != g_fnSetInventory && targets[i] != g_fnSetTitle) {
+                        g_fnSetDonationFaction = targets[i];
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    // Scan SetDonationFaction for `66 89 9X disp32` (MOV word [reg+disp32], BX)
+    // Take the smallest disp32 found — that's the first of the 3 donation-state shorts.
+    if (g_fnSetDonationFaction) {
+        uint8_t* fn = (uint8_t*)g_fnSetDonationFaction;
+        uint32_t smallest = 0;
+        for (int j = 0; j < 0x400 - 7; j++) {
+            // Must be: 0x66 (operand size prefix), 0x89 (MOV r/m16, r16), ModRM with
+            // mod=10 and reg=011 (BX).  That's ModRM byte = 0x98 | r/m in [0..7] minus r/m=100 (SIB).
+            if (fn[j] != 0x66 || fn[j+1] != 0x89) continue;
+            uint8_t modrm = fn[j+2];
+            if ((modrm & 0xC0) != 0x80) continue;     // mod=10
+            if ((modrm & 0x38) != 0x18) continue;     // reg=011 (BX)
+            if ((modrm & 0x07) == 0x04) continue;     // r/m != SIB
+            uint32_t disp = *(uint32_t*)(fn + j + 3);
+            if (disp < 0x100 || disp >= 0x1000) continue;
+            if (!smallest || disp < smallest) smallest = disp;
+        }
+        if (smallest) g_offDonationState = smallest;
+    }
+    Log("DonationOff:  %s offset=0x%X (SetDonationFaction → MOV [reg+N],BX)",
+        g_fnSetDonationFaction ? "OK" : "FALLBACK", g_offDonationState);
 
     // Step 3b: Find SetTitleDirect (FUN_1434159c0) from inside SetTitle.
     // SetTitle checks node+0xA8 (bridge). If bridge+8 (renderer) exists,
@@ -1680,7 +1794,7 @@ static DWORD WINAPI ModThread(LPVOID) {
     if(!g_enabled)return 0;
     if(g_debugLog){std::string lp=ip.substr(0,ip.rfind('.'))+".log";g_logFile=fopen(lp.c_str(),"w");}
 
-    Log("=== Private Storage Anywhere v1.3.0 ===");
+    Log("=== Private Storage Anywhere v1.3.1 ===");
     {char cls[256]={};char ttl[256]={};GetClassNameA(g_gameWindow,cls,256);GetWindowTextA(g_gameWindow,ttl,256);
     Log("Game window: class='%s' title='%s'",cls,ttl);}
     g_gameBase=(uintptr_t)GetModuleHandleA("CrimsonDesert.exe");

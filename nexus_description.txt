@@ -111,6 +111,13 @@ Delete [b]PrivateStorageAnywhere.asi[/b] and [b]PrivateStorageAnywhere.ini[/b] f
 
 [size=3][b]Changelog[/b][/size]
 
+[b]v1.3.1[/b]
+[list]
+[*]Fixed: Wrong keyguide shown after visiting a donation NPC (e.g. "Donate Funds" instead of "Store") — now triggers the game's internal UI-state reset before loading the inventory
+[*]Fixed: On the very first F6 after loading a save the warehouse panel sometimes opened without being properly activated — the "show panel" command is now retried after the mode switch once the handler becomes available
+[*]Improved: Resolves additional struct offsets dynamically from game code, including the donation-state field
+[/list]
+
 [b]v1.3.0[/b]
 [list]
 [*]Fixed: Random crashes after 2026-04-11 game update — the warehouse handler struct was reorganized, shifting the bottom-label pointer by 8 bytes; the mod was writing text to the wrong address
