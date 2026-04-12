@@ -111,6 +111,11 @@ Delete [b]PrivateStorageAnywhere.asi[/b] and [b]PrivateStorageAnywhere.ini[/b] f
 
 [size=3][b]Changelog[/b][/size]
 
+[b]v1.3.2[/b]
+[list]
+[*]Updated for game version 1.0.3.1 — internal game functions were restructured and had to be re-adapted
+[/list]
+
 [b]v1.3.1[/b]
 [list]
 [*]Fixed: Wrong keyguide shown after visiting a donation NPC (e.g. "Donate Funds" instead of "Store") — now triggers the game's internal UI-state reset before loading the inventory
@@ -226,5 +231,7 @@ Delete [b]PrivateStorageAnywhere.asi[/b] and [b]PrivateStorageAnywhere.ini[/b] f
 [size=3][b]Also check out[/b][/size]
 
 [url=https://www.nexusmods.com/crimsondesert/mods/57][b]Quick Menu Hotkeys[/b][/url] — Direct keyboard and controller shortcuts for all game menus (Inventory, Quest Book, Skills, Map, and more). Fully compatible with Private Storage Anywhere — use Shift+I for storage and plain I for inventory.
+
+[url=https://www.nexusmods.com/crimsondesert/mods/1020][b]FasterSkillPoints[/b][/url] — Reduce the experience threshold for skill-point level-ups. Configurable speedup from 2x to 128x via a simple INI setting. Only affects skill points — faction reputation and other progressions stay vanilla.
 
 [line]

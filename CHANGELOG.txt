@@ -1,5 +1,9 @@
 Private Storage Anywhere — Changelog
 
+v1.3.2 (2026-04-12)
+- Updated for game version 1.0.3.1 — internal game functions were restructured and had to be re-adapted.
+- Improved: Hook installer and pattern scanners updated to handle new code layout introduced by this game update.
+
 v1.3.1 (2026-04-11)
 - Fixed: Wrong keyguide shown after visiting a donation NPC (e.g. "Donate Funds" instead of "Store") — the mod's direct SetInventory call bypassed the game's 0x15 command dispatch, which runs three "prepare" methods on sub-objects at +0x2c8/+0x2d8/+0x300 that reset stale UI state including keyguide bindings. Now sends an empty 0x15 command to trigger these prepare calls before loading inventory.
 - Fixed: On the very first F6 after loading a save the 0x0e "show panel" command was skipped because the warehouse controller had not been captured yet (auto-capture only fires once the game calls CanShow on the panel, which happens during ModeSwitcher). The command is now retried after ModeSwitcher once the handler becomes available.

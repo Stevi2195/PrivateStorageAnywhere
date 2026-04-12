@@ -6,7 +6,7 @@
 #include <string>
 
 // ============================================================
-//  Private Storage Anywhere v1.3.1
+//  Private Storage Anywhere v1.3.2
 //
 //  Opens the Camp Warehouse (Private Storage) from anywhere
 //  with a hotkey (default F6) or controller button.
@@ -32,7 +32,7 @@ static uintptr_t g_fnSetTitleDirect = 0;  // FUN_1434159c0: UTF-8 aware wchar te
 static uintptr_t g_fnSetCursorVisible = 0;  // QOL: hides cursor immediately on warehouse close
 static uintptr_t g_warehouseVtableEntry = 0;  // vtable address containing handler — used for auto-capture verification
 static uintptr_t g_warehouseVtableStart = 0;  // vtable start of warehouse class — set on first successful capture
-static uint32_t  g_modalDialogOff = 0;     // handler+N stores active dialog pointer (0x338 in current build, was 0x240)
+static uint32_t  g_modalDialogOff = 0;     // handler+N: move-quantity dialog pointer
 static uintptr_t g_langByteAddr = 0;      // address of language byte (resolved dynamically from Steam API init function)
 
 // Struct offsets — all resolved dynamically from game code at runtime (update-proof).
@@ -51,6 +51,7 @@ static uint32_t g_offModeFlags    = 0xCB1;  // mainChar+N: mode flag array (7 by
 static uint32_t g_offSubtypes     = 0xCB8;  // mainChar+N: subtype array (16 bytes)
 static uint32_t g_offDonationState = 0x330; // handler+N: first of 3 donation faction shorts (cleared on open)
 static uintptr_t g_fnSetDonationFaction = 0; // handler for "SetDonationFaction" command — scanned for donation-state offset
+static uintptr_t g_mainCharGlobalPtr = 0;   // address of global singleton pointer; mainChar = *(*(globalPtr) + 0x48)
 
 // Captured game state (accessed from multiple threads via Interlocked ops)
 static volatile LONG64 g_mainChar = 0;
@@ -77,14 +78,18 @@ static volatile LONG64 g_lastModalPassed = 0;   // ModalMessageView addr when ES
 static void Log(const char* fmt, ...);
 
 // Hook cleanup: saved original bytes for safe DLL unload
-static uint8_t g_origHandlerBytes[15] = {};
-static uint8_t g_origModeSwitcherBytes[15] = {};
+static uint8_t g_origHandlerBytes[20] = {};
+static uint8_t g_origModeSwitcherBytes[20] = {};
 static uint8_t g_origCanShowBytes[14] = {};
+static int g_hookSizeHandler = 15, g_hookSizeModeSwitcher = 15;
 static uintptr_t g_hookAddrHandler = 0, g_hookAddrModeSwitcher = 0, g_hookAddrCanShow = 0;
 
 
 
 #define WM_TRIGGER_WAREHOUSE (WM_USER + 602)
+#define WM_INIT_WAREHOUSE    (WM_USER + 603)
+static volatile LONG g_initPending = 0;     // 1 = InputThread should post WM_INIT_WAREHOUSE
+static volatile LONG g_initRetryCount = 0;  // retry counter for deferred warehouse init
 
 // ============================================================
 //  Raw Input — DualSense / DualShock button detection
@@ -373,7 +378,6 @@ static bool SetTitleOnRenderer(uintptr_t node, const char* utf8Title, int depth)
 }
 
 // Read the active modal dialog pointer from the handler struct.
-// Offset found dynamically from the move-item handler's code at init.
 static uintptr_t ReadModalDialog(uintptr_t handler) {
     if (!g_modalDialogOff) return 0;
     __try {
@@ -591,28 +595,41 @@ extern "C" void __fastcall CaptureOnHandler(void* thisPtr, void* rdx) {
     }
 }
 
-extern "C" void __fastcall CaptureModeSwitcher(void* rcx) {
-    if (!g_mainChar && (uintptr_t)rcx > 0x10000000000ULL) {
-        InterlockedExchange64(&g_mainChar, (LONG64)(uintptr_t)rcx);
-        Log("CAPTURED mainChar: 0x%llX", (unsigned long long)(uintptr_t)rcx);
+// Resolve mainChar from the game manager singleton: *(*(globalPtr) + 0x48)
+static uintptr_t ResolveMainChar() {
+    if (!g_mainCharGlobalPtr) return 0;
+    __try {
+        uintptr_t mgr = *(uintptr_t*)g_mainCharGlobalPtr;
+        if (mgr) return *(uintptr_t*)(mgr + 0x48);
+    } __except(EXCEPTION_EXECUTE_HANDLER) {}
+    return 0;
+}
 
-        // Capture cursorObj via pointer chain: RCX+0x50 → +0x60 → deref → +0x78
-        __try {
-            uintptr_t container = *(uintptr_t*)((uint8_t*)rcx + 0x50);
-            if (container) {
-                uintptr_t worldList = *(uintptr_t*)(container + 0x60);
-                if (worldList) {
-                    uintptr_t world = *(uintptr_t*)worldList;
-                    if (world) {
-                        uintptr_t cursor = *(uintptr_t*)(world + 0x78);
-                        if (cursor > 0x10000000000ULL) {
-                            InterlockedExchange64(&g_cursorObj, (LONG64)cursor);
-                            Log("CAPTURED cursorObj: 0x%llX", (unsigned long long)cursor);
+extern "C" void __fastcall CaptureModeSwitcher(void* rcx) {
+    if (!g_mainChar) {
+        uintptr_t mc = ResolveMainChar();
+        if (mc > 0x10000000000ULL) {
+            InterlockedExchange64(&g_mainChar, (LONG64)mc);
+            Log("CAPTURED mainChar: 0x%llX (via singleton)", (unsigned long long)mc);
+
+            // Capture cursorObj via pointer chain: mainChar+0x50 -> +0x60 -> deref -> +0x78
+            __try {
+                uintptr_t container = *(uintptr_t*)((uint8_t*)mc + 0x50);
+                if (container) {
+                    uintptr_t worldList = *(uintptr_t*)(container + 0x60);
+                    if (worldList) {
+                        uintptr_t world = *(uintptr_t*)worldList;
+                        if (world) {
+                            uintptr_t cursor = *(uintptr_t*)(world + 0x78);
+                            if (cursor > 0x10000000000ULL) {
+                                InterlockedExchange64(&g_cursorObj, (LONG64)cursor);
+                                Log("CAPTURED cursorObj: 0x%llX", (unsigned long long)cursor);
+                            }
                         }
                     }
                 }
-            }
-        } __except(EXCEPTION_EXECUTE_HANDLER) {}
+            } __except(EXCEPTION_EXECUTE_HANDLER) {}
+        }
     }
 
     // Game calls ModeSwitcher every frame. While warehouse is open,
@@ -713,35 +730,94 @@ extern "C" char __fastcall HookedCanShow(void* thisPtr) {
 
 // Check if first N bytes contain RIP-relative instructions (ModRM.mod=00, R/M=101)
 // that would break when relocated to a trampoline at a different address.
+// NOTE: FF 25 (JMP [rip+disp32]) thunks are excluded — they work correctly in
+// trampolines because the inline 8-byte target address is copied alongside.
 static bool ContainsRipRelative(uint8_t* code, int len) {
     for (int i = 0; i < len - 2; i++) {
         uint8_t b = code[i];
-        // Skip REX prefixes (0x40-0x4F)
+        // Non-REX: CALL [rip+disp32] = FF 15 xx xx xx xx (ModRM 0x15: mod=00, r/m=101)
+        // (FF 25 is JMP thunk — safe to relocate because inline data follows, so skip it)
+        if (b == 0xFF && i + 5 < len && code[i + 1] == 0x15) return true;
+        // Non-REX MOV/LEA etc. with RIP-relative: opcode + ModRM(mod=00, r/m=101)
+        if ((b == 0x8B || b == 0x8D || b == 0x89 || b == 0x3B || b == 0x39 || b == 0x63) &&
+            i + 5 < len && (code[i + 1] & 0xC7) == 0x05) return true;
+        // REX-prefixed (0x40-0x4F): same checks on the byte after REX
         if (b >= 0x40 && b <= 0x4F && i + 2 < len) {
             uint8_t op = code[i + 1];
-            // Two-byte opcodes with ModRM: LEA, MOV, CMP, etc.
             if (op == 0x8D || op == 0x8B || op == 0x89 || op == 0x3B || op == 0x39 ||
                 op == 0x63 || op == 0x0F) {
                 uint8_t modrm = code[i + 2];
-                if ((modrm & 0xC7) == 0x05)  // mod=00, r/m=101 → RIP-relative
+                if ((modrm & 0xC7) == 0x05)
                     return true;
             }
+            // REX + FF 15 (CALL [rip+disp32])
+            if (op == 0xFF && i + 6 < len && code[i + 2] == 0x15) return true;
         }
     }
     return false;
 }
 
-static bool InstallHook(uintptr_t func, uintptr_t capture, const char* name) {
-    uint8_t orig[20]; memcpy(orig, (void*)func, 20);
-    if (ContainsRipRelative(orig, 15)) {
-        Log("HOOK %s: ABORT — RIP-relative instruction in first 15 bytes (base+0x%llX)",
-            name, (unsigned long long)(func - g_gameBase));
+// Find the smallest instruction boundary >= minBytes in a typical MSVC x86-64 prologue.
+// Handles common prologue patterns: MOV [RSP+N], REG; PUSH; SUB RSP; LEA RBP; MOV RBP,RSP
+static int FindPrologBoundary(uint8_t* code, int minBytes) {
+    int pos = 0;
+    while (pos < minBytes && pos < 30) {
+        uint8_t b = code[pos];
+        // Single-byte PUSH: 50-57 (PUSH RAX..RDI)
+        if (b >= 0x50 && b <= 0x57) { pos += 1; continue; }
+        // REX.B + PUSH: 41 50-57 (PUSH R8..R15)
+        if (b == 0x41 && code[pos+1] >= 0x50 && code[pos+1] <= 0x57) { pos += 2; continue; }
+        // REX.W prefix (48/4C): decode next opcode for length
+        if (b == 0x48 || b == 0x4C) {
+            uint8_t op = code[pos+1];
+            // MOV r/m, reg or MOV reg, r/m with ModRM
+            if (op == 0x89 || op == 0x8B) {
+                uint8_t modrm = code[pos+2];
+                uint8_t mod = modrm >> 6, rm = modrm & 0x07;
+                if (mod == 0x01) { pos += 4 + (rm == 0x04 ? 1 : 0); continue; } // [reg+disp8] (+SIB)
+                if (mod == 0x03) { pos += 3; continue; } // reg,reg (e.g. MOV RBP,RSP = 48 8B EC)
+            }
+            // SUB RSP, imm8: 48 83 EC xx
+            if (op == 0x83 && code[pos+2] == 0xEC) { pos += 4; continue; }
+            // SUB RSP, imm32: 48 81 EC xx xx xx xx
+            if (op == 0x81 && code[pos+2] == 0xEC) { pos += 7; continue; }
+            // LEA RBP, [RSP+disp8]: 48 8D 6C 24 xx
+            if (op == 0x8D) {
+                uint8_t modrm = code[pos+2];
+                uint8_t mod = modrm >> 6, rm = modrm & 0x07;
+                if (mod == 0x01) { pos += 4 + (rm == 0x04 ? 1 : 0); continue; }
+                if (mod == 0x02) { pos += 7 + (rm == 0x04 ? 1 : 0); continue; }
+            }
+        }
+        // JMP [RIP+disp32] thunk: FF 25 xx xx xx xx + 8-byte inline address = 14 bytes
+        if (b == 0xFF && code[pos+1] == 0x25) { pos += 14; continue; }
+        // Unknown — bail out to avoid infinite loop
+        Log("  FindPrologBoundary: unknown opcode 0x%02X at pos %d", b, pos);
+        return 0;
+    }
+    return pos;
+}
+
+static bool InstallHook(uintptr_t func, uintptr_t capture, const char* name, int hookSize = 0) {
+    // Auto-compute hook size if not provided: find instruction boundary >= 14 bytes
+    if (hookSize <= 0) {
+        hookSize = FindPrologBoundary((uint8_t*)func, 14);
+        if (hookSize < 14 || hookSize > 20) {
+            Log("HOOK %s: ABORT — cannot find clean instruction boundary (got %d) at base+0x%llX",
+                name, hookSize, (unsigned long long)(func - g_gameBase));
+            return false;
+        }
+    }
+    uint8_t orig[20]; memcpy(orig, (void*)func, hookSize);
+    if (ContainsRipRelative(orig, hookSize)) {
+        Log("HOOK %s: ABORT — RIP-relative instruction in first %d bytes (base+0x%llX)",
+            name, hookSize, (unsigned long long)(func - g_gameBase));
         return false;
     }
     void* thunk = VirtualAlloc(nullptr,256,MEM_COMMIT|MEM_RESERVE,PAGE_EXECUTE_READWRITE);
     if (!thunk) return false;
     uint8_t* t = (uint8_t*)thunk;
-    uintptr_t ret = func + 15;
+    uintptr_t ret = func + hookSize;
     *t++=0x50;*t++=0x51;*t++=0x52;
     *t++=0x41;*t++=0x50;*t++=0x41;*t++=0x51;*t++=0x41;*t++=0x52;*t++=0x41;*t++=0x53;
     *t++=0x48;*t++=0x83;*t++=0xEC;*t++=0x20;
@@ -752,15 +828,16 @@ static bool InstallHook(uintptr_t func, uintptr_t capture, const char* name) {
     *t++=0x48;*t++=0x83;*t++=0xC4;*t++=0x20;
     *t++=0x41;*t++=0x5B;*t++=0x41;*t++=0x5A;*t++=0x41;*t++=0x59;*t++=0x41;*t++=0x58;
     *t++=0x5A;*t++=0x59;*t++=0x58;
-    memcpy(t,orig,15); t+=15;
+    memcpy(t,orig,hookSize); t+=hookSize;
     *t++=0xFF;*t++=0x25; *(uint32_t*)t=0; t+=4; *(uintptr_t*)t=ret; t+=8;
     DWORD op;
-    VirtualProtect((void*)func,15,PAGE_EXECUTE_READWRITE,&op);
+    VirtualProtect((void*)func,hookSize,PAGE_EXECUTE_READWRITE,&op);
     uint8_t* p=(uint8_t*)func;
-    p[0]=0xFF;p[1]=0x25; *(uint32_t*)(p+2)=0; *(uintptr_t*)(p+6)=(uintptr_t)thunk; p[14]=0x90;
-    VirtualProtect((void*)func,15,op,&op);
-    FlushInstructionCache(GetCurrentProcess(),(void*)func,15);
-    Log("HOOK %s: OK base+0x%llX",name,(unsigned long long)(func-g_gameBase));
+    p[0]=0xFF;p[1]=0x25; *(uint32_t*)(p+2)=0; *(uintptr_t*)(p+6)=(uintptr_t)thunk;
+    for (int i = 14; i < hookSize; i++) p[i] = 0x90; // NOP padding
+    VirtualProtect((void*)func,hookSize,op,&op);
+    FlushInstructionCache(GetCurrentProcess(),(void*)func,hookSize);
+    Log("HOOK %s: OK base+0x%llX (size=%d)",name,(unsigned long long)(func-g_gameBase),hookSize);
     return true;
 }
 
@@ -791,6 +868,128 @@ static bool InstallCanShowHook(uintptr_t func) {
 }
 
 // ============================================================
+//  Warehouse panel initialization (handler-dependent steps)
+//  Called from TriggerWarehouse when handler is available, or
+//  deferred via WM_INIT_WAREHOUSE when handler wasn't captured yet.
+// ============================================================
+static void InitWarehousePanel(uintptr_t handler) {
+    // Clear stale modal dialog pointer from previous warehouse sessions
+    if (g_modalDialogOff) {
+        __try {
+            *(uintptr_t*)(handler + g_modalDialogOff) = 0;
+            Log("  Cleared stale modal pointer at +0x%X", g_modalDialogOff);
+        } __except(EXCEPTION_EXECUTE_HANDLER) {}
+    }
+
+    // Activate warehouse panel via the game's own base-class handler (command 0x0e).
+    if (g_fnHandler) {
+        __try {
+            uint8_t showPacket[24] = {};
+            showPacket[0] = 0x0e;  // base-class "show panel" command
+            typedef void (__fastcall *PFN_Handler)(void*, void*);
+            ((PFN_Handler)g_fnHandler)((void*)handler, (void*)showPacket);
+            Log("  Panel shown via 0x0e command");
+        } __except(EXCEPTION_EXECUTE_HANDLER) {
+            Log("  Panel show via 0x0e EXCEPTION, falling back to manual");
+            __try {
+                *(uint8_t*)(handler + g_offActiveFlag) = 1;
+            } __except(EXCEPTION_EXECUTE_HANDLER) {}
+        }
+    }
+
+    // Reset faction-donation state (3 shorts, 0xFFFF = no faction selected).
+    if (g_offDonationState) {
+        __try {
+            uint16_t* ds = (uint16_t*)(handler + g_offDonationState);
+            if (ds[0] != 0xFFFF || ds[1] != 0xFFFF || ds[2] != 0xFFFF) {
+                ds[0] = 0xFFFF;
+                ds[1] = 0xFFFF;
+                ds[2] = 0xFFFF;
+                Log("  Cleared donation state at +0x%X", g_offDonationState);
+            }
+        } __except(EXCEPTION_EXECUTE_HANDLER) {}
+    }
+
+    // Send an empty 0x15 command.  The 0x15 dispatch calls three virtual "prepare"
+    // methods on sub-objects BEFORE iterating sub-commands.  With count=0 the
+    // sub-command loop is skipped, so only the prepare calls run.
+    if (g_fnHandler) {
+        __try {
+            uintptr_t sub2c8 = *(uintptr_t*)(handler + 0x2c8);
+            uintptr_t sub2d8 = *(uintptr_t*)(handler + 0x2d8);
+            uintptr_t sub300 = *(uintptr_t*)(handler + 0x300);
+            if (sub2c8 > 0x10000 && sub2d8 > 0x10000 && sub300 > 0x10000) {
+                uint8_t emptyPacket[24] = {};
+                emptyPacket[0] = 0x15;
+                typedef void (__fastcall *PFN_Handler)(void*, void*);
+                ((PFN_Handler)g_fnHandler)((void*)handler, (void*)emptyPacket);
+                Log("  Empty 0x15 sent (prepare calls triggered)");
+            } else {
+                Log("  Empty 0x15 SKIPPED (sub-objects null: %llX/%llX/%llX)",
+                    (unsigned long long)sub2c8,
+                    (unsigned long long)sub2d8,
+                    (unsigned long long)sub300);
+            }
+        } __except(EXCEPTION_EXECUTE_HANDLER) {
+            Log("  Empty 0x15 EXCEPTION");
+        }
+    }
+
+    // Load inventory items
+    if (g_fnSetInventory) {
+        __try {
+            typedef void (__fastcall *PFN_SetInv)(void*, void*);
+            ((PFN_SetInv)g_fnSetInventory)((void*)handler, (void*)WAREHOUSE_INIT_STRING);
+            Log("  SetInventory called");
+        } __except(EXCEPTION_EXECUTE_HANDLER) {
+            Log("  SetInventory EXCEPTION");
+        }
+    }
+
+    // Fix bottom inventory label + top title
+    if (g_fnSetTitle) {
+        typedef uint8_t (__fastcall *PFN_SetTitle)(uintptr_t, const char*);
+        PFN_SetTitle setTitle = (PFN_SetTitle)g_fnSetTitle;
+        const char* title = GetWarehouseTitle();
+        bool needUtf8Fix = !IsAscii(title);
+
+        __try {
+            uintptr_t bottomLabel = *(uintptr_t*)(handler + g_offBottomLabel);
+            if (bottomLabel > 0x10000 && bottomLabel < 0x7FFFFFFFFFFF) {
+                setTitle(bottomLabel, title);
+                Log("  Bottom label (+0x%X) set: lang=%d needFix=%d",
+                    g_offBottomLabel, GetGameLanguage(), needUtf8Fix);
+                if (needUtf8Fix) {
+                    bool fixed = SetTitleOnRenderer(bottomLabel, title, 0);
+                    Log("  Bottom label UTF-8 fix: %s", fixed ? "OK" : "no renderer found");
+                }
+            } else {
+                Log("  Bottom label (+0x%X) invalid pointer", g_offBottomLabel);
+            }
+        } __except(EXCEPTION_EXECUTE_HANDLER) {
+            Log("  Bottom label (+0x%X) EXCEPTION", g_offBottomLabel);
+        }
+
+        __try {
+            uintptr_t topNode = *(uintptr_t*)(handler + g_offTopTitle);
+            if (topNode > 0x10000 && topNode < 0x7FFFFFFFFFFF) {
+                uint8_t ret = setTitle(topNode, title);
+                Log("  Top title (+0x%X) set: lang=%d ret=%u",
+                    g_offTopTitle, GetGameLanguage(), (unsigned)ret);
+                if (needUtf8Fix) {
+                    bool fixed = SetTitleOnRenderer(topNode, title, 0);
+                    Log("  Top title UTF-8 fix: %s", fixed ? "OK" : "no renderer found");
+                }
+            } else {
+                Log("  Top title (+0x%X) invalid pointer — skipping", g_offTopTitle);
+            }
+        } __except(EXCEPTION_EXECUTE_HANDLER) {
+            Log("  Top title (+0x%X) EXCEPTION", g_offTopTitle);
+        }
+    }
+}
+
+// ============================================================
 //  F6 / Controller: Toggle Warehouse
 // ============================================================
 static void TriggerWarehouse(bool fromKeyboard = false) {
@@ -798,8 +997,6 @@ static void TriggerWarehouse(bool fromKeyboard = false) {
     if (!mainChar) { Log("NOT READY: mainChar"); return; }
 
     uint8_t* mc = (uint8_t*)mainChar;
-    typedef void (__fastcall *PFN_ModeSwitcher)(void*);
-    PFN_ModeSwitcher fnMode = (PFN_ModeSwitcher)g_fnModeSwitcher;
 
     if (!InterlockedCompareExchange(&g_warehouseActive, 0, 0)) {
         uint8_t curSub = mc[g_offSubByte];
@@ -821,174 +1018,24 @@ static void TriggerWarehouse(bool fromKeyboard = false) {
         InterlockedExchange(&g_warehouseActive, 1);
         g_openTimestamp = GetTickCount64();
 
-        // Activate warehouse panel via the game's own base-class handler (command 0x0e).
-        // This properly sets the active flag, attaches the scene object, and calls the
-        // scene registration functions.  Manual flag setting is not sufficient.
+        InterlockedExchange(&g_modeSwitchByMod, 1);
+
+        // Try to initialize the panel immediately if handler is already captured.
+        // On first F6 after loading a save, the handler is typically NULL here because
+        // auto-capture happens in HookedCanShow which runs on the same (game) thread.
+        // A blocking Sleep loop would prevent the game from processing frames and
+        // calling CanShow, so the handler would never be captured.
+        // Instead, we defer initialization via WM_INIT_WAREHOUSE — the game gets to
+        // process a frame, CanShow fires, the handler is captured, and our deferred
+        // message picks it up.
         uintptr_t handler = (uintptr_t)InterlockedCompareExchange64(&g_handlerThis, 0, 0);
 
-        // Clear stale modal dialog pointer from previous warehouse sessions
-        // State checks above guarantee no menu is open, so pointer is safe to null
-        if (handler && g_modalDialogOff) {
-            __try {
-                *(uintptr_t*)(handler + g_modalDialogOff) = 0;
-                Log("  Cleared stale modal pointer at +0x%X", g_modalDialogOff);
-            } __except(EXCEPTION_EXECUTE_HANDLER) {}
-        }
-
-        // Track whether 0x0e was successfully sent — on first F6 after a fresh game
-        // start the handler may still be NULL here (auto-capture fires during
-        // ModeSwitcher below).  In that case retry 0x0e after the mode switch.
-        bool showSent = false;
-        if (handler && g_fnHandler) {
-            __try {
-                uint8_t showPacket[24] = {};
-                showPacket[0] = 0x0e;  // base-class "show panel" command
-                typedef void (__fastcall *PFN_Handler)(void*, void*);
-                ((PFN_Handler)g_fnHandler)((void*)handler, (void*)showPacket);
-                Log("  Panel shown via 0x0e command");
-                showSent = true;
-            } __except(EXCEPTION_EXECUTE_HANDLER) {
-                Log("  Panel show via 0x0e EXCEPTION, falling back to manual");
-                __try {
-                    *(uint8_t*)(handler + g_offActiveFlag) = 1;
-                } __except(EXCEPTION_EXECUTE_HANDLER) {}
-            }
-        }
-
-        __try {
-            InterlockedExchange(&g_modeSwitchByMod, 1);
-            fnMode((void*)mainChar);
-            // NOTE: g_modeSwitchByMod stays 1 while warehouse is open!
-            // The game calls ModeSwitcher every frame; keeping this flag
-            // prevents CaptureModeSwitcher from mis-detecting those as closes.
-            // It gets reset to 0 only when we explicitly close the warehouse.
-        } __except(EXCEPTION_EXECUTE_HANDLER) {
-            InterlockedExchange(&g_modeSwitchByMod, 0);
-            InterlockedExchange(&g_warehouseActive, 0);
-            return;
-        }
-
-        // Re-fetch handler after ModeSwitcher — auto-capture may have fired during
-        // the mode switch (game re-registers UI panels and calls CanShow on them,
-        // which is when our hook captures the warehouse controller for the first time).
-        if (!handler) handler = (uintptr_t)InterlockedCompareExchange64(&g_handlerThis, 0, 0);
-
-        // Retry 0x0e if it was skipped earlier because the handler hadn't been
-        // captured yet.  Without the 0x0e command the base-class scene registration
-        // never runs and the panel re-opens with stale UI state from the last save
-        // (e.g. the "Donate Funds" keyguide after a donation NPC interaction).
-        if (!showSent && handler && g_fnHandler) {
-            __try {
-                uint8_t showPacket[24] = {};
-                showPacket[0] = 0x0e;
-                typedef void (__fastcall *PFN_Handler)(void*, void*);
-                ((PFN_Handler)g_fnHandler)((void*)handler, (void*)showPacket);
-                Log("  Panel shown via 0x0e command (post-ModeSwitcher)");
-            } __except(EXCEPTION_EXECUTE_HANDLER) {
-                Log("  Panel show via 0x0e (retry) EXCEPTION");
-                __try {
-                    *(uint8_t*)(handler + g_offActiveFlag) = 1;
-                } __except(EXCEPTION_EXECUTE_HANDLER) {}
-            }
-        }
-
-        // Reset faction-donation state (3 shorts, 0xFFFF = no faction selected).
-        if (handler && g_offDonationState) {
-            __try {
-                uint16_t* ds = (uint16_t*)(handler + g_offDonationState);
-                if (ds[0] != 0xFFFF || ds[1] != 0xFFFF || ds[2] != 0xFFFF) {
-                    ds[0] = 0xFFFF;
-                    ds[1] = 0xFFFF;
-                    ds[2] = 0xFFFF;
-                    Log("  Cleared donation state at +0x%X", g_offDonationState);
-                }
-            } __except(EXCEPTION_EXECUTE_HANDLER) {}
-        }
-
-        // Send an empty 0x15 command to the handler.  The 0x15 dispatch calls three
-        // virtual "prepare" methods on sub-objects at +0x2c8/+0x2d8/+0x300 BEFORE
-        // iterating sub-commands.  These prepare calls are how the NPC interaction
-        // resets stale UI state (e.g. the "Donate Funds" keyguide carried over from
-        // a previous donation NPC visit).  With count=0 the sub-command loop is
-        // skipped, so only the prepare calls run.
-        // Guarded — old sub-objects used to be NULL before the first NPC interaction;
-        // verify the three pointers are non-NULL before dispatching.
-        if (handler && g_fnHandler) {
-            __try {
-                uintptr_t sub2c8 = *(uintptr_t*)(handler + 0x2c8);
-                uintptr_t sub2d8 = *(uintptr_t*)(handler + 0x2d8);
-                uintptr_t sub300 = *(uintptr_t*)(handler + 0x300);
-                if (sub2c8 > 0x10000 && sub2d8 > 0x10000 && sub300 > 0x10000) {
-                    uint8_t emptyPacket[24] = {};
-                    emptyPacket[0] = 0x15;  // list command with count=0 → just runs prepare calls
-                    typedef void (__fastcall *PFN_Handler)(void*, void*);
-                    ((PFN_Handler)g_fnHandler)((void*)handler, (void*)emptyPacket);
-                    Log("  Empty 0x15 sent (prepare calls triggered)");
-                } else {
-                    Log("  Empty 0x15 SKIPPED (sub-objects null: %llX/%llX/%llX)",
-                        (unsigned long long)sub2c8,
-                        (unsigned long long)sub2d8,
-                        (unsigned long long)sub300);
-                }
-            } __except(EXCEPTION_EXECUTE_HANDLER) {
-                Log("  Empty 0x15 EXCEPTION");
-            }
-        }
-
-        // Load inventory items
-        if (handler && g_fnSetInventory) {
-            __try {
-                typedef void (__fastcall *PFN_SetInv)(void*, void*);
-                ((PFN_SetInv)g_fnSetInventory)((void*)handler, (void*)WAREHOUSE_INIT_STRING);
-                Log("  SetInventory called");
-            } __except(EXCEPTION_EXECUTE_HANDLER) {
-                Log("  SetInventory EXCEPTION");
-            }
-        }
-
-        // Fix bottom inventory label using dynamically-resolved offset
-        // (cpp-ware-house-inventory-title node pointer — handler+g_offBottomLabel)
-        if (handler && g_fnSetTitle) {
-            typedef uint8_t (__fastcall *PFN_SetTitle)(uintptr_t, const char*);
-            PFN_SetTitle setTitle = (PFN_SetTitle)g_fnSetTitle;
-            const char* title = GetWarehouseTitle();
-            bool needUtf8Fix = !IsAscii(title);
-
-            __try {
-                uintptr_t bottomLabel = *(uintptr_t*)(handler + g_offBottomLabel);
-                if (bottomLabel > 0x10000 && bottomLabel < 0x7FFFFFFFFFFF) {
-                    setTitle(bottomLabel, title);
-                    Log("  Bottom label (+0x%X) set: lang=%d needFix=%d",
-                        g_offBottomLabel, GetGameLanguage(), needUtf8Fix);
-                    // For non-ASCII titles: ensure the renderer has correct wchar_t text.
-                    if (needUtf8Fix) {
-                        bool fixed = SetTitleOnRenderer(bottomLabel, title, 0);
-                        Log("  Bottom label UTF-8 fix: %s", fixed ? "OK" : "no renderer found");
-                    }
-                } else {
-                    Log("  Bottom label (+0x%X) invalid pointer", g_offBottomLabel);
-                }
-            } __except(EXCEPTION_EXECUTE_HANDLER) {
-                Log("  Bottom label (+0x%X) EXCEPTION", g_offBottomLabel);
-            }
-
-            // Top title — pointer validated at runtime since offset is not dynamically resolved
-            __try {
-                uintptr_t topNode = *(uintptr_t*)(handler + g_offTopTitle);
-                if (topNode > 0x10000 && topNode < 0x7FFFFFFFFFFF) {
-                    uint8_t ret = setTitle(topNode, title);
-                    Log("  Top title (+0x%X) set: lang=%d ret=%u",
-                        g_offTopTitle, GetGameLanguage(), (unsigned)ret);
-                    if (needUtf8Fix) {
-                        bool fixed = SetTitleOnRenderer(topNode, title, 0);
-                        Log("  Top title UTF-8 fix: %s", fixed ? "OK" : "no renderer found");
-                    }
-                } else {
-                    Log("  Top title (+0x%X) invalid pointer — skipping", g_offTopTitle);
-                }
-            } __except(EXCEPTION_EXECUTE_HANDLER) {
-                Log("  Top title (+0x%X) EXCEPTION", g_offTopTitle);
-            }
+        if (handler) {
+            InitWarehousePanel(handler);
+        } else {
+            InterlockedExchange(&g_initRetryCount, 0);
+            InterlockedExchange(&g_initPending, 1);
+            Log("  Handler not yet captured — deferred init via InputThread");
         }
 
         Log("  Warehouse opened (mode=0x%02X sub=0x%02X)", mc[g_offModeByte], mc[g_offSubByte]);
@@ -1001,6 +1048,7 @@ static void TriggerWarehouse(bool fromKeyboard = false) {
         }
         Log("=== CLOSING WAREHOUSE ===");
         InterlockedExchange(&g_warehouseActive, 0);
+        InterlockedExchange(&g_initPending, 0);
 
         // Hide warehouse panel via the game's base-class handler (command 0x0f).
         // This properly clears the active flag, detaches the scene object, and calls
@@ -1044,13 +1092,7 @@ static void TriggerWarehouse(bool fromKeyboard = false) {
             }
         }
 
-        __try {
-            InterlockedExchange(&g_modeSwitchByMod, 1);
-            fnMode((void*)mainChar);
-            InterlockedExchange(&g_modeSwitchByMod, 0);
-        } __except(EXCEPTION_EXECUTE_HANDLER) {
-            InterlockedExchange(&g_modeSwitchByMod, 0);
-        }
+        InterlockedExchange(&g_modeSwitchByMod, 0);
 
         Log("  Warehouse closed (mode=0x%02X sub=0x%02X)", mc[g_offModeByte], mc[g_offSubByte]);
     }
@@ -1063,6 +1105,19 @@ static volatile LONG g_pendingCircleClose = 0;  // 1 = waiting for Circle releas
 
 static LRESULT CALLBACK HookedWndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     if (m==WM_TRIGGER_WAREHOUSE) { TriggerWarehouse((bool)w); return 0; }
+    if (m==WM_INIT_WAREHOUSE) {
+        // Deferred warehouse panel init — posted by InputThread (separate thread)
+        // once the handler has been auto-captured by HookedCanShow.
+        if (!InterlockedCompareExchange(&g_warehouseActive, 0, 0)) return 0;
+        uintptr_t handler = (uintptr_t)InterlockedCompareExchange64(&g_handlerThis, 0, 0);
+        if (handler) {
+            Log("  Deferred init: handler captured, initializing panel");
+            InitWarehousePanel(handler);
+        } else {
+            Log("  Deferred init: WM_INIT_WAREHOUSE but handler still NULL");
+        }
+        return 0;
+    }
     if (InterlockedCompareExchange(&g_warehouseActive, 0, 0) && m==WM_KEYDOWN && w==VK_ESCAPE) {
         if (IsNewModalDialogVisible()) {
             // Record which modal we're dismissing so next ESC closes warehouse
@@ -1141,6 +1196,33 @@ static DWORD WINAPI InputThread(LPVOID) {
                 LoadConfig(g_iniPath);
                 Log("INI reloaded (hotkey 0x%02X)", g_reloadKey);
             } else if (!rd) reloadDown = false;
+        }
+
+        // Lazy-resolve mainChar from singleton if not yet captured
+        if (!InterlockedCompareExchange64(&g_mainChar, 0, 0)) {
+            uintptr_t resolved = ResolveMainChar();
+            if (resolved > 0x10000000000ULL) {
+                InterlockedExchange64(&g_mainChar, (LONG64)resolved);
+                Log("mainChar: 0x%llX (singleton, deferred)", (unsigned long long)resolved);
+            }
+        }
+
+        // Deferred warehouse init: handler wasn't available when F6 was pressed.
+        // We poll from this thread (16ms interval) because PostMessage from WndProc
+        // re-queues before the game renders a frame.  InputThread is a separate thread
+        // so the game processes frames between our checks.
+        if (InterlockedCompareExchange(&g_initPending, 0, 0)) {
+            uintptr_t handler = (uintptr_t)InterlockedCompareExchange64(&g_handlerThis, 0, 0);
+            if (handler) {
+                InterlockedExchange(&g_initPending, 0);
+                PostMessageA(g_gameWindow, WM_INIT_WAREHOUSE, 0, 0);
+            } else {
+                LONG retries = InterlockedIncrement(&g_initRetryCount);
+                if (retries >= 60) {  // ~1 second at 16ms
+                    InterlockedExchange(&g_initPending, 0);
+                    Log("  Deferred init: GAVE UP after %ld retries", retries);
+                }
+            }
         }
 
         // Don't poll in unsafe states
@@ -1532,47 +1614,54 @@ static bool ResolveAddresses() {
 
     // Step 4b: Find modal dialog offset in handler struct (update-proof modal detection)
     // Multiple handler functions find ModalMessageView via findChildByName, create a dialog,
-    // and store it at handler+N. The store pattern is: MOV [REG+disp32], RAX; TEST RAX, RAX
+    // and store it at handler+N.  The store pattern is:
+    //   MOV [REG+disp32], REG2 ; TEST REG2,REG2 ; JZ ; MOV [REG2+0x20], REG3
     // We iterate LEA xrefs to "ModalMessageView" and find the one with this store pattern.
+    // NOTE: Source register is NOT restricted to RAX — the compiler may use any GPR.
     {
         uintptr_t strMV = FindString("ModalMessageView");
         if (strMV) {
             uintptr_t leaModal = 0;
             uintptr_t searchFrom = g_fnHandler > 0x10000 ? g_fnHandler - 0x10000 : 0;
             while ((leaModal = FindLEA(strMV, searchFrom)) != 0) {
-                // Only consider LEAs near the warehouse handler (same class)
                 if (g_fnHandler && leaModal > g_fnHandler + 0x10000) break;
                 uint8_t* p = (uint8_t*)leaModal;
                 for (int i = 0; i < 0xC00; i++) {
                     uint8_t* q = p + i;
-                    // Match: REX.W MOV [REG+disp32], RAX
+                    // Match: REX.W MOV [REG+disp32], REG2 (any source register)
                     if ((q[0] & 0xFE) != 0x48 || q[1] != 0x89) continue;
                     uint8_t modrm = q[2];
-                    if ((modrm & 0xF8) != 0x80) continue;  // mod=10, reg=000 (RAX src)
-                    int dispOff = 3;
-                    if ((modrm & 0x07) == 0x04) dispOff = 4;  // SIB byte present
-                    uint32_t disp = *(uint32_t*)(q + dispOff);
+                    if ((modrm & 0xC0) != 0x80) continue;  // mod=10 (disp32)
+                    if ((modrm & 0x07) == 0x04) continue;   // skip SIB-encoded (ambiguous length)
+                    uint32_t disp = *(uint32_t*)(q + 3);
                     if (disp < 0x100 || disp >= 0x1000) continue;
-                    // Validate: TEST RAX,RAX (48 85 C0) within 16 bytes, then JZ, then MOV [RAX+0x20],REG
-                    uint8_t* a = q + dispOff + 4;
+                    // Extract source register from modrm (reg field bits 5:3)
+                    uint8_t srcReg = (modrm >> 3) & 0x07;
+                    // Validate: TEST REG2,REG2 within 16 bytes, then JZ, then MOV [REG2+0x20],REG3
+                    // TEST r64,r64: 48 85 <ModRM> where mod=11 and reg==r/m==srcReg
+                    uint8_t expectedTest = 0xC0 | (srcReg << 3) | srcReg;
+                    uint8_t* a = q + 7;  // after the MOV instruction
                     bool found = false;
                     for (int t = 0; t < 16 && !found; t++) {
-                        if (a[t] != 0x48 || a[t+1] != 0x85 || a[t+2] != 0xC0) continue;
+                        if (a[t] != 0x48 || a[t+1] != 0x85 || a[t+2] != expectedTest) continue;
                         uint8_t* jz = a + t + 3;
                         int jzLen = 0;
                         if (jz[0] == 0x74) jzLen = 2;
                         else if (jz[0] == 0x0F && jz[1] == 0x84) jzLen = 6;
                         if (!jzLen) continue;
+                        // MOV [REG2+0x20], REG3: REX.W 89 ModRM where mod=01, r/m=srcReg, disp8=0x20
                         uint8_t* bp = jz + jzLen;
-                        if ((bp[0] & 0xFC) == 0x48 && bp[1] == 0x89 &&
-                            (bp[2] & 0xC7) == 0x40 && bp[3] == 0x20) {
+                        if ((bp[0] & 0xF8) == 0x48 && bp[1] == 0x89 &&
+                            (bp[2] & 0xC7) == (0x40 | srcReg) && bp[3] == 0x20) {
                             found = true;
                         }
                     }
-                    // Keep the largest matching offset (warehouse-specific > base class)
-                    if (found && disp > g_modalDialogOff) g_modalDialogOff = disp;
+                    // Keep the smallest matching offset — that's the base move-quantity
+                    // dialog used in Private Storage.  Larger offsets (e.g. 0x340) belong
+                    // to donation/trade dialogs that don't appear in the warehouse.
+                    if (found && (!g_modalDialogOff || disp < g_modalDialogOff))
+                        g_modalDialogOff = disp;
                 }
-                // Continue scanning all LEAs — don't stop at first match
                 searchFrom = leaModal + 1;
             }
         }
@@ -1580,74 +1669,128 @@ static bool ResolveAddresses() {
     Log("ModalDlgOff:  %s offset=0x%X (string-xref → MOV [REG+N])",
         g_modalDialogOff?"OK":"FAIL", g_modalDialogOff);
 
-    // Step 5: ModeSwitcher — pattern scan + dynamic offset extraction
+    // Step 5a: Find mainChar singleton global
+    // Pattern: MOV RAX,[RIP+disp32]; MOV RCX,[RAX+0x48]; CMP byte [RCX+0xCA8], imm8
+    // The 10-byte tail "48 8B 48 48 80 B9 A8 0C 00 00" is preceded by "48 8B 05 disp32"
+    {
+        static const uint8_t tailPat[] = {0x48,0x8B,0x48,0x48, 0x80,0xB9,0xA8,0x0C,0x00,0x00};
+        uint8_t* base = (uint8_t*)g_gameBase;
+        for (DWORD i = 7; i + sizeof(tailPat) < g_imageSize; i++) {
+            if (memcmp(base + i, tailPat, sizeof(tailPat)) != 0) continue;
+            // Check the 7 bytes before: must be MOV RAX, [RIP+disp32] (48 8B 05 xx xx xx xx)
+            uint8_t* pre = base + i - 7;
+            if (pre[0] == 0x48 && pre[1] == 0x8B && (pre[2] & 0xC7) == 0x05) {
+                int32_t disp = *(int32_t*)(pre + 3);
+                g_mainCharGlobalPtr = (uintptr_t)(base + i) + disp; // RIP at end of MOV = base+i
+                Log("MainCharGlobal: OK base+0x%llX (singleton scan)",
+                    (unsigned long long)(g_mainCharGlobalPtr - g_gameBase));
+                break;
+            }
+        }
+        if (!g_mainCharGlobalPtr) Log("MainCharGlobal: FAIL (singleton pattern not found)");
+    }
+
+    // Step 5b: ModeSwitcher — string-xref + dynamic offset extraction
     // The ModeSwitcher function references 4 mainChar offsets in the 0x0C00-0x0D00 range:
     //   mode byte (u8), sub byte (u8), mode flags array (7 bytes), subtypes array (16 bytes)
     // Find any disp32 in that range — take min and max, derive the other offsets.
-    static const uint8_t pMS[] = {
-        0x48,0x89,0x5C,0x24,0x08, 0x48,0x89,0x6C,0x24,0x10,
-        0x48,0x89,0x74,0x24,0x18, 0x57, 0x48,0x81,0xEC,0xA0,0x00,0x00,0x00
-    };
-    {
-        uint8_t* base = (uint8_t*)g_gameBase;
-        for (DWORD i = 0; (DWORD)(i + sizeof(pMS)) <= g_imageSize; i++) {
-            if (memcmp(base + i, pMS, sizeof(pMS)) != 0) continue;
-            uintptr_t candidate = g_gameBase + i;
-            uint8_t* fn = (uint8_t*)candidate;
-            // Scan first 0x200 bytes for disp32 values in plausible mainChar mode-byte range.
-            // Two possible encodings for `[reg+disp32]` memory operand:
-            //   A) ModRM @ k-1 with mod=10 and r/m != 100 (no SIB)
-            //   B) ModRM @ k-2 with mod=10 and r/m == 100, SIB @ k-1 (for indexed access
-            //      like [rcx+rax+disp32] used by the loops reading flag/subtype arrays)
-            uint32_t minDisp = 0, maxDisp = 0;
-            for (int k = 2; k < 0x200 - 4; k++) {
-                uint8_t modrmA = fn[k - 1];
-                uint8_t modrmB = fn[k - 2];
-                bool caseA = ((modrmA & 0xC0) == 0x80) && ((modrmA & 0x07) != 0x04);
-                bool caseB = ((modrmB & 0xC0) == 0x80) && ((modrmB & 0x07) == 0x04);
-                if (!caseA && !caseB) continue;
-                uint32_t disp = *(uint32_t*)(fn + k);
-                if (disp < 0xC00 || disp >= 0xD00) continue;
-                if (!minDisp || disp < minDisp) minDisp = disp;
-                if (disp > maxDisp) maxDisp = disp;
+
+    // Helper lambda: scan function body for disp32 values in mainChar mode-byte range.
+    // Strategy: collect all disp32 in 0xC00-0xD00, find the consecutive pair (X, X+1)
+    // which identifies mode byte + sub byte. Then find the max disp for subtypes/flags.
+    // Returns true and populates g_fnModeSwitcher + offsets on success.
+    auto tryValidateModeSwitcher = [](uintptr_t candidate, int scanWindow, const char* method) -> bool {
+        uint8_t* fn = (uint8_t*)candidate;
+        // Collect all unique disp32 values in range
+        uint32_t found[64];
+        int nFound = 0;
+        for (int k = 2; k < scanWindow - 4; k++) {
+            uint8_t modrmA = fn[k - 1];
+            uint8_t modrmB = fn[k - 2];
+            bool caseA = ((modrmA & 0xC0) == 0x80) && ((modrmA & 0x07) != 0x04);
+            bool caseB = ((modrmB & 0xC0) == 0x80) && ((modrmB & 0x07) == 0x04);
+            if (!caseA && !caseB) continue;
+            uint32_t disp = *(uint32_t*)(fn + k);
+            if (disp < 0xC00 || disp >= 0xD00) continue;
+            // Add if not already seen
+            bool dup = false;
+            for (int j = 0; j < nFound; j++) if (found[j] == disp) { dup = true; break; }
+            if (!dup && nFound < 64) found[nFound++] = disp;
+        }
+        // Find the consecutive pair (X, X+1) — this is mode byte + sub byte
+        uint32_t modeByte = 0;
+        for (int i = 0; i < nFound; i++) {
+            for (int j = 0; j < nFound; j++) {
+                if (found[j] == found[i] + 1) { modeByte = found[i]; break; }
             }
-            if (minDisp && maxDisp && maxDisp > minDisp) {
-                // minDisp = mode byte (e.g. 0xCA8), minDisp+1 = sub byte
-                // maxDisp = subtypes start, maxDisp-7 = mode flags start
-                g_fnModeSwitcher = candidate;
-                g_offModeByte  = minDisp;
-                g_offSubByte   = minDisp + 1;
-                g_offSubtypes  = maxDisp;
-                g_offModeFlags = maxDisp - 7;
-                Log("ModeSwitcher: OK base+0x%llX (mode=0x%X sub=0x%X flags=0x%X subtypes=0x%X)",
-                    (unsigned long long)(candidate - g_gameBase),
-                    g_offModeByte, g_offSubByte, g_offModeFlags, g_offSubtypes);
-                break;
+            if (modeByte) break;
+        }
+        if (!modeByte) return false;
+        // Find the max disp within modeByte+0x20 range (mode/sub/flags/subtypes are
+        // clustered within ~0x20 bytes of each other in the mainChar struct)
+        uint32_t maxDisp = 0;
+        for (int i = 0; i < nFound; i++) {
+            if (found[i] > modeByte + 1 && found[i] <= modeByte + 0x20 && found[i] > maxDisp)
+                maxDisp = found[i];
+        }
+        // Need at least mode, sub, and one more offset for flags/subtypes
+        if (!maxDisp) return false;
+        g_fnModeSwitcher = candidate;
+        g_offModeByte  = modeByte;
+        g_offSubByte   = modeByte + 1;
+        g_offSubtypes  = maxDisp;
+        g_offModeFlags = maxDisp - 7;
+        Log("ModeSwitcher: OK base+0x%llX (mode=0x%X sub=0x%X flags=0x%X subtypes=0x%X) [%s]",
+            (unsigned long long)(candidate - g_gameBase),
+            g_offModeByte, g_offSubByte, g_offModeFlags, g_offSubtypes, method);
+        return true;
+    };
+
+    // PRIMARY: String-xref via "ingame-global" (unique string, update-resistant)
+    {
+        uintptr_t strIG = FindString("ingame-global");
+        if (strIG) {
+            uintptr_t leaAddr = FindLEA(strIG);
+            if (leaAddr) {
+                uintptr_t fnStart = FindFunctionStart(leaAddr);
+                if (fnStart) {
+                    tryValidateModeSwitcher(fnStart, 0xA00, "string-xref");
+                }
+            }
+        }
+    }
+
+    // FALLBACK: Pattern scan with old + new prologs, extended scan window
+    if (!g_fnModeSwitcher) {
+        static const uint8_t pMS_old[] = {
+            0x48,0x89,0x5C,0x24,0x08, 0x48,0x89,0x6C,0x24,0x10,
+            0x48,0x89,0x74,0x24,0x18, 0x57, 0x48,0x81,0xEC,0xA0,0x00,0x00,0x00
+        };
+        static const uint8_t pMS_new[] = {
+            0x48,0x89,0x5C,0x24,0x08, 0x48,0x89,0x74,0x24,0x18,
+            0x55, 0x57, 0x41,0x56, 0x48,0x8B,0xEC
+        };
+        struct { const uint8_t* pat; int len; const char* tag; } patterns[] = {
+            { pMS_new, sizeof(pMS_new), "pattern-new" },
+            { pMS_old, sizeof(pMS_old), "pattern-old" },
+        };
+        uint8_t* base = (uint8_t*)g_gameBase;
+        for (auto& p : patterns) {
+            if (g_fnModeSwitcher) break;
+            for (DWORD i = 0; (DWORD)(i + p.len) <= g_imageSize; i++) {
+                if (memcmp(base + i, p.pat, p.len) != 0) continue;
+                if (tryValidateModeSwitcher(g_gameBase + i, 0xA00, p.tag))
+                    break;
             }
         }
     }
     if (!g_fnModeSwitcher) Log("ModeSwitcher: FAIL (no validated match)");
 
-    // Step 6: Find SetCursorVisible — called from ModeSwitcher via thunk
-    // QOL: Hides cursor immediately when closing warehouse
-    if (g_fnModeSwitcher) {
-        uintptr_t targets[32];
-        int n = FindAllCALLsAfter(g_fnModeSwitcher, 0x200, targets, 32);
-        for (int i = 0; i < n; i++) {
-            uint8_t* t = (uint8_t*)targets[i];
-            if (t[0] == 0xE9) {
-                int32_t rel = *(int32_t*)(t + 1);
-                uintptr_t realFn = (uintptr_t)(t + 5) + rel;
-                if (realFn > g_gameBase + 0x10000000) {
-                    g_fnSetCursorVisible = targets[i];
-                    Log("SetCursorVisible: OK base+0x%llX (thunk from ModeSwitcher)",
-                        (unsigned long long)(targets[i] - g_gameBase));
-                    break;
-                }
-            }
-        }
-        if (!g_fnSetCursorVisible) Log("SetCursorVisible: FAIL (not found in ModeSwitcher)");
-    }
+    // Step 6: SetCursorVisible — removed.
+    // The ModeSwitcher function (FUN_1406CE4A0) is a pure mode-string configurator
+    // with no cursor-related callees.  The game handles cursor visibility natively
+    // when entering/leaving storage mode via the mode byte system.
+    g_fnSetCursorVisible = 0;
 
     // ================================================================
     //  FALLBACK: Old pattern scans if string-xref chain failed
@@ -1779,7 +1922,7 @@ static bool ResolveAddresses() {
             g_langByteAddr?(unsigned long long)(g_langByteAddr-g_gameBase):0);
     }
 
-    return g_fnHandler && g_fnModeSwitcher && g_fnCanShow && g_fnSetInventory;
+    return g_fnHandler && g_fnModeSwitcher && g_fnCanShow && g_fnSetInventory && g_mainCharGlobalPtr;
 }
 
 static DWORD WINAPI ModThread(LPVOID) {
@@ -1794,7 +1937,7 @@ static DWORD WINAPI ModThread(LPVOID) {
     if(!g_enabled)return 0;
     if(g_debugLog){std::string lp=ip.substr(0,ip.rfind('.'))+".log";g_logFile=fopen(lp.c_str(),"w");}
 
-    Log("=== Private Storage Anywhere v1.3.1 ===");
+    Log("=== Private Storage Anywhere v1.3.2 ===");
     {char cls[256]={};char ttl[256]={};GetClassNameA(g_gameWindow,cls,256);GetWindowTextA(g_gameWindow,ttl,256);
     Log("Game window: class='%s' title='%s'",cls,ttl);}
     g_gameBase=(uintptr_t)GetModuleHandleA("CrimsonDesert.exe");
@@ -1805,14 +1948,20 @@ static DWORD WINAPI ModThread(LPVOID) {
         (unsigned long long)g_gameBase, g_imageSize, g_hotkey);
 
     // Hash meta/0.papgt to detect modded game files (JSON mods etc.)
+    // Find game root by locating \bin64\ in the DLL path (works regardless of subdirectory depth)
     {
         std::string metaPath(dp);
-        size_t bs = metaPath.rfind('\\');
-        if (bs != std::string::npos) {
-            metaPath = metaPath.substr(0, bs);           // strip filename
+        size_t bin64pos = metaPath.rfind("\\bin64\\");
+        if (bin64pos == std::string::npos)
+            bin64pos = metaPath.rfind("\\bin64");  // DLL directly in bin64 (no trailing subdir)
+        if (bin64pos != std::string::npos)
+            metaPath = metaPath.substr(0, bin64pos);
+        else {
+            // Fallback: strip filename + one dir (legacy layout)
+            size_t bs = metaPath.rfind('\\');
+            if (bs != std::string::npos) metaPath = metaPath.substr(0, bs);
             bs = metaPath.rfind('\\');
-            if (bs != std::string::npos)
-                metaPath = metaPath.substr(0, bs);       // strip bin64
+            if (bs != std::string::npos) metaPath = metaPath.substr(0, bs);
         }
         metaPath += "\\meta\\0.papgt";
         uint32_t crc = FileCRC32(metaPath.c_str());
@@ -1822,17 +1971,31 @@ static DWORD WINAPI ModThread(LPVOID) {
 
     if(!ResolveAddresses()){Log("FATAL: pattern scan failed");return 0;}
 
+    // Compute hook sizes (find clean instruction boundaries)
+    g_hookSizeHandler = FindPrologBoundary((uint8_t*)g_fnHandler, 14);
+    if (g_hookSizeHandler < 14) g_hookSizeHandler = 15;   // fallback
+
     // Save original bytes before hooking (for cleanup on unload)
-    memcpy(g_origHandlerBytes, (void*)g_fnHandler, 15);
+    memcpy(g_origHandlerBytes, (void*)g_fnHandler, g_hookSizeHandler);
     g_hookAddrHandler = g_fnHandler;
-    memcpy(g_origModeSwitcherBytes, (void*)g_fnModeSwitcher, 15);
-    g_hookAddrModeSwitcher = g_fnModeSwitcher;
     memcpy(g_origCanShowBytes, (void*)g_fnCanShow, 14);
     g_hookAddrCanShow = g_fnCanShow;
 
-    if(!InstallHook(g_fnHandler,(uintptr_t)&CaptureOnHandler,"Handler")) return 0;
-    if(!InstallHook(g_fnModeSwitcher,(uintptr_t)&CaptureModeSwitcher,"ModeSwitcher")) return 0;
+    if(!InstallHook(g_fnHandler,(uintptr_t)&CaptureOnHandler,"Handler",g_hookSizeHandler)) return 0;
+    // ModeSwitcher hook removed: mainChar is now resolved via singleton global,
+    // and the dispatcher function has a different signature (4 args, not 1).
     if(!InstallCanShowHook(g_fnCanShow)) return 0;
+
+    // Resolve mainChar immediately from singleton (no need to wait for hook callback)
+    {
+        uintptr_t mc = ResolveMainChar();
+        if (mc > 0x10000000000ULL) {
+            InterlockedExchange64(&g_mainChar, (LONG64)mc);
+            Log("mainChar: 0x%llX (singleton)", (unsigned long long)mc);
+        } else {
+            Log("mainChar: DEFERRED (singleton not ready yet)");
+        }
+    }
 
     if (InitXInput()) {
         if (g_controllerButton)
@@ -1880,17 +2043,12 @@ BOOL APIENTRY DllMain(HMODULE h,DWORD r,LPVOID){
         // Restore original bytes for all game hooks to prevent use-after-free
         DWORD op;
         if (g_hookAddrHandler) {
-            VirtualProtect((void*)g_hookAddrHandler, 15, PAGE_EXECUTE_READWRITE, &op);
-            memcpy((void*)g_hookAddrHandler, g_origHandlerBytes, 15);
-            VirtualProtect((void*)g_hookAddrHandler, 15, op, &op);
-            FlushInstructionCache(GetCurrentProcess(), (void*)g_hookAddrHandler, 15);
+            VirtualProtect((void*)g_hookAddrHandler, g_hookSizeHandler, PAGE_EXECUTE_READWRITE, &op);
+            memcpy((void*)g_hookAddrHandler, g_origHandlerBytes, g_hookSizeHandler);
+            VirtualProtect((void*)g_hookAddrHandler, g_hookSizeHandler, op, &op);
+            FlushInstructionCache(GetCurrentProcess(), (void*)g_hookAddrHandler, g_hookSizeHandler);
         }
-        if (g_hookAddrModeSwitcher) {
-            VirtualProtect((void*)g_hookAddrModeSwitcher, 15, PAGE_EXECUTE_READWRITE, &op);
-            memcpy((void*)g_hookAddrModeSwitcher, g_origModeSwitcherBytes, 15);
-            VirtualProtect((void*)g_hookAddrModeSwitcher, 15, op, &op);
-            FlushInstructionCache(GetCurrentProcess(), (void*)g_hookAddrModeSwitcher, 15);
-        }
+        // ModeSwitcher hook removed (mainChar via singleton, no hook needed)
         if (g_hookAddrCanShow) {
             VirtualProtect((void*)g_hookAddrCanShow, 14, PAGE_EXECUTE_READWRITE, &op);
             memcpy((void*)g_hookAddrCanShow, g_origCanShowBytes, 14);
