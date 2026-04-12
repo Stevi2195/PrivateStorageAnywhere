@@ -21,5 +21,8 @@ src/imgui/
 # Old backups / notes
 *.bak
 
+# Local build scripts
+compile.bat
+
 
 *.md
