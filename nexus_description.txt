@@ -2,26 +2,32 @@
 
 [line]
 
-Open your Private Storage (Camp Warehouse) from anywhere in the world with a single hotkey or controller button press. No need to walk back to your camp chest.
+Open your [b]Private Storage[/b] and all five [b]Housing Storage Chests[/b] (Gatherables, Dresser, Refrigerator, Symbol, Collecting) from anywhere in the world with a single hotkey or controller button press. No need to walk back to your camp or housing chests.
 
 [line]
 
 [size=3][b]Features[/b][/size]
 
 [list]
-[*][b]F6[/b] to open Private Storage from anywhere on the map
-[*][b]ESC[/b] to close (or F6 again)
+[*][b]F6[/b] to open Private Storage (Camp Warehouse) from anywhere
+[*][b]F7[/b] to open the [b]Gatherables Chest[/b] from anywhere
+[*][b]F8[/b] to open the [b]Dresser[/b]
+[*][b]F9[/b] to open the [b]Refrigerator[/b]
+[*][b]Numpad 0[/b] to open the [b]Collecting Storage[/b]
+[*]Press the same key again to close. To switch chests, close one and press the next chest's hotkey.
+[*]Each chest also supports optional XInput controller buttons + modifier and PS5/PS4 (DualSense/DualShock 4) buttons, all configurable in the INI.
+[*][b]ESC[/b] to close
 [*][b]Native UI:[/b] Uses the game's built-in warehouse interface — no custom overlay
-[*][b]Localized titles:[/b] Warehouse title automatically matches your game language (14 languages supported)
-[*][b]Full interaction:[/b] Move items in and out of storage, same as at the chest
-[*][b]No chest visit required:[/b] Works immediately after game start
-[*][b]Update-proof:[/b] Uses automatic pattern scanning and vtable matching to locate internal game functions instead of relying on hardcoded offsets
+[*][b]Localized titles:[/b] Private Storage and Gatherables Chest titles automatically match your game language (14 languages supported); the four other housing chests use English titles
+[*][b]Full interaction:[/b] Move items in and out of every chest, same as at the chest in person
+[*][b]No NPC visit required:[/b] Works immediately after game start
+[*][b]Update-proof:[/b] Uses automatic pattern scanning, vtable matching, and runtime string cross-references to locate internal game functions instead of hardcoded offsets
 [*][b]Compatible with UI mods:[/b] Identifies the warehouse panel by vtable signature, not by panel ID — works correctly even when mods like "No Letterbox" change the UI configuration
-[*][b]Safety system:[/b] Hotkey is automatically blocked during cutscenes, minigames, and other unsafe states
-[*][b]Configurable:[/b] Hotkey can be changed via INI file
+[*][b]Safety system:[/b] Hotkeys are automatically blocked during cutscenes, minigames, and other unsafe states
+[*][b]Configurable:[/b] Each chest hotkey can be reassigned via INI file
 [*][b]Keyboard modifiers:[/b] Optional modifier key support (e.g. Shift+I to open storage while plain I opens inventory)
-[*][b]Xbox / XInput controller:[/b] Assign a controller button via XInput. Supports an optional modifier button (e.g. hold LB + press D-Pad). Works with Xbox controllers natively and all other controllers through Steam Input.
-[*][b]PS5 / PS4 controller:[/b] Native HID support for DualSense and DualShock 4 — close warehouse with Circle button. Configurable PSButton in INI (Share, Options, Circle, Triangle, Square, Cross, L1, R1, L3, R3, Touchpad, PS, Mute)
+[*][b]Xbox / XInput controller:[/b] Assign a controller button to Private Storage. Supports an optional modifier button (e.g. hold LB + press D-Pad). Works with Xbox controllers natively and all other controllers through Steam Input.
+[*][b]PS5 / PS4 controller:[/b] Native HID support for DualSense and DualShock 4 — close warehouse with Circle (or any configured button). Configurable PSButton in INI (Share, Options, Circle, Triangle, Square, Cross, L1, R1, L3, R3, Touchpad, PS, Mute)
 [*][b]INI hot-reload:[/b] Press F11 to reload all settings without restarting the game
 [/list]
 
@@ -41,7 +47,7 @@ Open your Private Storage (Camp Warehouse) from anywhere in the world with a sin
 [*]Make sure Ultimate ASI Loader ([b]version.dll[/b]) is in:
 [code][Steam]\steamapps\common\Crimson Desert\bin64\[/code]
 [*]Copy [b]PrivateStorageAnywhere.asi[/b] and [b]PrivateStorageAnywhere.ini[/b] into the same [b]bin64[/b] folder.
-[*]Launch the game. Press F6 to open Private Storage from anywhere.
+[*]Launch the game. Press F6 for Private Storage, F7 for Gatherables, F8/F9/Num0 for the other housing chests.
 [/list]
 
 [line]
@@ -51,20 +57,33 @@ Open your Private Storage (Camp Warehouse) from anywhere in the world with a sin
 Edit [b]PrivateStorageAnywhere.ini[/b]:
 
 [code][Settings]
-Enabled=1              ; Master switch (0=off, 1=on)
-DebugLog=0             ; Create log file for troubleshooting (0=off, 1=on)
-Hotkey=75              ; Keyboard hotkey in hex (default: 75 = F6)
-ModifierKey=00         ; Hold this key + Hotkey (00 = no modifier)
-ReloadKey=7A           ; Press to reload INI (default: 7A = F11, 00 = disabled)
-ControllerButton=0000  ; XInput controller button (0000 = disabled)
-ControllerModifier=0000 ; Hold this button first (0000 = no modifier)
-PSButton=none          ; PS5/PS4 button: Circle, Triangle, Square, Cross, L1, R1, etc. (none = disabled)[/code]
+Enabled=1               ; Master switch (0=off, 1=on)
+DebugLog=0              ; Create log file for troubleshooting
+Hotkey=75               ; Private Storage hotkey (default: 75 = F6)
+ModifierKey=00          ; Hold this key + Hotkey
+ReloadKey=7A            ; Reload INI without restart (7A = F11)
+ControllerButton=0000   ; XInput controller button (0000 = disabled)
+PSButton=none           ; PS5/PS4 button (Circle, Triangle, etc.)
 
-Key codes use Windows Virtual Key Codes in hex format. A full reference table covering letters, numbers, F1-F24, numpad, navigation, modifiers, punctuation, mouse buttons, and media keys is included at the bottom of the INI file.
+; --- Per-chest keyboard hotkeys ---
+GatherablesHotkey=76    ; Default F7
+DresserHotkey=77        ; Default F8
+RefrigeratorHotkey=78   ; Default F9
+CollectingHotkey=60     ; Default Numpad 0
+
+; --- Per-chest controller buttons (XInput, 0000 = disabled) ---
+GatherablesControllerButton=0000
+DresserControllerButton=0000
+RefrigeratorControllerButton=0000
+CollectingControllerButton=0000[/code]
+
+Each binding is a panel toggle: opens that panel from cold, or closes the warehouse if any panel is open. Set any [b]<Name>Hotkey[/b] / [b]<Name>ControllerButton[/b] to 00 to disable.
+
+A full Windows Virtual Key Code reference is at the bottom of the INI file.
 
 [size=3][b]Controller Setup[/b][/size]
 
-To use a controller button, assign a button in the INI:
+To use a controller button for Private Storage:
 
 [code][Settings]
 ControllerModifier=0100  ; Hold LB before pressing the button
@@ -111,6 +130,30 @@ Delete [b]PrivateStorageAnywhere.asi[/b] and [b]PrivateStorageAnywhere.ini[/b] f
 
 [size=3][b]Changelog[/b][/size]
 
+[b]v1.4.1[/b]
+[list]
+[*]New: Per-chest XInput controller buttons (with optional modifier) — every chest can be bound to any controller button combination via the INI.
+[*]New: Per-chest PS5/PS4 (HID) buttons — every chest can be bound to any DualSense/DualShock 4 button via the INI.
+[*]Changed: Symbol Storage hotkey is disabled by default — its in-game purpose is currently unclear. Re-enable manually via the INI if you know what it is.
+[/list]
+
+[b]v1.4.0[/b]
+[list]
+[*]New: All five [b]housing storage chests[/b] (Gatherables, Dresser, Refrigerator, Symbol, Collecting) can now be opened from anywhere with dedicated hotkeys — F7/F8/F9/F12/Num0. Each hotkey toggles its panel open/close.
+[*]New: Per-chest hotkey/modifier configuration in the INI — reassign or disable individual chests without recompiling.
+[/list]
+
+[b]v1.3.3[/b]
+[list]
+[*]Updated for game version 1.0.4.1 (2026-04-23) — internal game struct layout changed again, all affected offsets and prolog patterns re-adapted
+[*]Fixed: "Donate Funds" keyguide no longer shows on Private Storage
+[*]Fixed: ESC with a modal open (quantity-select / confirm dialog) now correctly closes the modal first, then the warehouse on the next ESC
+[*]Fixed: No more "Panel hide exception" log noise on close — the mod now does the close state-clear directly
+[*]Fixed: Warehouse no longer opens during the new "ingame-menu" state
+[*]Added: INI setting [b]PanelId[/b] — Apr-23 introduced multiple warehouse types; leave at 0 for auto-capture (default)
+[*]Improved: Several struct offsets resolved dynamically so non-layout-shifting future updates shouldn't require a rebuild
+[/list]
+
 [b]v1.3.2[/b]
 [list]
 [*]Updated for game version 1.0.3.1 — internal game functions were restructured and had to be re-adapted
@@ -118,105 +161,93 @@ Delete [b]PrivateStorageAnywhere.asi[/b] and [b]PrivateStorageAnywhere.ini[/b] f
 
 [b]v1.3.1[/b]
 [list]
-[*]Fixed: Wrong keyguide shown after visiting a donation NPC (e.g. "Donate Funds" instead of "Store") — now triggers the game's internal UI-state reset before loading the inventory
-[*]Fixed: On the very first F6 after loading a save the warehouse panel sometimes opened without being properly activated — the "show panel" command is now retried after the mode switch once the handler becomes available
+[*]Fixed: Wrong keyguide shown after visiting a donation NPC — now triggers the game's internal UI-state reset before loading the inventory
+[*]Fixed: On the very first F6 after loading a save the warehouse panel sometimes opened without being properly activated
 [*]Improved: Resolves additional struct offsets dynamically from game code, including the donation-state field
 [/list]
 
 [b]v1.3.0[/b]
 [list]
-[*]Fixed: Random crashes after 2026-04-11 game update — the warehouse handler struct was reorganized, shifting the bottom-label pointer by 8 bytes; the mod was writing text to the wrong address
-[*]Improved: All struct offsets (active flag, mainChar mode bytes, bottom label) are now resolved dynamically from game code at startup instead of being hardcoded — future updates that shift these offsets no longer require a mod rebuild
+[*]Fixed: Random crashes after 2026-04-11 game update — the warehouse handler struct was reorganized
+[*]Improved: All struct offsets are now resolved dynamically from game code at startup instead of being hardcoded
 [/list]
 
 [b]v1.2.6[/b]
 [list]
 [*]Fixed: F6 and controller toggle button could close the warehouse while a quantity/confirm dialog was still open
-[*]Fixed: Phantom modal bug — after visiting the camp NPC warehouse, ESC sometimes wouldn't close the mod-opened warehouse until you manually opened and closed a dialog first
+[*]Fixed: Phantom modal bug — after visiting the camp NPC warehouse, ESC sometimes wouldn't close the mod-opened warehouse
 [/list]
 
 [b]v1.2.5[/b]
 [list]
-[*]Fixed: Warehouse panel sometimes not opening after game update (HUD disappeared but no storage UI) — caused by auto-capture permanently locking onto a wrong UI controller
-[*]Improved: Auto-capture now uses exact vtable match via RTTI scan instead of offset-based range check — eliminates false positives from nearby base-class vtables
+[*]Fixed: Warehouse panel sometimes not opening after game update — caused by auto-capture permanently locking onto a wrong UI controller
+[*]Improved: Auto-capture now uses exact vtable match via RTTI scan
 [/list]
 
 [b]v1.2.4[/b]
 [list]
-[*]Fixed: Auto-capture no longer grabs the wrong UI controller when other panels share the same base class — now validates warehouse-specific UI nodes before accepting
-[*]Fixed: Modal dialog offset scan now picks the correct (warehouse-specific) offset instead of a base class offset
+[*]Fixed: Auto-capture no longer grabs the wrong UI controller when other panels share the same base class
+[*]Fixed: Modal dialog offset scan now picks the correct (warehouse-specific) offset
 [/list]
 
 [b]v1.2.3[/b]
 [list]
 [*]QOL: Cursor is hidden immediately when closing the warehouse
-[*]Improved: CanShow detection is now update-proof — primary vtable scan identifies CanShow by signature, fallback pattern scan kept as safety net
+[*]Improved: CanShow detection is now update-proof
 [/list]
 
 [b]v1.2.2[/b]
 [list]
 [*]Fixed: Compatible with game update 2026-04-04 — warehouse panel now renders correctly
-[*]Fixed: Panel show/hide uses the game's own base-class commands instead of manual flag manipulation — more robust across updates
+[*]Fixed: Panel show/hide uses the game's own base-class commands instead of manual flag manipulation
 [*]Removed: Unsafe cache-clear call that crashed after the update
-[*]Removed: Cursor force-show/hide — game now handles cursor visibility natively
-[*]Improved: Language detection is now update-proof — resolved dynamically from Steam API init function
-[*]Improved: Modal dialog detection is now update-proof — struct offset resolved dynamically at runtime
+[*]Improved: Language detection and modal dialog detection are now update-proof
 [/list]
 
 [b]v1.2.1[/b]
 [list]
-[*]Fixed: ESC now correctly closes the quantity dialog before closing the warehouse — previously the warehouse closed while the dialog stayed visible
-[*]Fixed: Window detection now uses exact game window class name instead of blind enumeration, preventing WndProc hook failures caused by overlays
+[*]Fixed: ESC now correctly closes the quantity dialog before closing the warehouse
+[*]Fixed: Window detection now uses exact game window class name
 [/list]
 
 [b]v1.2.0[/b]
 [list]
 [*]New: Localized warehouse titles — automatically matches game language (14 languages)
 [*]New: Top title now set correctly via CSS tree scan
-[*]New: Native PS5/PS4 controller support via HID Raw Input (DualSense, DualSense Edge, DualShock 4)
+[*]New: Native PS5/PS4 controller support via HID Raw Input
 [*]New: Configurable PSButton (Circle, Triangle, Square, Cross, L1, R1, L3, R3, Share, Options, Touchpad, PS, Mute)
 [*]New: Deferred close on button release to prevent dodge roll
 [*]New: Game-initiated close detection — properly restores mode bytes and cursor
-[*]Includes all v1.1.2 improvements
 [/list]
 
 [b]v1.1.2[/b]
 [list]
-[*]Fixed: Auto-capture now identifies warehouse controller by vtable instead of panelId (compatible with UI-mods like "No Letterbox" that change panel registration order)
-[*]Fixed: PanelId resolved dynamically from the warehouse handler object (no longer hardcoded)
-[*]Improved: FindFunctionStart now recognizes INT3 padding (0xCC) as function boundary
-[*]Improved: FindFunctionStart supports additional prolog patterns for better update resilience
-[*]Improved: Hook installation aborts safely if RIP-relative instructions detected (prevents corruption on game updates)
-[*]Improved: Mode byte access protected by spinlock to prevent race conditions
-[*]Changed: Removed ControllerEnabled toggle — controller works automatically when a ControllerButton is configured
+[*]Fixed: Auto-capture now identifies warehouse controller by vtable instead of panelId
+[*]Fixed: PanelId resolved dynamically from the warehouse handler object
+[*]Improved: FindFunctionStart recognizes INT3 padding and additional prolog patterns
+[*]Improved: Hook installation aborts safely if RIP-relative instructions detected
+[*]Improved: Mode byte access protected by spinlock
 [/list]
 
 [b]v1.1.1[/b]
 [list]
 [*]New: Mouse cursor now appears automatically when opening warehouse with keyboard
 [*]New: Cursor is hidden again when closing warehouse
-[*]Changed: ESC close now uses the same PostMessage path as all other triggers
 [/list]
 
 [b]v1.1[/b]
 [list]
-[*]Fixed: CanShow hook now correctly suppresses only competing store panels (IndulgenceView/BountyShop) while letting non-store UI work normally
-[*]Fixed: Removed unsafe brute-force SetTitle scan that could cause silent memory corruption
-[*]Fixed: SetTitle pattern now matches exact function start (off-by-one corrected)
-[*]Fixed: DLL unload now properly restores all game hooks (prevents use-after-free crashes)
-[*]Fixed: WndProc hook no longer falsely reports failure when previous WndProc was class-level
-[*]Fixed: B button on controller now always closes warehouse (like ESC on keyboard), no ControllerButton config needed
-[*]Improved: Function resolution now uses string cross-references instead of fragile byte patterns (survives game updates)
-[*]Improved: Pattern scans kept as fallback if string-xref fails
-[*]Improved: ModeSwitcher pattern scan now validates matches (was 9 matches, only 1 correct)
-[*]Changed: Bottom inventory label correctly set to "Private Storage" via verified offset
+[*]Fixed: CanShow hook now correctly suppresses only competing store panels
+[*]Fixed: Removed unsafe brute-force SetTitle scan
+[*]Fixed: DLL unload now properly restores all game hooks
+[*]Fixed: B button on controller now always closes warehouse
+[*]Improved: Function resolution now uses string cross-references instead of fragile byte patterns
 [/list]
 
 [b]v1.0.0[/b]
 [list]
 [*]Initial release
 [*]Open Private Storage from anywhere with F6
-[*]ESC or F6 to close
 [*]Auto-capture via panel ID — no chest visit required
 [*]Pattern-scan based function detection (update-proof)
 [*]Safety system: blocked during cutscenes, minigames, and interactions

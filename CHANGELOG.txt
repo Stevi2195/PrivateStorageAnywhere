@@ -1,5 +1,26 @@
 Private Storage Anywhere — Changelog
 
+v1.4.1 (2026-04-27)
+- New: Per-chest XInput controller buttons (with optional modifier) — every chest can be bound to any controller button combination via the INI.
+- New: Per-chest PS5/PS4 (HID) buttons — every chest can be bound to any DualSense/DualShock 4 button (Share, Options, Circle, Triangle, Square, Cross, L1, R1, L3, R3, Touchpad, PS, Mute) via the INI.
+- Changed: Symbol Storage hotkey is disabled by default (was F12). Its in-game purpose is currently unclear; users who know what it is can re-enable it manually via the INI.
+
+v1.4.0 (2026-04-26)
+- New: All 5 housing chests can now be opened from anywhere with their own hotkeys — F7 Gatherables, F8 Dresser, F9 Refrigerator, F12 Symbol, Num0 Collecting. Each hotkey toggles its panel open/close. To switch chests, close one and press the next chest's hotkey.
+- New: Per-chest hotkey configuration in the INI — every chest has its own hotkey/modifier you can reassign without recompiling.
+
+v1.3.3 (2026-04-23)
+- Updated for game version 1.0.4.1 — Apr-23 update reorganized the internal warehouse struct layout and changed several function prologs. All affected offsets, scanners, and hook installer re-adapted.
+- Fixed: Hook installed at the wrong address after the update — the warehouse Handler's prolog changed from `MOV [RSP+8], RBX` to `MOV [RSP+0x10], RBX`; FindFunctionStart didn't recognize the new form and fell through to a nearby JMP thunk. Prolog matcher generalized to accept any stack slot.
+- Fixed: Warehouse struct fields shifted by +0x20 in the 0x2C8–0x330 range. Donation state (3 faction shorts) moved from 0x330 to 0x350, the 0x15 prepare sub-object offsets moved from 0x2C8/0x2D8/0x300 to 0x2E8/0x2F8/0x320. Both resolved dynamically at startup.
+- Fixed: "Donate Funds" keyguide stayed visible on Private Storage — the Apr-23 HTML template made this widget default-visible (previously default-hidden). Mod now explicitly hides the donation sub-controller via the game's own hide function immediately after the 0x15 prepare.
+- Fixed: ESC no longer closes the warehouse while a quantity/confirm modal is open — the modal-dialog pointer moved from handler+0x360 to handler+0x258 (completely different struct slot, not a +0x20 shift like the other fields).
+- Fixed: Panel-close no longer generates a log exception — the base-class "hide panel" command null-derefs for mod-opened panels. Mod now does the three state clears directly (active flag, panel value, scene render-bit) with null-safe dereferencing of the scene-object chain.
+- Fixed: Warehouse no longer opens from the Ingame-Menu state. Apr-23 shifted the sub-mode enum values: the old 0x0E (pre-update "normal gameplay") now means "ingamemenu". Open-whitelist is now explicit: 0x0D, 0x0F, 0x10.
+- Fixed: SetDonationFaction function resolution — its prolog changed in Apr-23 (the old exact-prolog filter rejected it). Resolver now filters by call-target proximity to the Handler (library calls like strcmp sit far away, the real command handler is co-located within ~1 MB), so future prolog changes won't break donation-state cleanup.
+- Added: INI setting `PanelId=<hex>` — default 0 (auto-capture first seen, legacy behavior). Apr-23 introduced multiple warehouse types (Camp, Private, Kuku Food Storage, Collectibles, Wardrobe); set a specific panelId hex to pin the mod to one variant.
+- Added: Diagnostic log line listing every warehouse-vtable instance seen by CanShow with its panelId, so users can discover which ids the game registers for the new types.
+
 v1.3.2 (2026-04-12)
 - Updated for game version 1.0.3.1 — internal game functions were restructured and had to be re-adapted.
 - Improved: Hook installer and pattern scanners updated to handle new code layout introduced by this game update.
