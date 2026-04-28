@@ -130,6 +130,12 @@ Delete [b]PrivateStorageAnywhere.asi[/b] and [b]PrivateStorageAnywhere.ini[/b] f
 
 [size=3][b]Changelog[/b][/size]
 
+[b]v1.4.2[/b]
+[list]
+[*]New: PS5/PS4 modifier button — hold one button to gate another, so multiple chests can share face buttons via a single modifier (e.g. L1+Triangle / L1+Square / L1+Cross). Per-chest [b]<Name>PSModifier[/b] in the INI, plus the legacy [b]PSModifier[/b] for Private.
+[*]Fixed: Pressing ESC (or B/Circle) while an item "View Details" popup is open no longer closes the underlying storage UI by mistake — ESC now closes the popup first, a second ESC closes the warehouse.
+[/list]
+
 [b]v1.4.1[/b]
 [list]
 [*]New: Per-chest XInput controller buttons (with optional modifier) — every chest can be bound to any controller button combination via the INI.

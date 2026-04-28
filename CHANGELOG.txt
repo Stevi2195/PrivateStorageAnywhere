@@ -1,5 +1,9 @@
 Private Storage Anywhere — Changelog
 
+v1.4.2 (2026-04-28)
+- New: PSModifier (legacy global) and per-chest <Name>PSModifier — hold one PS5/PS4 button to gate another. Lets you bind multiple chests to face buttons via a single shared modifier (e.g. L1+Triangle for one chest, L1+Square for another).
+- Fixed: Pressing ESC (or B/Circle) while an item "View Details" popup is open no longer closes the underlying storage UI by mistake. The mod now tracks the popup's lifecycle via constructor/destructor hooks, so ESC is passed through to close the popup first; a second ESC closes the warehouse as before.
+
 v1.4.1 (2026-04-27)
 - New: Per-chest XInput controller buttons (with optional modifier) — every chest can be bound to any controller button combination via the INI.
 - New: Per-chest PS5/PS4 (HID) buttons — every chest can be bound to any DualSense/DualShock 4 button (Share, Options, Circle, Triangle, Square, Cross, L1, R1, L3, R3, Touchpad, PS, Mute) via the INI.

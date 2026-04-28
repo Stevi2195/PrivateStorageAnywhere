@@ -6,7 +6,7 @@
 #include <string>
 
 // ============================================================
-//  Private Storage Anywhere v1.4.1
+//  Private Storage Anywhere v1.4.2
 //
 //  Opens the Camp Warehouse (Private Storage) from anywhere
 //  with a hotkey (default F6) or controller button.
@@ -35,6 +35,15 @@ static uintptr_t g_warehouseVtableEntry = 0;  // vtable address containing handl
 static uintptr_t g_warehouseVtableStart = 0;  // vtable start of warehouse class — set on first successful capture
 static uint32_t  g_modalDialogOff = 0;     // handler+N: move-quantity dialog pointer
 static uintptr_t g_langByteAddr = 0;      // address of language byte (resolved dynamically from Steam API init function)
+
+// ItemDetailModal ("View Details" popup) tracking via lifecycle hooks.
+// Constructor wrapper FUN_140c25c80 (base+0xC25C80) increments active count;
+// destructor FUN_140b90360 (base+0xB90360) decrements. Modal-check reads
+// the count to decide whether ESC should pass through to the popup or
+// close the warehouse.
+static volatile LONG g_itemDetailActiveCount = 0;
+static uintptr_t g_addrItemDetailCtor = 0;
+static uintptr_t g_addrItemDetailDtor = 0;
 
 // Struct offsets — all resolved dynamically from game code at runtime (update-proof).
 // Defaults match the build in which each offset was first discovered; they serve as
@@ -91,26 +100,29 @@ static volatile LONG g_activePanel = PANEL_PRIVATE;
 // open shortcut (0 = disabled). Each hotkey is a panel toggle: opens cold if
 // warehouse is closed, otherwise closes the warehouse.
 struct PanelDef {
-    const char* name;              // English logging name
-    char        initString[256];   // SetInventory filter (overridable via INI)
-    DWORD       hotkey;            // Keyboard VK code, 0 = no dedicated hotkey
-    DWORD       modifier;          // Keyboard VK code, 0 = no modifier
-    WORD        controllerButton;  // XInput button mask, 0 = no button
-    WORD        controllerModifier; // XInput hold-this-first mask, 0 = no modifier
-    int         psButtonByteOff;   // PS5/PS4 HID: byte offset from buttons1; -1 = unbound
-    BYTE        psButtonBitMask;   // PS5/PS4 HID: bit mask within that byte
+    const char* name;                // English logging name
+    char        initString[256];     // SetInventory filter (overridable via INI)
+    DWORD       hotkey;              // Keyboard VK code, 0 = no dedicated hotkey
+    DWORD       modifier;            // Keyboard VK code, 0 = no modifier
+    WORD        controllerButton;    // XInput button mask, 0 = no button
+    WORD        controllerModifier;  // XInput hold-this-first mask, 0 = no modifier
+    int         psButtonByteOff;     // PS5/PS4 HID: byte offset from buttons1; -1 = unbound
+    BYTE        psButtonBitMask;     // PS5/PS4 HID: bit mask within that byte
+    int         psModifierByteOff;   // PS5/PS4 HID modifier byte offset; -1 = no modifier
+    BYTE        psModifierBitMask;   // PS5/PS4 HID modifier bit mask
 };
 static PanelDef g_panels[PANEL_COUNT] = {
-    { "Private",      "Character,Focus,True;CampWareHouse,Focus,True",                0,            0, 0, 0, -1, 0 },
-    { "Gatherables",  "Character,Focus,True;Housing_GatheredMaterials,Focus,True",   0x76 /*F7*/,  0, 0, 0, -1, 0 },
-    { "Dresser",      "Character,Focus,True;Housing_Dresser,Focus,True",              0x77 /*F8*/,  0, 0, 0, -1, 0 },
-    { "Refrigerator", "Character,Focus,True;Housing_Refrigerator,Focus,True",         0x78 /*F9*/,  0, 0, 0, -1, 0 },
-    { "Symbol",       "Character,Focus,True;Housing_Symbol,Focus,True",               0,            0, 0, 0, -1, 0 },
-    { "Collecting",   "Character,Focus,True;Housing_Collecting,Focus,True",           0x60 /*Num0*/,0, 0, 0, -1, 0 },
+    { "Private",      "Character,Focus,True;CampWareHouse,Focus,True",                0,            0, 0, 0, -1, 0, -1, 0 },
+    { "Gatherables",  "Character,Focus,True;Housing_GatheredMaterials,Focus,True",   0x76 /*F7*/,  0, 0, 0, -1, 0, -1, 0 },
+    { "Dresser",      "Character,Focus,True;Housing_Dresser,Focus,True",              0x77 /*F8*/,  0, 0, 0, -1, 0, -1, 0 },
+    { "Refrigerator", "Character,Focus,True;Housing_Refrigerator,Focus,True",         0x78 /*F9*/,  0, 0, 0, -1, 0, -1, 0 },
+    { "Symbol",       "Character,Focus,True;Housing_Symbol,Focus,True",               0,            0, 0, 0, -1, 0, -1, 0 },
+    { "Collecting",   "Character,Focus,True;Housing_Collecting,Focus,True",           0x60 /*Num0*/,0, 0, 0, -1, 0, -1, 0 },
 };
-// Per-panel last-down state for PS button edge detection (parallel to g_panels[]).
+// Per-panel last/current state for PS button edge detection (parallel to g_panels[]).
 static bool g_panelPsLastDown[PANEL_COUNT] = {};
 static bool g_panelPsCurrentDown[PANEL_COUNT] = {};
+static bool g_panelPsModifierDown[PANEL_COUNT] = {};
 
 // Constants
 static volatile LONG g_warehousePanelId = 0x0059;  // default, verified dynamically at runtime
@@ -320,11 +332,15 @@ static void IdentifyHidDevice(HANDLE hDevice) {
         SONY_VID, pid, g_cachedReportOffset);
 }
 
-// Parses Circle + per-panel PSButton state from WM_INPUT HID report.
-// Stores results in g_lastCircle and g_panelPsCurrentDown[].
+// Parses Circle + per-panel PSButton/PSModifier state from WM_INPUT HID
+// report. Stores results in g_lastCircle, g_panelPsCurrentDown[],
+// g_panelPsModifierDown[].
 static void ParseSonyButtons(LPARAM lParam) {
     g_lastCircle = false;
-    for (int i = 0; i < PANEL_COUNT; i++) g_panelPsCurrentDown[i] = false;
+    for (int i = 0; i < PANEL_COUNT; i++) {
+        g_panelPsCurrentDown[i] = false;
+        g_panelPsModifierDown[i] = false;
+    }
 
     UINT dwSize = 0;
     GetRawInputData((HRAWINPUT)lParam, RID_INPUT, nullptr, &dwSize, sizeof(RAWINPUTHEADER));
@@ -359,18 +375,19 @@ static void ParseSonyButtons(LPARAM lParam) {
     // Circle is always at buttons1 (offset + 0) — used for close-on-release
     g_lastCircle = (report[offset] & CIRCLE_BIT) != 0;
 
-    // Per-panel PSButton state. Each panel that has a binding gets its
-    // current pressed state populated; panels without binding stay false.
+    // Per-panel PSButton + PSModifier state. Each panel that has a binding
+    // gets its current pressed state populated; panels without binding stay
+    // false (and an unset modifier counts as "no modifier required" later).
     for (int i = 0; i < PANEL_COUNT; i++) {
-        if (g_panels[i].psButtonByteOff < 0) {
-            g_panelPsCurrentDown[i] = false;
-            continue;
+        if (g_panels[i].psButtonByteOff >= 0) {
+            int psOff = offset + g_panels[i].psButtonByteOff;
+            if ((DWORD)psOff < reportLen)
+                g_panelPsCurrentDown[i] = (report[psOff] & g_panels[i].psButtonBitMask) != 0;
         }
-        int psOff = offset + g_panels[i].psButtonByteOff;
-        if ((DWORD)psOff < reportLen) {
-            g_panelPsCurrentDown[i] = (report[psOff] & g_panels[i].psButtonBitMask) != 0;
-        } else {
-            g_panelPsCurrentDown[i] = false;
+        if (g_panels[i].psModifierByteOff >= 0) {
+            int modOff = offset + g_panels[i].psModifierByteOff;
+            if ((DWORD)modOff < reportLen)
+                g_panelPsModifierDown[i] = (report[modOff] & g_panels[i].psModifierBitMask) != 0;
         }
     }
 }
@@ -606,6 +623,11 @@ static uintptr_t ReadModalDialog(uintptr_t handler) {
 // After we pass ESC to the game once (dismissing it), we record the address so that
 // further ESC presses don't keep passing through (children cleanup is async).
 static bool IsNewModalDialogVisible() {
+    // ItemDetailModal popup ("View Details") — tracked via ctor/dtor hooks
+    if (InterlockedCompareExchange(&g_itemDetailActiveCount, 0, 0) > 0) {
+        return true;
+    }
+
     uintptr_t handler = (uintptr_t)InterlockedCompareExchange64(&g_handlerThis, 0, 0);
     if (!handler) return false;
     __try {
@@ -619,13 +641,9 @@ static bool IsNewModalDialogVisible() {
                 InterlockedExchange64(&g_lastModalPassed, 0);
                 return false;
             }
-            // children > 0: is this a modal we already passed ESC for?
             uintptr_t lastPassed = (uintptr_t)InterlockedCompareExchange64(&g_lastModalPassed, 0, 0);
-            if (lastPassed == modalView) {
-                // Same modal view, already handled — async cleanup still pending
-                return false;
-            }
-            return true;  // New modal, not yet dismissed
+            if (lastPassed == modalView) return false;
+            return true;
         }
     } __except(EXCEPTION_EXECUTE_HANDLER) {}
     InterlockedExchange64(&g_lastModalPassed, 0);
@@ -706,8 +724,8 @@ static void LoadConfig(const char* p) {
         if (buf[0]) strncpy(g_panels[i].initString, buf, sizeof(g_panels[i].initString) - 1);
     }
 
-    // PSButton (legacy global) → seeds Private's panel slot. Existing user
-    // INIs with PSButton=Share keep working.
+    // PSButton + PSModifier (legacy globals) → seed Private's panel slot.
+    // Existing user INIs with PSButton=Share keep working.
     char psBtn[32];
     GetPrivateProfileStringA("Settings", "PSButton", "none", psBtn, sizeof(psBtn), p);
     int legacyOff; BYTE legacyMask;
@@ -716,24 +734,48 @@ static void LoadConfig(const char* p) {
         g_panels[PANEL_PRIVATE].psButtonBitMask = legacyMask;
         Log("Legacy PSButton=%s → Private (byteOff=%d bitMask=0x%02X)", psBtn, legacyOff, legacyMask);
     }
+    char psMod[32];
+    GetPrivateProfileStringA("Settings", "PSModifier", "none", psMod, sizeof(psMod), p);
+    if (ParsePSButtonName(psMod, &legacyOff, &legacyMask)) {
+        g_panels[PANEL_PRIVATE].psModifierByteOff = legacyOff;
+        g_panels[PANEL_PRIVATE].psModifierBitMask = legacyMask;
+        Log("Legacy PSModifier=%s → Private (byteOff=%d bitMask=0x%02X)", psMod, legacyOff, legacyMask);
+    }
 
-    // Per-panel <Name>PSButton overrides. Reads same name strings (Share,
-    // Circle, Cross, ...).
+    // Per-panel <Name>PSButton + <Name>PSModifier overrides. Both use the
+    // same button-name strings (Share, Circle, Cross, L1, R1, ...).
     for (int i = 0; i < PANEL_COUNT; i++) {
         char keyName[64];
-        snprintf(keyName, sizeof(keyName), "%sPSButton", kIniKey[i]);
         char buf[32] = {};
+        snprintf(keyName, sizeof(keyName), "%sPSButton", kIniKey[i]);
         GetPrivateProfileStringA("Settings", keyName, "", buf, sizeof(buf), p);
-        if (!buf[0]) continue;  // not set in INI → keep current binding
-        int off; BYTE mask;
-        if (ParsePSButtonName(buf, &off, &mask)) {
-            g_panels[i].psButtonByteOff = off;
-            g_panels[i].psButtonBitMask = mask;
-            Log("Panel %s PSButton=%s (byteOff=%d bitMask=0x%02X)",
-                g_panels[i].name, buf, off, mask);
-        } else {
-            g_panels[i].psButtonByteOff = -1;
-            g_panels[i].psButtonBitMask = 0;
+        if (buf[0]) {
+            int off; BYTE mask;
+            if (ParsePSButtonName(buf, &off, &mask)) {
+                g_panels[i].psButtonByteOff = off;
+                g_panels[i].psButtonBitMask = mask;
+                Log("Panel %s PSButton=%s (byteOff=%d bitMask=0x%02X)",
+                    g_panels[i].name, buf, off, mask);
+            } else {
+                g_panels[i].psButtonByteOff = -1;
+                g_panels[i].psButtonBitMask = 0;
+            }
+        }
+
+        snprintf(keyName, sizeof(keyName), "%sPSModifier", kIniKey[i]);
+        buf[0] = '\0';
+        GetPrivateProfileStringA("Settings", keyName, "", buf, sizeof(buf), p);
+        if (buf[0]) {
+            int off; BYTE mask;
+            if (ParsePSButtonName(buf, &off, &mask)) {
+                g_panels[i].psModifierByteOff = off;
+                g_panels[i].psModifierBitMask = mask;
+                Log("Panel %s PSModifier=%s (byteOff=%d bitMask=0x%02X)",
+                    g_panels[i].name, buf, off, mask);
+            } else {
+                g_panels[i].psModifierByteOff = -1;
+                g_panels[i].psModifierBitMask = 0;
+            }
         }
     }
 }
@@ -928,6 +970,25 @@ extern "C" void __fastcall CaptureOnFactory(void* owner, void* ctrl) {
             (unsigned long long)(uintptr_t)owner,
             (unsigned long long)(uintptr_t)ctrl);
     }
+}
+
+// Fires whenever the game spawns an ItemDetailModal ("View Details" popup).
+// We don't need the new instance pointer — we just track the count so the
+// ESC handler knows a popup is active and should be passed through to the game.
+extern "C" void __fastcall CaptureOnItemDetailCtor(void* /*param_1*/, void* /*param_2*/) {
+    LONG n = InterlockedIncrement(&g_itemDetailActiveCount);
+    Log("ItemDetailModal ctor → activeCount=%ld", n);
+}
+
+// Fires when an ItemDetailModal instance is destroyed.
+extern "C" void __fastcall CaptureOnItemDetailDtor(void* /*this*/, void* /*flags*/) {
+    LONG n = InterlockedDecrement(&g_itemDetailActiveCount);
+    if (n < 0) {
+        // dtor fired before ctor was hooked (game start), clamp to 0
+        InterlockedExchange(&g_itemDetailActiveCount, 0);
+        n = 0;
+    }
+    Log("ItemDetailModal dtor → activeCount=%ld", n);
 }
 
 // Resolve mainChar from the game manager singleton: *(*(globalPtr) + 0x48)
@@ -2423,14 +2484,18 @@ static LRESULT CALLBACK HookedWndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
 
         bool circleDown = g_lastCircle;
 
-        // Per-panel PSButton rising edges → toggle that panel
+        // Per-panel PSButton rising edges → toggle that panel.
+        // If a PSModifier is configured, it must also be held at the moment
+        // the button is pressed (mirrors XInput ControllerModifier).
         for (int i = 0; i < PANEL_COUNT; i++) {
             if (g_panels[i].psButtonByteOff < 0) {
                 g_panelPsLastDown[i] = false;
                 continue;
             }
             bool down = g_panelPsCurrentDown[i];
-            if (down && !g_panelPsLastDown[i]) {
+            bool modOk = (g_panels[i].psModifierByteOff < 0) ||
+                         g_panelPsModifierDown[i];
+            if (down && !g_panelPsLastDown[i] && modOk) {
                 if (InterlockedCompareExchange(&g_warehouseActive, 0, 0)) {
                     if (IsNewModalDialogVisible()) {
                         Log("Panel %s PS button → sub-dialog active, ignoring",
@@ -2539,16 +2604,15 @@ static DWORD WINAPI InputThread(LPVOID) {
                             if (ap < 0 || ap >= PANEL_COUNT) ap = PANEL_PRIVATE;
                             LONG64 prev = InterlockedCompareExchange64(&g_panelStickyContainer[ap], 0, 0);
                             if (prev != (LONG64)cont) {
-                                uint32_t typeId  = *(uint32_t*)(cont + 0x18);
-                                uint32_t cap1    = *(uint32_t*)(cont + 0x9C);
-                                uint32_t cap2    = *(uint32_t*)(cont + 0xA0);
-                                uintptr_t arr1   = *(uintptr_t*)(cont + 0x48);
-                                uintptr_t arr2   = *(uintptr_t*)(cont + 0x58);
                                 InterlockedExchange64(&g_panelStickyContainer[ap], (LONG64)cont);
                                 InterlockedExchange(&g_currentBoundPanel, ap);
-                                Log("Sticky bind [%s]: saved 0x%llX type=0x%X cap=%u/%u arr1=0x%llX arr2=0x%llX",
-                                    g_panels[ap].name, (unsigned long long)cont, typeId, cap1, cap2,
-                                    (unsigned long long)arr1, (unsigned long long)arr2);
+                                // Log only the FIRST sticky save per panel — once we have
+                                // a valid container the user can re-open that panel later.
+                                // Subsequent updates within a session are diagnostic noise.
+                                if (prev == 0) {
+                                    Log("Sticky bind [%s]: saved 0x%llX",
+                                        g_panels[ap].name, (unsigned long long)cont);
+                                }
                             }
                         }
                     }
@@ -2655,26 +2719,25 @@ static DWORD WINAPI InputThread(LPVOID) {
                     } else {
                         trigger = true;
                     }
-                } else {
-                    // Per-panel controller buttons. Each panel's button is a
-                    // toggle: opens that panel from cold, or closes the
-                    // warehouse if any panel is currently open.
-                    for (int i = 0; i < PANEL_COUNT; i++) {
-                        WORD btn = g_panels[i].controllerButton;
-                        if (!btn || !(pressed & btn)) continue;
-                        WORD mod = g_panels[i].controllerModifier;
-                        if (mod && !(buttons & mod)) continue;
+                }
+                // Per-panel controller buttons. Each panel's button is a
+                // toggle: opens that panel from cold, or closes the
+                // warehouse if any panel is currently open.
+                else for (int i = 0; i < PANEL_COUNT; i++) {
+                    WORD btn = g_panels[i].controllerButton;
+                    if (!btn || !(pressed & btn)) continue;
+                    WORD mod = g_panels[i].controllerModifier;
+                    if (mod && !(buttons & mod)) continue;
 
-                        DWORD now = GetTickCount();
-                        if (now - g_lastAct < 400) continue;
-                        g_lastAct = now;
+                    DWORD now = GetTickCount();
+                    if (now - g_lastAct < 400) continue;
+                    g_lastAct = now;
 
-                        if (!InterlockedCompareExchange(&g_warehouseActive, 0, 0)) {
-                            InterlockedExchange(&g_nextOpenPanel, i);
-                        }
-                        trigger = true;
-                        break;
+                    if (!InterlockedCompareExchange(&g_warehouseActive, 0, 0)) {
+                        InterlockedExchange(&g_nextOpenPanel, i);
                     }
+                    trigger = true;
+                    break;
                 }
             }
         }
@@ -3358,6 +3421,8 @@ static bool ResolveAddresses() {
     g_addrSingletonGetter     = g_gameBase + 0xA7CDFB0;
     g_addrFactoryWrapper      = g_gameBase + 0xA9EDC10;
     g_addrInventoryInfoMgrPtr = g_gameBase + 0x5F0DA18;
+    g_addrItemDetailCtor      = g_gameBase + 0xC316D0;  // FUN_140c316d0: ItemDetailModal inner ctor (allocator + vtable assign); wrapper at +0xC25C80 has CALL too early to hook
+    g_addrItemDetailDtor      = g_gameBase + 0xB90360;  // FUN_140b90360: ItemDetailModal destructor
     Log("Container vtable:    base+0x%llX", (unsigned long long)(g_addrContainerVtable    - g_gameBase));
     Log("Factory singleton vt: base+0x%llX", (unsigned long long)(g_addrFactorySingletonVt - g_gameBase));
     Log("Singleton type-ID:   base+0x%llX (= 0x%08X)",
@@ -3382,7 +3447,7 @@ static DWORD WINAPI ModThread(LPVOID) {
     if(!g_enabled)return 0;
     if(g_debugLog){std::string lp=ip.substr(0,ip.rfind('.'))+".log";g_logFile=fopen(lp.c_str(),"w");}
 
-    Log("=== Private Storage Anywhere v1.4.1 ===");
+    Log("=== Private Storage Anywhere v1.4.2 ===");
     {char cls[256]={};char ttl[256]={};GetClassNameA(g_gameWindow,cls,256);GetWindowTextA(g_gameWindow,ttl,256);
     Log("Game window: class='%s' title='%s'",cls,ttl);}
     g_gameBase=(uintptr_t)GetModuleHandleA("CrimsonDesert.exe");
@@ -3439,6 +3504,22 @@ static DWORD WINAPI ModThread(LPVOID) {
         if (!InstallHook(g_addrFactoryWrapper, (uintptr_t)&CaptureOnFactory,
                          "Factory")) {
             Log("Factory hook FAILED — F7 will fall back to fake-owner path");
+        }
+    }
+
+    // Hook the ItemDetailModal lifecycle so we can detect when the "View
+    // Details" popup is open (so ESC passes through to close it instead of
+    // closing the warehouse).
+    if (g_addrItemDetailCtor) {
+        if (!InstallHook(g_addrItemDetailCtor, (uintptr_t)&CaptureOnItemDetailCtor,
+                         "ItemDetailCtor")) {
+            Log("ItemDetailCtor hook FAILED — popup won't be detected");
+        }
+    }
+    if (g_addrItemDetailDtor) {
+        if (!InstallHook(g_addrItemDetailDtor, (uintptr_t)&CaptureOnItemDetailDtor,
+                         "ItemDetailDtor")) {
+            Log("ItemDetailDtor hook FAILED — popup count may stay incremented");
         }
     }
 
