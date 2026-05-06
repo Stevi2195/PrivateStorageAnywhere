@@ -130,6 +130,18 @@ Delete [b]PrivateStorageAnywhere.asi[/b] and [b]PrivateStorageAnywhere.ini[/b] f
 
 [size=3][b]Changelog[/b][/size]
 
+[b]v1.5.0[/b]
+[list]
+[*]Updated for game version [b]1.0.5.0 hotfix[/b] — internal warehouse functions, struct offsets, and the InventoryInfoManager address all moved.
+[*]Fixed: Housing chests (Gatherables, Dresser, Refrigerator, Symbol, Collecting) showed wrong items or stayed empty after the 1.0.5.0 update — channel routing rewired, refresh path now uses the correct scope-walker so the game allocates the proper housing container.
+[*]Fixed: Slot count showed 10 instead of 1000 for housing chests — InventoryInfoManager singleton moved (base+0x5F0DA18 → base+0x5EF1DC0); slot-count patch now applies again.
+[*]Fixed: F-key hotkeys sometimes didn't toggle reliably — the game's input system grabbed F7 in a way that left polling-based detection thinking the key was still held. Hotkeys now use Windows messages with proper press-vs-repeat detection — every physical tap registers, regardless of how the game treats the key.
+[*]Fixed: ~800ms stutter on the first F6 of each session — removed an obsolete synchronous heap scan.
+[*]Fixed: View Details popup detection — old hook addresses no longer exist in 1.0.5.0; replaced with a string-xref-resilient hook so ESC closes the popup first as before, second ESC closes the warehouse.
+[*]Fixed: Housing panel toggles no longer leave dirty handler state behind — Camp fields are restored on every close, so subsequent F-key cycles work cleanly.
+[*]Cleanup: Removed dead code paths and obsolete diagnostics (~100 lines smaller).
+[/list]
+
 [b]v1.4.2[/b]
 [list]
 [*]New: PS5/PS4 modifier button — hold one button to gate another, so multiple chests can share face buttons via a single modifier (e.g. L1+Triangle / L1+Square / L1+Cross). Per-chest [b]<Name>PSModifier[/b] in the INI, plus the legacy [b]PSModifier[/b] for Private.
