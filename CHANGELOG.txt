@@ -1,15 +1,7 @@
 Private Storage Anywhere — Changelog
 
-v1.5.0 (2026-05-06)
-- Updated for game version 1.0.5.0 hotfix — internal warehouse functions, struct offsets, and the InventoryInfoManager singleton address all moved. All affected scanners and hooks re-adapted.
-- Fixed: Housing chest items (Gatherables, Dresser, Refrigerator, Symbol, Collecting) showed Camp items or stayed empty after the 1.0.5.0 update. The slot-grid renderer now reads the channel from sub[handler+0x1E0]+0x218; mod writes the correct tab index for chest panels and re-binds sub[1] to the housing channel. Refresh is invoked with the proper sub-controller scope-walker (not the chest itself) which triggers the game's natural housing-chest allocation path.
-- Fixed: Slot counts displayed wrong number (10 instead of 1000) for housing chests. The InventoryInfoManager singleton moved from base+0x5F0DA18 to base+0x5EF1DC0; the per-Inventory-info slot-count patch now hits the right entries.
-- Fixed: F-key hotkeys (F7+) sometimes didn't toggle to close. The game's input system grabbed F7 and kept the hardware state reporting "still down" after a tap, so the polling-based rising-edge detection missed subsequent presses. Hotkeys now route through WM_KEYDOWN messages with lParam bit-30 (previous-key-state) for clean press-vs-repeat distinction. Works regardless of GetAsyncKeyState weirdness.
-- Fixed: First F6 of a session caused an ~800ms stutter from a synchronous heap scan that always produced 0 hits. Scan removed.
-- Fixed: After closing a housing panel and reopening, the previously-patched handler fields (handler+0x1D8 / +0x200 / +0x2A8 / +0x39C) stayed dirty and could destabilize subsequent toggles. Camp state is now restored on every close.
-- Fixed: ItemDetailModal ("View Details" popup) detection — the 1.0.4.x ctor (base+0xC316D0) and dtor (base+0xB90360) addresses no longer exist in 1.0.5.0. Replaced with the open-handler at base+0xB4D310, located via xref of the "ItemDetailModalMessage" string (resilient to future address drift). Modal-dismissal is detected by ESC pass-through plus warehouse-close safety-net.
-- Fixed: Removed 400ms time-based debounce on hotkeys; press-edge detection alone is sufficient and the timer was causing rapid open-close attempts to be silently dropped.
-- Cleanup: Removed dead code paths (BindScopeForActivePanel, verbose container/handler diagnostics, stale ScopeBind comments) — net ~100 lines smaller.
+v1.4.3 (2026-05-06)
+- Updated for game version 1.0.5.0 hotfix.
 
 v1.4.2 (2026-04-28)
 - New: PSModifier (legacy global) and per-chest <Name>PSModifier — hold one PS5/PS4 button to gate another. Lets you bind multiple chests to face buttons via a single shared modifier (e.g. L1+Triangle for one chest, L1+Square for another).
