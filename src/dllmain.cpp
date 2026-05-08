@@ -1,12 +1,13 @@
 #include <windows.h>
 #include <psapi.h>
+#include <tlhelp32.h>
 #include <intrin.h>
 #include <cstdio>
 #include <cstring>
 #include <string>
 
 // ============================================================
-//  Private Storage Anywhere v1.4.2
+//  Private Storage Anywhere v1.4.4
 //
 //  Opens the Camp Warehouse (Private Storage) from anywhere
 //  with a hotkey (default F6) or controller button.
@@ -106,6 +107,7 @@ static volatile LONG64 g_cursorObj = 0;
 static volatile LONG g_warehouseActive = 0;
 static volatile LONG g_handlerHitCount = 0;
 static volatile LONG g_canShowSeen118 = 0;  // set to 1 once +0x118 has been seen as 1
+static volatile LONG g_canShowZeroCount = 0; // consecutive frames where +0x118==0 (de-bounce close detection)
 
 // Active panel selector. F6 opens PRIVATE; F7/F8/F9/F12/Num0 open the housing
 // chests directly. Each press is a fresh open from cold.
@@ -154,6 +156,14 @@ static PanelDef g_panels[PANEL_COUNT] = {
 static bool g_panelPsLastDown[PANEL_COUNT] = {};
 static bool g_panelPsCurrentDown[PANEL_COUNT] = {};
 static bool g_panelPsModifierDown[PANEL_COUNT] = {};
+// Per-panel last-down state for XInput button edge detection (parallel to g_panels[]).
+// Keeps the XInput per-panel logic structurally identical to the DirectInput version
+// (which uses g_panelPsLastDown) — each panel tracks its own rising edge instead of
+// sharing the global g_prevButtons mask. This avoids cross-panel interference and
+// makes the two paths trivially auditable.
+static bool g_panelXiLastDown[PANEL_COUNT] = {};
+// XInput B-button last-down state (parallel to g_circleWasDown for DualSense Circle).
+static bool g_xiBWasDown = false;
 
 // Constants
 static volatile LONG g_warehousePanelId = 0x0059;  // default, verified dynamically at runtime
@@ -283,7 +293,8 @@ static uint8_t g_savedSubtypes[15] = {};
 // NOTE: g_cursorShownByMod removed — not needed, we always hide cursor on close
 static volatile LONG g_modeByteLock = 0;  // Spinlock for mode byte read/write
 static volatile LONG g_modeSwitchByMod = 0;  // 1 when WE call fnMode, 0 otherwise
-static volatile ULONGLONG g_openTimestamp = 0;  // GetTickCount64 at warehouse open (grace period)
+static volatile ULONGLONG g_openTimestamp  = 0;  // GetTickCount64 at warehouse open (grace period)
+static volatile ULONGLONG g_closeTimestamp = 0;  // GetTickCount64 at last close (re-open cooldown)
 static volatile LONG64 g_lastModalPassed = 0;   // ModalMessageView addr when ESC was last passed to game for a modal
 
 // Forward declaration (defined later in Utilities section)
@@ -295,6 +306,17 @@ static uintptr_t ResolveContainerForPanelId(uintptr_t handler, uint16_t panelId)
 static uintptr_t TryCreateContainerViaSingleton(uintptr_t handler);
 static void InitWarehousePanel(uintptr_t handler, const char* initString);
 static void ScanForInventorySaveData();
+// Diagnostic forward decls (defined near WndProc section).
+static void EnableActiveFlagWatch(uintptr_t handler);
+static void DisableActiveFlagWatch();
+static void LogModalState(const char* prefix);
+
+// Pending-close flags. Set on press while warehouse is active, cleared on
+// release-driven close OR on warehouse close from any other path. Defined
+// here (instead of next to the input handlers) so TriggerWarehouse's
+// close branch can reset them without a forward declaration.
+static volatile LONG g_pendingCircleClose = 0;  // PS5/PS4 Circle (HID)
+static volatile LONG g_pendingBClose      = 0;  // XInput B
 static uintptr_t ResolveContainerForPanelId(uintptr_t handler, uint16_t panelId);
 
 // GetInitStringForActive: returns the SetInventory filter string for the currently active panel.
@@ -372,8 +394,6 @@ static void IdentifyHidDevice(HANDLE hDevice) {
     } else if (pid == DS5_PID || pid == DS5_EDGE) {
         g_cachedReportOffset = 8;  // DualSense USB
     }
-    Log("HID device identified: VID=%04X PID=%04X → buttons1 offset=%d",
-        SONY_VID, pid, g_cachedReportOffset);
 }
 
 // Parses Circle + per-panel PSButton/PSModifier state from WM_INPUT HID
@@ -730,7 +750,11 @@ static bool ParsePSButtonName(const char* name, int* outOff, BYTE* outMask) {
 static void LoadConfig(const char* p) {
     g_enabled = GetPrivateProfileIntA("Settings","Enabled",1,p)!=0;
     g_debugLog = GetPrivateProfileIntA("Settings","DebugLog",0,p)!=0;
-    g_hotkey = ReadHexValue("Settings", "Hotkey", VK_F6, p);
+    // Legacy "Hotkey" (single Private toggle). Default 0 = disabled, since the
+    // new INI layout uses PrivateHotkey=… for per-panel control. Keeping the
+    // old VK_F6 default would silently steal whatever F6 is now assigned to
+    // (e.g. Dresser).
+    g_hotkey = ReadHexValue("Settings", "Hotkey", 0, p);
     g_modifierKey = ReadHexValue("Settings", "ModifierKey", 0, p);
     g_controllerButton = (WORD)ReadHexValue("Settings", "ControllerButton", 0, p);
     g_controllerModifier = (WORD)ReadHexValue("Settings", "ControllerModifier", 0, p);
@@ -782,14 +806,12 @@ static void LoadConfig(const char* p) {
     if (ParsePSButtonName(psBtn, &legacyOff, &legacyMask)) {
         g_panels[PANEL_PRIVATE].psButtonByteOff = legacyOff;
         g_panels[PANEL_PRIVATE].psButtonBitMask = legacyMask;
-        Log("Legacy PSButton=%s → Private (byteOff=%d bitMask=0x%02X)", psBtn, legacyOff, legacyMask);
     }
     char psMod[32];
     GetPrivateProfileStringA("Settings", "PSModifier", "none", psMod, sizeof(psMod), p);
     if (ParsePSButtonName(psMod, &legacyOff, &legacyMask)) {
         g_panels[PANEL_PRIVATE].psModifierByteOff = legacyOff;
         g_panels[PANEL_PRIVATE].psModifierBitMask = legacyMask;
-        Log("Legacy PSModifier=%s → Private (byteOff=%d bitMask=0x%02X)", psMod, legacyOff, legacyMask);
     }
 
     // Per-panel <Name>PSButton + <Name>PSModifier overrides. Both use the
@@ -804,8 +826,6 @@ static void LoadConfig(const char* p) {
             if (ParsePSButtonName(buf, &off, &mask)) {
                 g_panels[i].psButtonByteOff = off;
                 g_panels[i].psButtonBitMask = mask;
-                Log("Panel %s PSButton=%s (byteOff=%d bitMask=0x%02X)",
-                    g_panels[i].name, buf, off, mask);
             } else {
                 g_panels[i].psButtonByteOff = -1;
                 g_panels[i].psButtonBitMask = 0;
@@ -820,8 +840,6 @@ static void LoadConfig(const char* p) {
             if (ParsePSButtonName(buf, &off, &mask)) {
                 g_panels[i].psModifierByteOff = off;
                 g_panels[i].psModifierBitMask = mask;
-                Log("Panel %s PSModifier=%s (byteOff=%d bitMask=0x%02X)",
-                    g_panels[i].name, buf, off, mask);
             } else {
                 g_panels[i].psModifierByteOff = -1;
                 g_panels[i].psModifierBitMask = 0;
@@ -922,24 +940,132 @@ static bool InitXInput() {
     const char* dlls[] = { "xinput1_4.dll", "xinput1_3.dll", "xinput9_1_0.dll" };
     for (int i = 0; i < 3; i++) {
         g_hXInput = LoadLibraryA(dlls[i]);
-        if (g_hXInput) {
+        if (!g_hXInput) continue;
+
+        // Prefer ordinal 100 = XInputGetStateEx (undocumented, returns Guide
+        // button + reads from the *fresh* slot rather than the cached
+        // legacy slot). xinput9_1_0.dll has no ordinal 100 — fall through.
+        g_pXInputGetState = (PFN_XInputGetState)GetProcAddress(g_hXInput, (LPCSTR)100);
+        if (!g_pXInputGetState) {
             g_pXInputGetState = (PFN_XInputGetState)GetProcAddress(g_hXInput, "XInputGetState");
-            if (g_pXInputGetState) {
-                Log("XInput loaded: %s", dlls[i]);
-                return true;
+        }
+        if (g_pXInputGetState) return true;
+        FreeLibrary(g_hXInput);
+        g_hXInput = nullptr;
+    }
+    return false;
+}
+
+// ============================================================
+//  XInput IAT hook on game module
+//
+//  The game polls XInput from its own thread independently of the
+//  mod. While the warehouse is open, that polling makes the game
+//  treat B as Dodge and react to LB+LeftStick / similar combos —
+//  the controller user gets a dodge roll on close and the open is
+//  fought by the game's own input handling. (DirectInput / Sony HID
+//  doesn't have this problem because the game's UI-cancel path
+//  consumes Circle on the WM_INPUT route.)
+//
+//  Fix: IAT-hook XInputGetState on CrimsonDesert.exe so the GAME's
+//  XInput reads come through us. The mod's own poll uses the direct
+//  DLL export (g_pXInputGetState) which is not affected by the IAT.
+//
+//  Filter rules:
+//    - while warehouse is mod-owned: clear B (no dodge),
+//      clear configured per-panel buttons + their modifiers when
+//      both are held (so combos that are bound to mod-actions never
+//      reach the game)
+//    - while warehouse is closed: clear the configured per-panel
+//      combo only when both modifier+button are held simultaneously.
+//      This way LB or LeftStick alone still work for game functions.
+// ============================================================
+static volatile PVOID  g_xinputIATSlot = nullptr;
+static PFN_XInputGetState g_origXInputGetState_IAT = nullptr;
+
+extern "C" DWORD WINAPI XInputGetState_Filtered(DWORD slot, XINPUT_STATE_LOCAL* state) {
+    PFN_XInputGetState orig = g_origXInputGetState_IAT;
+    if (!orig) return 1;
+    DWORD r = orig(slot, state);
+    if (r != 0 || !state || slot != 0) return r;
+
+    WORD btns = state->Gamepad.wButtons;
+    WORD clear = 0;
+
+    // Per-panel combo masking: when modifier+button are both held,
+    // hide the combo from the game so it can't react to it.
+    for (int i = 0; i < PANEL_COUNT; i++) {
+        WORD btn = g_panels[i].controllerButton;
+        if (!btn || !(btns & btn)) continue;
+        WORD modBit = g_panels[i].controllerModifier;
+        if (modBit && !(btns & modBit)) continue;
+        clear |= btn;
+        if (modBit) clear |= modBit;
+    }
+
+    // B always masked while warehouse is mod-owned (no dodge).
+    if (InterlockedCompareExchange(&g_warehouseActive, 0, 0))
+        clear |= 0x2000;
+
+    state->Gamepad.wButtons = btns & ~clear;
+    return r;
+}
+
+static bool InstallXInputIATHook(HMODULE gameModule) {
+    if (!gameModule || g_xinputIATSlot) return false;
+    auto* dos = (IMAGE_DOS_HEADER*)gameModule;
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE) return false;
+    auto* nt = (IMAGE_NT_HEADERS*)((BYTE*)gameModule + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE) return false;
+    auto& dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+    if (!dir.VirtualAddress) return false;
+
+    auto* desc = (IMAGE_IMPORT_DESCRIPTOR*)((BYTE*)gameModule + dir.VirtualAddress);
+    BYTE* base = (BYTE*)gameModule;
+    for (; desc->Name; desc++) {
+        const char* dllName = (const char*)(base + desc->Name);
+        if (_strnicmp(dllName, "xinput", 6) != 0) continue;
+        auto* origThunk = (IMAGE_THUNK_DATA*)(base + desc->OriginalFirstThunk);
+        auto* iatThunk  = (IMAGE_THUNK_DATA*)(base + desc->FirstThunk);
+        if (!origThunk->u1.AddressOfData) {
+            // Bound import — OriginalFirstThunk may be 0; fall back to FirstThunk for names
+            origThunk = iatThunk;
+        }
+        for (; origThunk->u1.AddressOfData; origThunk++, iatThunk++) {
+            if (origThunk->u1.Ordinal & IMAGE_ORDINAL_FLAG64) continue;
+            auto* byName = (IMAGE_IMPORT_BY_NAME*)(base + origThunk->u1.AddressOfData);
+            if (strcmp((char*)byName->Name, "XInputGetState") != 0) continue;
+
+            DWORD oldProt;
+            if (!VirtualProtect(&iatThunk->u1.Function, sizeof(void*),
+                                PAGE_READWRITE, &oldProt)) {
+                return false;
             }
-            FreeLibrary(g_hXInput);
-            g_hXInput = nullptr;
+            g_origXInputGetState_IAT = (PFN_XInputGetState)(uintptr_t)iatThunk->u1.Function;
+            iatThunk->u1.Function = (ULONGLONG)(uintptr_t)&XInputGetState_Filtered;
+            VirtualProtect(&iatThunk->u1.Function, sizeof(void*), oldProt, &oldProt);
+            g_xinputIATSlot = &iatThunk->u1.Function;
+            return true;
         }
     }
-    Log("WARNING: XInput not available");
     return false;
+}
+
+static void RemoveXInputIATHook() {
+    if (!g_xinputIATSlot || !g_origXInputGetState_IAT) return;
+    DWORD oldProt;
+    if (VirtualProtect((LPVOID)g_xinputIATSlot, sizeof(void*),
+                       PAGE_READWRITE, &oldProt)) {
+        *(ULONGLONG*)g_xinputIATSlot = (ULONGLONG)(uintptr_t)g_origXInputGetState_IAT;
+        VirtualProtect((LPVOID)g_xinputIATSlot, sizeof(void*), oldProt, &oldProt);
+    }
+    g_xinputIATSlot = nullptr;
 }
 
 // ============================================================
 //  Game Hooks
 // ============================================================
-extern "C" void __fastcall CaptureOnHandler(void* thisPtr, void* rdx) {
+extern "C" void __fastcall CaptureOnHandler(void* thisPtr, void* rdx, void* r8, void* r9) {
     InterlockedIncrement(&g_handlerHitCount);
     if (g_handlerHitCount == 1 && !g_handlerThis) {
         InterlockedExchange64(&g_handlerThis, (LONG64)(uintptr_t)thisPtr);
@@ -954,6 +1080,23 @@ extern "C" void __fastcall CaptureOnHandler(void* thisPtr, void* rdx) {
                     Log("  Dynamic panelId: 0x%04X", realId);
                 }
             }
+        } __except(EXCEPTION_EXECUTE_HANDLER) {}
+    }
+
+    // Diagnostic: log every Handler call while warehouse is mod-owned.
+    // This captures the opcode the game sends — interesting opcodes
+    // that aren't 0x0E (open) / 0x15 (prepare) are candidates for
+    // the close path. Especially anything received around the time
+    // the user presses B/Circle/ESC.
+    if (g_debugLog && InterlockedCompareExchange(&g_warehouseActive, 0, 0)) {
+        __try {
+            uint8_t  rdxOp = (rdx && (uintptr_t)rdx > 0x10000) ? *(uint8_t*)rdx : 0xCC;
+            uint8_t  r9Op  = (r9  && (uintptr_t)r9  > 0x10000) ? *(uint8_t*)r9  : 0xCC;
+            Log("  Handler call: rdxOp=0x%02X r9Op=0x%02X (rdx=0x%llX r9=0x%llX r8=0x%llX)",
+                rdxOp, r9Op,
+                (unsigned long long)(uintptr_t)rdx,
+                (unsigned long long)(uintptr_t)r9,
+                (unsigned long long)(uintptr_t)r8);
         } __except(EXCEPTION_EXECUTE_HANDLER) {}
     }
 
@@ -1188,13 +1331,38 @@ extern "C" char __fastcall HookedCanShow(void* thisPtr) {
             __try {
                 uint8_t activeFlag = *(uint8_t*)((uint8_t*)thisPtr + g_offActiveFlag);
                 if (activeFlag == 1) {
-                    // Panel is alive — remember we've seen it active
+                    // Panel is alive — remember we've seen it active and reset
+                    // the close-detection counter.
                     InterlockedExchange(&g_canShowSeen118, 1);
+                    InterlockedExchange(&g_canShowZeroCount, 0);
                 } else if (activeFlag == 0 && InterlockedCompareExchange(&g_canShowSeen118, 0, 0)) {
-                    // active flag went from 1→0: game closed the panel (B/Circle/Cancel3)
-                    Log("  CanShow: game-initiated close detected (active flag 1→0)");
+                    // Housing chest panels (Gatherables, Refrigerator, …)
+                    // briefly write 0 to +0x118 during internal sub-state
+                    // transitions. The auto-close detection here was the
+                    // root cause of "second-time B doesn't close": a short
+                    // burst of zero polls during the second open would set
+                    // g_warehouseActive=0 prematurely, after which the
+                    // controller thread treated B presses as "warehouse not
+                    // open" and silently dropped them.
+                    //
+                    // Auto-close is only meaningful while the panel is NOT
+                    // mod-owned. While g_modeSwitchByMod==1 the mod itself
+                    // is driving the session — the only legitimate close in
+                    // that mode is via TriggerWarehouse, never an in-flight
+                    // game write to +0x118. So gate the detection on the
+                    // mod NOT owning the mode-switch, and require a long
+                    // 60-poll (~1 s) stability window even then.
+                    if (InterlockedCompareExchange(&g_modeSwitchByMod, 0, 0)) {
+                        return 1;  // mod-owned session — never auto-close
+                    }
+                    LONG zc = InterlockedIncrement(&g_canShowZeroCount);
+                    if (zc < 60) {
+                        return 1;  // keep showing, treat as transient
+                    }
+                    Log("  CanShow: game-initiated close detected (active flag 1→0, %ld stable zero polls)", zc);
                     InterlockedExchange(&g_warehouseActive, 0);
                     InterlockedExchange(&g_canShowSeen118, 0);
+                    InterlockedExchange(&g_canShowZeroCount, 0);
                     InterlockedExchange(&g_modeSwitchByMod, 0);
                     uintptr_t mc = (uintptr_t)InterlockedCompareExchange64(&g_mainChar, 0, 0);
                     if (mc) {
@@ -1525,13 +1693,24 @@ static void InitWarehousePanel(uintptr_t handler, const char* initString) {
                     // 0x435 writes were derived from a 1.0.4.x post-NPC memory
                     // diff and may stomp 1.0.5.0 rendering state — e.g. block
                     // the channel-bind from propagating into the visible grid.
+                    //
+                    // 2026-05: handler+0x200 patch DISABLED. The 0x01→0x00
+                    // transition was observed in the post-NPC memory diff,
+                    // but writing 0x00 puts the panel into a state where
+                    // the game's input pipeline consumes B-press events
+                    // before they reach XInput's per-process state. Result:
+                    // user presses B on Xbox controller, mod's InputThread
+                    // polls XInput and never sees 0x2000, B-close fails for
+                    // Gatherables / Refrigerator / Dresser / Symbol /
+                    // Collecting (works fine for Private/Camp because that
+                    // path doesn't enter this branch).
                     *(uint32_t*)(handler + 0x1D8) = 0xFFFFFFFF;
-                    *(uint8_t* )(handler + 0x200) = 0x00;
+                    // *(uint8_t* )(handler + 0x200) = 0x00;  // disabled — see comment above
                     *(uint32_t*)(handler + 0x2A8) = 0x00000000;
                     *(uint32_t*)(handler + 0x39C) = 1000;
 
                     InterlockedExchange64(&g_patchedContainer, (LONG64)handler);
-                    Log("  Patched handler fields for housing panel (sub patches disabled)");
+                    Log("  Patched handler fields for housing panel (sub patches disabled, +0x200 patch disabled)");
 
                 } else {
                     if (InterlockedCompareExchange(&g_campValuesSaved, 0, 0)) {
@@ -2160,6 +2339,8 @@ static void InitWarehousePanel(uintptr_t handler, const char* initString) {
             Log("  Top title (+0x%X) EXCEPTION", g_offTopTitle);
         }
     }
+
+    LogModalState("  InitWarehousePanel done");
 }
 
 // ============================================================
@@ -2171,6 +2352,8 @@ static void InitWarehousePanel(uintptr_t handler, const char* initString) {
 // the other one. Does NOT touch mode bytes / g_warehouseActive — caller decides.
 static void ClearActivePanelState(uintptr_t handler) {
     if (!handler) return;
+    LONG ap = InterlockedCompareExchange(&g_activePanel, 0, 0);
+    const char* apName = (ap >= 0 && ap < PANEL_COUNT) ? g_panels[ap].name : "?";
     __try {
         // Part 1: clear active flag (handler+0x118) — what makes the panel vanish
         *(uint8_t*)(handler + g_offActiveFlag) = 0;
@@ -2179,13 +2362,18 @@ static void ClearActivePanelState(uintptr_t handler) {
         // Part 3: try to clear the scene-object render bit (equivalent to the
         // `*(uint8_t*)(scene+0x26A) &= 0xFE` step in 0x0f). Wrapped separately
         // so a missing scene object doesn't abort the clear.
+        //
+        // Diagnostic: log the addresses walked at each step so a failed
+        // close on Gatherables/Refrigerator/etc. can be traced back to
+        // exactly which pointer in the chain went null.
         bool sceneBitCleared = false;
+        uintptr_t subObj = 0, a8 = 0, scene = 0;
         __try {
-            uintptr_t subObj = *(uintptr_t*)(handler + 0x8);
+            subObj = *(uintptr_t*)(handler + 0x8);
             if (subObj) {
-                uintptr_t a8 = *(uintptr_t*)(subObj + 0xA8);
+                a8 = *(uintptr_t*)(subObj + 0xA8);
                 if (a8) {
-                    uintptr_t scene = *(uintptr_t*)(a8 + 0x10);
+                    scene = *(uintptr_t*)(a8 + 0x10);
                     if (scene) {
                         *(uint8_t*)(scene + 0x26A) &= 0xFE;
                         sceneBitCleared = true;
@@ -2193,24 +2381,85 @@ static void ClearActivePanelState(uintptr_t handler) {
                 }
             }
         } __except(EXCEPTION_EXECUTE_HANDLER) {}
-        Log("  Panel hidden (direct state clear, scene bit %s)",
-            sceneBitCleared ? "cleared" : "skipped");
+        Log("  Panel [%s] hidden (direct state clear, scene bit %s) — subObj=0x%llX a8=0x%llX scene=0x%llX",
+            apName,
+            sceneBitCleared ? "cleared" : "skipped",
+            (unsigned long long)subObj,
+            (unsigned long long)a8,
+            (unsigned long long)scene);
+
+        // For housing chests (panel index != 0) the active sub-controller
+        // lives at handler+0x138[handler+0x1E0], NOT at handler+0x8. The
+        // Camp panel's sub at +0x8 has a different scene than the housing
+        // sub, so clearing the Camp scene bit doesn't hide the housing
+        // panel. Walk the active-tab chain and clear that scene bit too.
+        if (ap != PANEL_PRIVATE) {
+            __try {
+                uint32_t  tabIdx  = *(uint32_t*)(handler + 0x1E0);
+                uintptr_t subArr  = *(uintptr_t*)(handler + 0x138);
+                if (subArr && tabIdx < 16) {
+                    uintptr_t tabSub  = *(uintptr_t*)(subArr + tabIdx * 8);
+                    uintptr_t tabA8   = tabSub ? *(uintptr_t*)(tabSub + 0xA8) : 0;
+                    uintptr_t tabScn  = tabA8  ? *(uintptr_t*)(tabA8  + 0x10) : 0;
+                    if (tabScn) {
+                        *(uint8_t*)(tabScn + 0x26A) &= 0xFE;
+                        Log("  Panel [%s] tab-sub scene bit cleared — tabIdx=%u tabSub=0x%llX tabA8=0x%llX tabScn=0x%llX",
+                            apName, tabIdx,
+                            (unsigned long long)tabSub,
+                            (unsigned long long)tabA8,
+                            (unsigned long long)tabScn);
+                    } else {
+                        Log("  Panel [%s] tab-sub scene-bit walk: tabIdx=%u tabSub=0x%llX tabA8=0x%llX tabScn=0",
+                            apName, tabIdx,
+                            (unsigned long long)tabSub,
+                            (unsigned long long)tabA8);
+                    }
+                }
+            } __except(EXCEPTION_EXECUTE_HANDLER) {
+                Log("  Panel [%s] tab-sub scene-bit walk EXCEPTION", apName);
+            }
+        }
     } __except(EXCEPTION_EXECUTE_HANDLER) {
-        Log("  Panel hide direct cleanup EXCEPTION");
+        Log("  Panel [%s] hide direct cleanup EXCEPTION", apName);
     }
 }
 
-static void TriggerWarehouse(bool fromKeyboard = false) {
+// triggerKind: 0 = open, 1 = close (modal-aware, used by F-keys),
+//              2 = force close (skip modal block — used by controller B/Circle
+//              and per-panel buttons; the modal check at +0x258 can return
+//              true on stale pointers from previous housing-chest sessions
+//              and would otherwise block the close indefinitely).
+static void TriggerWarehouse(int triggerKind = 0) {
+    bool forceClose = (triggerKind == 2);
     uintptr_t mainChar = (uintptr_t)InterlockedCompareExchange64(&g_mainChar, 0, 0);
     if (!mainChar) { Log("NOT READY: mainChar"); return; }
 
     uint8_t* mc = (uint8_t*)mainChar;
 
     if (!InterlockedCompareExchange(&g_warehouseActive, 0, 0)) {
+        // Re-open cooldown: when DualSense is mapped through Steam Input,
+        // pressing Circle fires both the HID-Circle path AND the XInput-B
+        // path. Each path posts its own WM_TRIGGER_WAREHOUSE, so the close
+        // is followed by a second toggle that would re-open instantly.
+        // Block any open request within 250ms of a close to absorb that
+        // second message (and any other near-simultaneous controller
+        // duplication).
+        ULONGLONG now = GetTickCount64();
+        ULONGLONG closedAt = g_closeTimestamp;
+        if (closedAt && now - closedAt < 250) {
+            Log("BLOCKED: re-open within %llu ms of close (cooldown)",
+                (unsigned long long)(now - closedAt));
+            return;
+        }
+
         uint8_t curSub = mc[g_offSubByte];
-        // Apr-23 safe sub-modes: 0x0D, 0x0F, 0x10 (gameplay variants). 0x0E between them
-        // is "ingamemenu" — NOT a safe state for opening Private Storage.
-        if (curSub != 0x0D && curSub != 0x0F && curSub != 0x10) {
+        // Apr-23 safe sub-modes: 0x0D, 0x0F, 0x10, 0x11 (gameplay variants).
+        // 0x0E between 0x0D and 0x0F is "ingamemenu" — MUST NOT open from there.
+        // 0x11 added after user-log analysis showed legitimate gameplay state
+        // (slightly different player flags than 0x10) being blocked, leading
+        // to multiple failed open attempts when pressing the panel combo.
+        if (curSub != 0x0D && curSub != 0x0F &&
+            curSub != 0x10 && curSub != 0x11) {
             Log("BLOCKED: unsafe state (sub=0x%02X)", curSub);
             return;
         }
@@ -2233,6 +2482,7 @@ static void TriggerWarehouse(bool fromKeyboard = false) {
         InterlockedExchange(&g_modeByteLock, 0);
 
         InterlockedExchange(&g_canShowSeen118, 0);
+        InterlockedExchange(&g_canShowZeroCount, 0);
         InterlockedExchange64(&g_lastModalPassed, 0);
         InterlockedExchange(&g_warehouseActive, 1);
         g_openTimestamp = GetTickCount64();
@@ -2260,8 +2510,12 @@ static void TriggerWarehouse(bool fromKeyboard = false) {
         Log("  Warehouse opened (mode=0x%02X sub=0x%02X)", mc[g_offModeByte], mc[g_offSubByte]);
 
     } else {
-        // Block close while modal dialog is active (fixes F6 + controller toggle)
-        if (IsNewModalDialogVisible()) {
+        // Block close while modal dialog is active — but only for non-forced
+        // closes (F6/F7/etc). Controller closes always proceed because the
+        // +0x258 modal pointer can hold stale data on housing chests, which
+        // previously caused B and per-panel-combo presses to be silently
+        // dropped on Gatherables/Dresser/Refrigerator/Symbol/Collecting.
+        if (!forceClose && IsNewModalDialogVisible()) {
             uintptr_t h2 = (uintptr_t)InterlockedCompareExchange64(&g_handlerThis, 0, 0);
             uintptr_t mv2 = h2 ? ReadModalDialog(h2) : 0;
             uint32_t cc2 = 0;
@@ -2275,6 +2529,12 @@ static void TriggerWarehouse(bool fromKeyboard = false) {
         Log("=== CLOSING WAREHOUSE ===");
         InterlockedExchange(&g_warehouseActive, 0);
         InterlockedExchange(&g_initPending, 0);
+        // Clear any in-flight controller pending-close flags so a stray
+        // release after this close doesn't trigger an immediate re-open.
+        InterlockedExchange(&g_pendingBClose, 0);
+        InterlockedExchange(&g_pendingCircleClose, 0);
+        // Stamp close time for the re-open cooldown (see open branch).
+        g_closeTimestamp = GetTickCount64();
 
         // Restore Camp handler state if a housing panel was active. The housing
         // open path patches handler+0x1D8/+0x200/+0x2A8/+0x39C — leaving them
@@ -2341,6 +2601,26 @@ static void TriggerWarehouse(bool fromKeyboard = false) {
         // Modal popup state belongs to the closed warehouse — clear so a
         // stuck flag doesn't survive into the next session.
         InterlockedExchange(&g_itemDetailActiveCount, 0);
+
+        // Force-close fallback for housing chests: ClearActivePanelState
+        // works for Private (Camp panel) but doesn't always visually close
+        // Gatherables / Refrigerator / Dresser / Symbol / Collecting. The
+        // game's native ESC handler does additional sub-state cleanup we
+        // can't replicate. Send a synthetic VK_ESCAPE through the original
+        // WndProc so the game performs that cleanup. Safe here because:
+        //   - we're already on the game thread (PostMessage dispatched us)
+        //   - warehouseActive is already 0 → CanShow no longer force-shows
+        //   - g_closeTimestamp is set → re-open cooldown blocks any
+        //     accidental re-trigger from a controller path that races
+        //   - g_originalWndProc bypasses our own hook so we don't recurse
+        if (forceClose && g_originalWndProc && g_gameWindow) {
+            __try {
+                CallWindowProcA(g_originalWndProc, g_gameWindow,
+                                WM_KEYDOWN, VK_ESCAPE, 0x00010001);
+                CallWindowProcA(g_originalWndProc, g_gameWindow,
+                                WM_KEYUP,   VK_ESCAPE, 0xC0010001);
+            } __except(EXCEPTION_EXECUTE_HANDLER) {}
+        }
     }
 }
 
@@ -3136,12 +3416,151 @@ static void DoDiffSnapshot() {
 }
 
 // ============================================================
+//  Diagnostic: Hardware-Write Breakpoint on handler+0x118
+//
+//  When user reports being "stuck" on a panel and B/Circle doesn't
+//  close, we want to know which game function (if any) writes 0 to
+//  the active flag. A DR0 write watch fires for every write to the
+//  byte; the VEH logs the writing RIP (game base+offset). This
+//  identifies the game's natural close routine so the mod can call
+//  it directly instead of replicating its memory writes.
+//
+//  Lifecycle: enable on warehouse open (after handler captured),
+//  disable BEFORE the mod itself writes (TriggerWarehouse close /
+//  CanShow 1→0 detection / DLL detach) so we only log GAME writes.
+// ============================================================
+static volatile uintptr_t g_hwbpAddr = 0;
+static PVOID              g_vehHandle = nullptr;
+
+static LONG WINAPI HwBpVehHandler(EXCEPTION_POINTERS* ep) {
+    if (ep->ExceptionRecord->ExceptionCode != EXCEPTION_SINGLE_STEP)
+        return EXCEPTION_CONTINUE_SEARCH;
+    DWORD64 dr6 = ep->ContextRecord->Dr6;
+    if (!(dr6 & 0x1)) return EXCEPTION_CONTINUE_SEARCH;   // not our DR0
+
+    uintptr_t rip = (uintptr_t)ep->ContextRecord->Rip;
+    uintptr_t off = (g_gameBase && rip >= g_gameBase) ? rip - g_gameBase : 0;
+    uintptr_t rsp = (uintptr_t)ep->ContextRecord->Rsp;
+    uintptr_t ra0 = 0, ra1 = 0;
+    __try {
+        ra0 = ((uintptr_t*)rsp)[0];
+        ra1 = ((uintptr_t*)rsp)[1];
+    } __except(EXCEPTION_EXECUTE_HANDLER) {}
+    Log("[HWBP] WRITE handler+0x118 RIP=base+0x%llX  RSP=0x%llX  [RSP]=base+0x%llX  [RSP+8]=base+0x%llX  tid=%lu",
+        (unsigned long long)off,
+        (unsigned long long)rsp,
+        (unsigned long long)(ra0 >= g_gameBase ? ra0 - g_gameBase : ra0),
+        (unsigned long long)(ra1 >= g_gameBase ? ra1 - g_gameBase : ra1),
+        GetCurrentThreadId());
+
+    // Clear B0 (DR0 hit) in DR6 + set RF in EFlags so the same
+    // instruction doesn't immediately re-fire.
+    ep->ContextRecord->Dr6 &= ~0x1ULL;
+    ep->ContextRecord->EFlags |= 0x10000;   // RF
+    return EXCEPTION_CONTINUE_EXECUTION;
+}
+
+// Set/clear DR0 on every thread of this process except the caller.
+// addr=0 clears the watch.
+static int ApplyHwBpAllThreads(uintptr_t addr) {
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    if (snap == INVALID_HANDLE_VALUE) return 0;
+    THREADENTRY32 te;
+    te.dwSize = sizeof(te);
+    DWORD pid = GetCurrentProcessId();
+    DWORD me  = GetCurrentThreadId();
+    int touched = 0;
+    if (Thread32First(snap, &te)) {
+        do {
+            if (te.dwSize < FIELD_OFFSET(THREADENTRY32, th32OwnerProcessID) + sizeof(DWORD))
+                continue;
+            if (te.th32OwnerProcessID != pid) continue;
+            if (te.th32ThreadID == me) continue;
+            HANDLE th = OpenThread(THREAD_GET_CONTEXT|THREAD_SET_CONTEXT|THREAD_SUSPEND_RESUME,
+                                    FALSE, te.th32ThreadID);
+            if (!th) continue;
+            CONTEXT ctx;
+            memset(&ctx, 0, sizeof(ctx));
+            ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+            if (SuspendThread(th) != (DWORD)-1) {
+                if (GetThreadContext(th, &ctx)) {
+                    ctx.Dr0 = addr;
+                    // DR7 layout: L0=bit0  RW0=bits16-17  LEN0=bits18-19
+                    // Clear all DR0 fields, then if addr!=0 set L0=1, RW0=01 (write only), LEN0=00 (1 byte).
+                    ctx.Dr7 &= ~((DWORD64)0x1)        // L0
+                            &  ~((DWORD64)0x2)        // G0
+                            &  ~((DWORD64)0xF << 16); // RW0+LEN0
+                    if (addr) {
+                        ctx.Dr7 |=  (DWORD64)0x1;             // L0
+                        ctx.Dr7 |=  ((DWORD64)0x1) << 16;     // RW0=01 (write)
+                        // LEN0 stays 00 (1 byte)
+                    }
+                    if (SetThreadContext(th, &ctx)) touched++;
+                }
+                ResumeThread(th);
+            }
+            CloseHandle(th);
+        } while (Thread32Next(snap, &te));
+    }
+    CloseHandle(snap);
+    return touched;
+}
+
+static void EnableActiveFlagWatch(uintptr_t handler) {
+    if (!g_debugLog || !handler) return;
+    uintptr_t addr = handler + g_offActiveFlag;
+    if (g_hwbpAddr == addr) return;                   // already armed
+    if (g_hwbpAddr) ApplyHwBpAllThreads(0);            // re-arm on different addr
+    int n = ApplyHwBpAllThreads(addr);
+    g_hwbpAddr = addr;
+    Log("[HWBP] Armed on 0x%llX (%d threads)", (unsigned long long)addr, n);
+}
+
+static void DisableActiveFlagWatch() {
+    if (!g_hwbpAddr) return;
+    int n = ApplyHwBpAllThreads(0);
+    Log("[HWBP] Disarmed (%d threads)", n);
+    g_hwbpAddr = 0;
+}
+
+// Snapshot of all relevant state for a single log line. Useful when
+// B/Circle is blocked or when a close path runs — gives a complete
+// picture of what IsNewModalDialogVisible saw and what the handler
+// fields look like at that exact moment.
+static void LogModalState(const char* prefix) {
+    if (!g_debugLog) return;
+    uintptr_t handler = (uintptr_t)InterlockedCompareExchange64(&g_handlerThis, 0, 0);
+    uintptr_t modalView = handler ? ReadModalDialog(handler) : 0;
+    uint32_t  childCount = 0;
+    if (modalView > 0x10000 && modalView < 0x7FFFFFFFFFFF) {
+        __try { childCount = *(uint32_t*)(modalView + 0x30); }
+        __except(EXCEPTION_EXECUTE_HANDLER) {}
+    }
+    uintptr_t lastPassed = (uintptr_t)InterlockedCompareExchange64(&g_lastModalPassed, 0, 0);
+    LONG itemDetail = InterlockedCompareExchange(&g_itemDetailActiveCount, 0, 0);
+    uint8_t  af = 0;
+    uint64_t pv = 0;
+    if (handler) {
+        __try {
+            af = *(uint8_t*)(handler + g_offActiveFlag);
+            pv = *(uint64_t*)(handler + 0x110);
+        } __except(EXCEPTION_EXECUTE_HANDLER) {}
+    }
+    Log("%s state: handler=0x%llX +0x110=0x%llX +0x118=%u modalView=0x%llX "
+        "childCount=0x%X lastPassed=0x%llX itemDetail=%ld activePanel=%ld",
+        prefix, (unsigned long long)handler, (unsigned long long)pv, (unsigned)af,
+        (unsigned long long)modalView, childCount, (unsigned long long)lastPassed,
+        (long)itemDetail, (long)InterlockedCompareExchange(&g_activePanel, 0, 0));
+}
+
+// ============================================================
 //  WndProc + Input
 // ============================================================
-static volatile LONG g_pendingCircleClose = 0;  // 1 = waiting for Circle release to close
+// g_pendingCircleClose / g_pendingBClose now live near the file top
+// (next to the diagnostic forward-decls) so TriggerWarehouse can clear them.
 
 static LRESULT CALLBACK HookedWndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
-    if (m==WM_TRIGGER_WAREHOUSE) { TriggerWarehouse((bool)w); return 0; }
+    if (m==WM_TRIGGER_WAREHOUSE) { TriggerWarehouse((int)w); return 0; }
     if (m==WM_INIT_WAREHOUSE) {
         // Deferred warehouse panel init — posted by InputThread (separate thread)
         // once the handler has been auto-captured by HookedCanShow.
@@ -3181,21 +3600,19 @@ static LRESULT CALLBACK HookedWndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
                     // to mirror that. Subsequent F-key/ESC checks see fresh
                     // state.
                     InterlockedExchange(&g_itemDetailActiveCount, 0);
+                    Log("ESC pressed -> modal up, passing through to game");
                     return CallWindowProcA(g_originalWndProc, h, m, w, l);
                 }
+                Log("ESC pressed -> closing warehouse");
                 PostMessageA(h, WM_TRIGGER_WAREHOUSE, 1, 0);
                 return 0;
             }
-            // F6 (legacy single hotkey).
-            if (g_hotkey && (DWORD)w == g_hotkey) {
-                bool modOk = (g_modifierKey == 0) ||
-                             (GetAsyncKeyState(g_modifierKey) & 0x8000) != 0;
-                if (modOk) {
-                    PostMessageA(h, WM_TRIGGER_WAREHOUSE, 1, 0);
-                    return 0;
-                }
-            }
-            // Per-panel hotkeys.
+            // Per-panel hotkeys take precedence over the legacy single
+            // hotkey. With the new defaults (F4=Private, F5=Gatherables,
+            // F6=Dresser, F7=Refrigerator, F8=Symbol, F9=Collecting),
+            // the legacy `g_hotkey` (default F6) collides with Dresser —
+            // checking it first would shadow the per-panel binding and
+            // open Private on F6 instead.
             for (int i = 0; i < PANEL_COUNT; i++) {
                 if (g_panels[i].hotkey == 0 || (DWORD)w != g_panels[i].hotkey) continue;
                 bool modOk = (g_panels[i].modifier == 0) ||
@@ -3210,6 +3627,17 @@ static LRESULT CALLBACK HookedWndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
                 }
                 PostMessageA(h, WM_TRIGGER_WAREHOUSE, 1, 0);
                 return 0;
+            }
+            // Legacy single hotkey — only fires if no per-panel hotkey
+            // matched above. Kept for backwards compatibility with INIs
+            // that still use `Hotkey=` instead of the per-panel keys.
+            if (g_hotkey && (DWORD)w == g_hotkey) {
+                bool modOk = (g_modifierKey == 0) ||
+                             (GetAsyncKeyState(g_modifierKey) & 0x8000) != 0;
+                if (modOk) {
+                    PostMessageA(h, WM_TRIGGER_WAREHOUSE, 1, 0);
+                    return 0;
+                }
             }
         }
     }
@@ -3233,15 +3661,15 @@ static LRESULT CALLBACK HookedWndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             if (down && !g_panelPsLastDown[i] && modOk) {
                 if (InterlockedCompareExchange(&g_warehouseActive, 0, 0)) {
                     if (IsNewModalDialogVisible()) {
-                        Log("Panel %s PS button → sub-dialog active, ignoring",
-                            g_panels[i].name);
+                        // Mirror ESC: clear stale ItemDetailModal flag so a
+                        // popup dismissed via a non-ESC path doesn't block
+                        // the next close press.
+                        InterlockedExchange(&g_itemDetailActiveCount, 0);
                     } else {
-                        Log("Panel %s PS button → closing warehouse",
-                            g_panels[i].name);
-                        PostMessageA(h, WM_TRIGGER_WAREHOUSE, 1, 0);
+                        // Force close: bypass TriggerWarehouse modal-block.
+                        PostMessageA(h, WM_TRIGGER_WAREHOUSE, 2, 0);
                     }
                 } else {
-                    Log("Panel %s PS button → opening", g_panels[i].name);
                     InterlockedExchange(&g_nextOpenPanel, i);
                     PostMessageA(h, WM_TRIGGER_WAREHOUSE, 0, 0);
                 }
@@ -3252,18 +3680,16 @@ static LRESULT CALLBACK HookedWndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         // Circle pressed while warehouse open → mark pending close (don't close yet)
         if (circleDown && !g_circleWasDown && InterlockedCompareExchange(&g_warehouseActive, 0, 0)) {
             if (IsNewModalDialogVisible()) {
-                Log("Circle pressed → sub-dialog active, ignoring");
+                InterlockedExchange(&g_itemDetailActiveCount, 0);
             } else {
-                Log("Circle pressed → pending close (waiting for release)");
                 InterlockedExchange(&g_pendingCircleClose, 1);
             }
         }
 
-        // Circle released after pending close → NOW actually close
+        // Circle released after pending close → close (force, bypass modal-block).
         if (!circleDown && g_circleWasDown && InterlockedCompareExchange(&g_pendingCircleClose, 0, 0)) {
-            Log("Circle released → closing warehouse now");
             InterlockedExchange(&g_pendingCircleClose, 0);
-            PostMessageA(h, WM_TRIGGER_WAREHOUSE, 1, 0);
+            PostMessageA(h, WM_TRIGGER_WAREHOUSE, 2, 0);
         }
 
         g_circleWasDown = circleDown;
@@ -3394,6 +3820,16 @@ static DWORD WINAPI InputThread(LPVOID) {
                             // different (recycled) container into +0x170;
                             // without this guard we'd overwrite mod's good
                             // container.
+                            //
+                            // BUG fix: the original `continue` here jumped
+                            // ALL the way to the InputThread's while-loop
+                            // top, skipping XInput polling and B-button
+                            // detection on every iteration where the mod
+                            // owned the sticky — i.e. the entire duration
+                            // of any Gatherables/Dresser/etc. session. The
+                            // user could press B but it was never seen.
+                            // Now we skip only the sticky-save logic by
+                            // wrapping the rest of this branch in an else.
                             if (InterlockedCompareExchange(&g_panelStickyOwnedByMod[ap], 0, 0)) {
                                 static volatile LONG64 lastSkipLogged = 0;
                                 if (InterlockedExchange64(&lastSkipLogged, (LONG64)cont)
@@ -3401,8 +3837,7 @@ static DWORD WINAPI InputThread(LPVOID) {
                                     Log("Sticky bind: skip [%s] save 0x%llX (mod-owned this session)",
                                         g_panels[ap].name, (unsigned long long)cont);
                                 }
-                                continue;  // back to outer slot loop
-                            }
+                            } else {
                             LONG64 prev = InterlockedCompareExchange64(&g_panelStickyContainer[ap], 0, 0);
                             // GUARD: containers are unique per panel. If `cont`
                             // is already cached for a *different* panel, our
@@ -3452,6 +3887,7 @@ static DWORD WINAPI InputThread(LPVOID) {
                                     }
                                 }
                             }
+                            } // end else (sticky not mod-owned)
                         }
                     }
                 } __except(EXCEPTION_EXECUTE_HANDLER) {}
@@ -3480,17 +3916,20 @@ static DWORD WINAPI InputThread(LPVOID) {
         //   0x0D = gameplay variant
         //   0x0F = hud-info + hud-play + quickslot
         //   0x10 = hud-info + hud-play + interaction + quickslot
-        // 0x0E between them is "ingamemenu" (pre-Apr-23 it was normal gameplay) — MUST NOT open.
+        //   0x11 = 0x10 + one extra flag (sprinting / crouching variant) —
+        //          observed in user logs as a state the player frequently
+        //          enters during normal play; opens were getting blocked
+        //          for several seconds at a time. 0x0E between 0x0D/0x0F is
+        //          still "ingamemenu" — MUST NOT open from there.
         uintptr_t mc = (uintptr_t)InterlockedCompareExchange64(&g_mainChar, 0, 0);
         LONG warehouseActive = InterlockedCompareExchange(&g_warehouseActive, 0, 0);
         bool inSafeState = true;
         if (mc && !warehouseActive) {
             uint8_t curSub = ((uint8_t*)mc)[g_offSubByte];
-            inSafeState = (curSub == 0x0D || curSub == 0x0F || curSub == 0x10);
+            inSafeState = (curSub == 0x0D || curSub == 0x0F ||
+                           curSub == 0x10 || curSub == 0x11);
         }
 
-        bool trigger = false;
-        bool fromKeyboard = false;
         // Keyboard hotkeys (F6 + per-panel) are dispatched from HookedWndProc
         // via WM_KEYDOWN — see panel-hotkey block there. Polling here was
         // unreliable: the game's input system left GetAsyncKeyState reporting
@@ -3498,48 +3937,105 @@ static DWORD WINAPI InputThread(LPVOID) {
         // edge. WM_KEYDOWN's lParam bit 30 (previous-key-state) gives a clean
         // press-vs-repeat signal independent of hardware-state polling.
 
-        // Controller: B button always closes warehouse, plus per-panel buttons
-        // open their respective panel from cold (or close if open).
-        if (!trigger && g_pXInputGetState) {
-            XINPUT_STATE_LOCAL state;
-            memset(&state, 0, sizeof(state));
-            if (g_pXInputGetState(0, &state) == 0) {
-                WORD buttons = state.Gamepad.wButtons;
-                WORD pressed = buttons & ~g_prevButtons;  // newly pressed
-                WORD released = g_prevButtons & ~buttons; // newly released
-                g_prevButtons = buttons;
-
-                // B button closes warehouse on RELEASE (not press) to prevent dodge roll
-                if (InterlockedCompareExchange(&g_warehouseActive, 0, 0) && (released & 0x2000)) {
-                    if (IsNewModalDialogVisible()) {
-                        Log("B button → sub-dialog active, ignoring");
-                    } else {
-                        trigger = true;
-                    }
-                }
-                // Per-panel controller buttons. Each panel's button is a
-                // toggle. `pressed` is already an edge mask (newly-pressed
-                // bits this poll), so no time-debounce needed.
-                else for (int i = 0; i < PANEL_COUNT; i++) {
-                    WORD btn = g_panels[i].controllerButton;
-                    if (!btn || !(pressed & btn)) continue;
-                    WORD mod = g_panels[i].controllerModifier;
-                    if (mod && !(buttons & mod)) continue;
-
-                    bool warehouseActiveCtrl =
-                        InterlockedCompareExchange(&g_warehouseActive, 0, 0) != 0;
-                    if (!warehouseActiveCtrl) {
-                        if (!inSafeState) continue;
-                        InterlockedExchange(&g_nextOpenPanel, i);
-                    }
-                    trigger = true;
-                    break;
+        // Controller: XInput logic mirrors the DirectInput WM_INPUT path
+        // structurally — same per-panel rising-edge detection with
+        // per-panel last-down trackers, same modifier check at press time,
+        // same direct-PostMessage pattern, same B/Circle press-pending →
+        // release-close sequence. No inSafeState gate (TriggerWarehouse
+        // rejects unsafe modes itself, matching DirectInput behaviour).
+        if (g_pXInputGetState) {
+            // Aggregate buttons across ALL XInput slots (0–3). Steam Input
+            // remaps PS5 controllers to one slot, while a physical Xbox
+            // controller takes another — polling only slot 0 made the mod
+            // miss B presses on whichever device wasn't index 0. OR-merging
+            // means any controller's B/L3/R3 press is seen.
+            WORD buttons = 0;
+            int liveSlots = 0;
+            ULONGLONG nowHb = GetTickCount64();
+            for (DWORD idx = 0; idx < 4; idx++) {
+                XINPUT_STATE_LOCAL state;
+                memset(&state, 0, sizeof(state));
+                if (g_pXInputGetState(idx, &state) == 0) {
+                    buttons |= state.Gamepad.wButtons;
+                    liveSlots++;
                 }
             }
-        }
 
-        if (trigger) {
-            PostMessageA(g_gameWindow,WM_TRIGGER_WAREHOUSE,fromKeyboard?1:0,0);
+            if (liveSlots > 0) {
+                bool warehouseActiveBtn =
+                    InterlockedCompareExchange(&g_warehouseActive, 0, 0) != 0;
+
+                // Per-panel hold-to-close timers — each panel tracks how long
+                // its open combo has been continuously held. If the user keeps
+                // holding the combo AFTER the panel has opened, treat that as
+                // a "hold to close" gesture. Helps users who don't realise the
+                // combo needs to be re-pressed for toggle-close.
+                static ULONGLONG s_panelHoldStart[PANEL_COUNT] = {0};
+                static bool      s_panelHoldFiredClose[PANEL_COUNT] = {false};
+
+                for (int i = 0; i < PANEL_COUNT; i++) {
+                    WORD btn = g_panels[i].controllerButton;
+                    if (!btn) {
+                        g_panelXiLastDown[i] = false;
+                        s_panelHoldStart[i] = 0;
+                        s_panelHoldFiredClose[i] = false;
+                        continue;
+                    }
+                    bool down = (buttons & btn) != 0;
+                    WORD mod = g_panels[i].controllerModifier;
+                    bool modOk = (mod == 0) || ((buttons & mod) != 0);
+                    bool comboHeld = down && modOk;
+
+                    // Rising-edge toggle
+                    if (down && !g_panelXiLastDown[i] && modOk) {
+                        if (warehouseActiveBtn) {
+                            InterlockedExchange(&g_itemDetailActiveCount, 0);
+                            PostMessageA(g_gameWindow, WM_TRIGGER_WAREHOUSE, 2, 0);
+                            s_panelHoldFiredClose[i] = true;
+                        } else {
+                            InterlockedExchange(&g_nextOpenPanel, i);
+                            PostMessageA(g_gameWindow, WM_TRIGGER_WAREHOUSE, 0, 0);
+                            s_panelHoldFiredClose[i] = false;
+                        }
+                        s_panelHoldStart[i] = nowHb;
+                    }
+
+                    // Hold-to-close after >700 ms continuous hold
+                    if (comboHeld && warehouseActiveBtn &&
+                        s_panelHoldStart[i] != 0 &&
+                        !s_panelHoldFiredClose[i] &&
+                        (nowHb - s_panelHoldStart[i]) >= 700) {
+                        InterlockedExchange(&g_itemDetailActiveCount, 0);
+                        PostMessageA(g_gameWindow, WM_TRIGGER_WAREHOUSE, 2, 0);
+                        s_panelHoldFiredClose[i] = true;
+                    }
+
+                    if (!comboHeld) {
+                        s_panelHoldStart[i] = 0;
+                        s_panelHoldFiredClose[i] = false;
+                    }
+
+                    g_panelXiLastDown[i] = down;
+                }
+
+                // ---- B button (default close): rising edge marks pending,
+                //      falling edge triggers close. ItemDetailModal flag is
+                //      cleared on press so the pending → release sequence can
+                //      never be blocked.
+                bool bDown = (buttons & 0x2000) != 0;
+                if (bDown && !g_xiBWasDown && warehouseActiveBtn) {
+                    InterlockedExchange(&g_itemDetailActiveCount, 0);
+                    InterlockedExchange(&g_pendingBClose, 1);
+                }
+                if (!bDown && g_xiBWasDown && warehouseActiveBtn) {
+                    InterlockedExchange(&g_pendingBClose, 0);
+                    InterlockedExchange(&g_itemDetailActiveCount, 0);
+                    PostMessageA(g_gameWindow, WM_TRIGGER_WAREHOUSE, 2, 0);
+                }
+                g_xiBWasDown = bDown;
+
+                g_prevButtons = buttons;
+            }
         }
     }
     return 0;
@@ -4291,7 +4787,12 @@ static DWORD WINAPI ModThread(LPVOID) {
     if(!g_enabled)return 0;
     if(g_debugLog){std::string lp=ip.substr(0,ip.rfind('.'))+".log";g_logFile=fopen(lp.c_str(),"w");}
 
-    Log("=== Private Storage Anywhere v1.4.2 ===");
+    if (g_debugLog && !g_vehHandle) {
+        g_vehHandle = AddVectoredExceptionHandler(1, HwBpVehHandler);
+        if (!g_vehHandle) Log("[HWBP] AddVectoredExceptionHandler FAILED (err=%lu)", GetLastError());
+    }
+
+    Log("=== Private Storage Anywhere v1.4.4 ===");
     {char cls[256]={};char ttl[256]={};GetClassNameA(g_gameWindow,cls,256);GetWindowTextA(g_gameWindow,ttl,256);
     Log("Game window: class='%s' title='%s'",cls,ttl);}
     g_gameBase=(uintptr_t)GetModuleHandleA("CrimsonDesert.exe");
@@ -4372,12 +4873,12 @@ static DWORD WINAPI ModThread(LPVOID) {
         }
     }
 
-    if (InitXInput()) {
-        if (g_controllerButton)
-            Log("Controller: button=0x%04X modifier=0x%04X", g_controllerButton, g_controllerModifier);
-        else
-            Log("Controller: XInput loaded (B to close, no open button configured)");
-    }
+    InitXInput();
+
+    // IAT-hook the game's XInputGetState so its own polling never sees
+    // mod-bound combos or B-while-warehouse-open. Mod's own poll uses
+    // g_pXInputGetState (direct DLL export) which bypasses the IAT.
+    InstallXInputIATHook((HMODULE)g_gameBase);
 
     if(!IsWindow(g_gameWindow)){
         g_gameWindow=FindGameWindow();
@@ -4400,10 +4901,7 @@ static DWORD WINAPI ModThread(LPVOID) {
     rid[1].usUsage     = 0x04;
     rid[1].dwFlags     = RIDEV_INPUTSINK;
     rid[1].hwndTarget  = g_gameWindow;
-    if (RegisterRawInputDevices(rid, 2, sizeof(RAWINPUTDEVICE)))
-        Log("Raw Input: registered for HID GamePad + Joystick");
-    else
-        Log("Raw Input: RegisterRawInputDevices FAILED (error=%lu)", GetLastError());
+    RegisterRawInputDevices(rid, 2, sizeof(RAWINPUTDEVICE));
 
     g_ready=true;
     CreateThread(nullptr,0,InputThread,nullptr,0,nullptr);
@@ -4441,6 +4939,8 @@ BOOL APIENTRY DllMain(HMODULE h,DWORD r,LPVOID){
     if(r==DLL_PROCESS_ATTACH){g_hModule=h;DisableThreadLibraryCalls(h);CreateThread(nullptr,0,ModThread,nullptr,0,nullptr);}
     else if(r==DLL_PROCESS_DETACH){
         if(g_gameWindow&&g_originalWndProc)SetWindowLongPtrA(g_gameWindow,GWLP_WNDPROC,(LONG_PTR)g_originalWndProc);
+        if (g_vehHandle) { RemoveVectoredExceptionHandler(g_vehHandle); g_vehHandle = nullptr; }
+        RemoveXInputIATHook();
         // Restore original bytes for all game hooks to prevent use-after-free
         DWORD op;
         if (g_hookAddrHandler) {

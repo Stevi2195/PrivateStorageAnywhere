@@ -1,5 +1,18 @@
 Private Storage Anywhere — Changelog
 
+v1.4.4 (2026-05-08)
+- Fixed: B button (XInput) now closes Gatherables / Refrigerator / Dresser / Symbol / Collecting reliably. The mod's housing-panel patch wrote 0x00 to handler+0x200 (a leftover from the 1.0.4.x post-NPC memory diff), which put the game's input pipeline into a state where B-press events were consumed before reaching XInput's per-process state — so the mod's polling never saw the press. The +0x200 patch is now disabled; the value stays at 0x01 (Camp/normal input mode), and B-close works on every panel.
+- Fixed: F6 keyboard hotkey was permanently bound to Private Storage even when the user mapped F6 to a different panel (e.g. Dresser). The legacy "Hotkey" INI default was VK_F6, which was checked before the per-panel hotkey loop and silently stole F6. Default is now 0 (disabled); per-panel hotkeys (PrivateHotkey/DresserHotkey/etc.) are the single source of truth.
+- Fixed: B (XInput) and Circle (DualSense) now share identical close logic — same press-pending → release-close pattern, same modal-flag clearing, same force-close path. Previously XInput closed on press without a pending step, which caused intermittent re-opens on housing chests when an early state-restore hit before the user's release was registered.
+- Fixed: Self-closing of Gatherables right after open was caused by a synthetic ESC racing against PostMessage WM_TRIGGER_WAREHOUSE — the ESC closed the panel via the game path, then TriggerWarehouse saw warehouse-active=0 and re-opened. Synthetic ESC is now only emitted from inside the close path (post-cleanup), never alongside a trigger.
+- Added: Force-close mode for TriggerWarehouse — controller paths (B / Circle / per-panel combo) bypass the IsNewModalDialogVisible block. Stale +0x258 modal pointers on housing chests had been silently rejecting controller-initiated closes; F-key paths still respect the modal block as intended.
+- Added: Multi-slot XInput polling — all 4 XInput slots are OR-merged so a B press on any connected controller is seen, not just slot 0. Steam Input setups that map a DualSense to one slot and a physical Xbox controller to another no longer drop presses based on which slot was first.
+- Added: XInputGetStateEx (ordinal 100) preferred over plain XInputGetState — matches the entry point modern games use, so the mod and the game read state from the same underlying source.
+- Added: Hold-to-close gesture — holding the per-panel open combo (e.g. LB+R3) for >700 ms while the panel is already open also closes it. Helps users who don't realise the combo needs to be released and re-pressed for toggle-close.
+- Added: 250 ms re-open cooldown after close — absorbs the second WM_TRIGGER_WAREHOUSE that arrives when DualSense is mapped through Steam Input and the Circle press fires both the HID-Circle path and the XInput-B path simultaneously.
+- Added: CanShow close-detection now requires 10 consecutive zero polls before declaring a game-initiated close. Housing chest panels briefly write 0 to handler+0x118 during internal sub-state transitions; a single zero poll would otherwise trip the detection and silently close the warehouse.
+- Cleanup: Removed all controller-input-flow log lines (XInput slot/slots/buttons/heartbeat, B/Circle press/release, per-panel button toggles, HID device identification, Raw Input registration, synthetic ESC). The log now stays focused on warehouse state changes and errors. Set DebugLog=0 in the INI to disable logging entirely.
+
 v1.4.3 (2026-05-06)
 - Updated for game version 1.0.5.0 hotfix.
 
