@@ -22,14 +22,14 @@ Open your [b]Private Storage[/b] and all five [b]Housing Storage Chests[/b] (Gat
 [*][b]Native UI:[/b] Uses the game's built-in warehouse interface — no custom overlay
 [*][b]Localized titles:[/b] Private Storage and Gatherables Chest titles automatically match your game language (14 languages supported); the four other housing chests use English titles
 [*][b]Full interaction:[/b] Move items in and out of every chest, same as at the chest in person
-[*][b]No NPC visit required:[/b] Works immediately after game start
+[*][b]Private Storage works immediately[/b] after game start, no NPC visit required. [b]Housing chests[/b] (Gatherables, Dresser, Refrigerator, Symbol, Collecting) need an NPC visit once per game session before the mod can display their contents.
 [*][b]Update-proof:[/b] Uses automatic pattern scanning, vtable matching, and runtime string cross-references to locate internal game functions instead of hardcoded offsets
 [*][b]Compatible with UI mods:[/b] Identifies the warehouse panel by vtable signature, not by panel ID — works correctly even when mods like "No Letterbox" change the UI configuration
 [*][b]Safety system:[/b] Hotkeys are automatically blocked during cutscenes, minigames, and other unsafe states
 [*][b]Configurable:[/b] Each chest hotkey can be reassigned via INI file
 [*][b]Keyboard modifiers:[/b] Optional modifier key support (e.g. Shift+I to open storage while plain I opens inventory)
-[*][b]Xbox / XInput controller:[/b] Assign a controller button to Private Storage. Supports an optional modifier button (e.g. hold LB + press D-Pad). Works with Xbox controllers natively and all other controllers through Steam Input.
-[*][b]PS5 / PS4 controller:[/b] Native HID support for DualSense and DualShock 4 — close warehouse with Circle (or any configured button). Configurable PSButton in INI (Share, Options, Circle, Triangle, Square, Cross, L1, R1, L3, R3, Touchpad, PS, Mute)
+[*][b]Xbox / XInput controller:[/b] Assign a controller button to any panel. Supports an optional modifier button (e.g. hold LB + LeftStick for Private). Works with Xbox controllers natively and all other controllers through Steam Input.
+[*][b]PS5 / PS4 controller:[/b] Native HID support for DualSense and DualShock 4 — close warehouse with Circle or any configured button. Default for Private is L1 + L3, for Gatherables L1 + R3. Configurable PSButton/PSModifier per panel (Share, Options, Circle, Triangle, Square, Cross, L1, R1, L3, R3, Touchpad, PS, Mute).
 [*][b]INI hot-reload:[/b] Press F11 to reload all settings without restarting the game
 [/list]
 
@@ -138,6 +138,16 @@ Delete [b]PrivateStorageAnywhere.asi[/b] and [b]PrivateStorageAnywhere.ini[/b] f
 [line]
 
 [size=3][b]Changelog[/b][/size]
+
+[b]v1.5.0[/b]
+[list]
+[*]Updated for game version [b]1.06.00[/b]. Every panel (Private Storage and all five housing chests) opens and closes without crashing.
+[*]Housing chests (F5–F9) now require visiting the chest's NPC at least once per game session for items to display. Without an NPC visit the panel opens with an empty grid (no crash). Private Storage continues to work immediately from game start.
+[*]Fixed: ESC / B / Circle no longer closes the warehouse when a "Move items" quantity dialog or an "Item Details" popup is up. Both close-detection sources are now fully independent, so neither one can mask the other.
+[*]Fixed: XInput per-panel close-combo (e.g. LB + LeftStick) now respects the modal guard. Previously pressing the close-combo while a quantity dialog or Details popup was up would skip the modal-dismiss step and close the warehouse outright.
+[*]Boot log now lists every panel's keybindings on startup so you can verify exactly which key/button each panel is wired to.
+[*]Re-resolved all internal game addresses that moved in 1.06: SetInventory, WarehouseRefresh, ContainerWalker, ContainerMarker DAT, ItemDetailOpen, Container vtable, FactoryWrapper, InventoryInfoMgrPtr, and the Housing_GatheredMaterials string slot.
+[/list]
 
 [b]v1.4.4[/b]
 [list]

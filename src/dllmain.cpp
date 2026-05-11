@@ -7,10 +7,24 @@
 #include <string>
 
 // ============================================================
-//  Private Storage Anywhere v1.4.4
+//  Private Storage Anywhere v1.5.0
 //
 //  Opens the Camp Warehouse (Private Storage) from anywhere
-//  with a hotkey (default F6) or controller button.
+//  with a hotkey (default F4) or controller button (default LB + LeftStick).
+//
+//  v1.5.0: ported to Crimson Desert 1.06.00 (May 2026 patch).
+//  Re-resolved hardcoded RVAs via Ghidra:
+//    WarehouseRefresh    0xA754E0 -> 0xA7D860
+//    ContainerWalker     0x35115C0 -> 0x3540740
+//    ContainerMarker DAT 0x5E215B0 -> 0x5E57854
+//    ItemDetailCtor      0xB4D310 -> 0xB4D250
+//    SubObjectResolver   unchanged at 0xA31F00
+//  Disabled (no anchor found in 1.06): ChestRegistryLookup,
+//  TypeNameLookup, FactoryWrapper, HGM-string slot,
+//  Container-Vtable, InventoryInfoMgrPtr. Affected features
+//  (housing-chest container auto-creation without NPC visit)
+//  rely on captured-factory-args path which fires once any
+//  chest is opened by the game normally.
 // ============================================================
 
 static uintptr_t g_gameBase = 0, g_imageSize = 0;
@@ -20,7 +34,12 @@ static HMODULE g_hModule = nullptr;
 static HWND g_gameWindow = nullptr;
 static WNDPROC g_originalWndProc = nullptr;
 static bool g_enabled = true, g_debugLog = true;
-static DWORD g_hotkey = VK_F6;
+// Legacy "single hotkey" global. Kept for backwards compatibility with old
+// INIs that used `Hotkey=...` instead of per-panel <Name>Hotkey keys.
+// LoadConfig() overrides this with the INI value (default 0 = disabled).
+// The runtime initial value here is also 0 so that no key fires before
+// LoadConfig has run.
+static DWORD g_hotkey = 0;
 static DWORD g_modifierKey = 0;
 static DWORD g_reloadKey = 0;
 static char g_iniPath[MAX_PATH] = {};
@@ -142,15 +161,24 @@ struct PanelDef {
 // renderer (FUN_140A78690 @ base+0xA78690) reads sub[handler+0x1E0]+0x218 to
 // pick which channel feeds items. With a 2-token initString
 // ("Character;ChannelX"), ChannelX always lands in sub[1] — so tabIndex=1 for
-// every chest panel. Private is left at -1 (don't write) because F6 already
-// works with the game's natural state and we don't want to disturb that.
+// every chest panel. Private is left at -1 (don't write) because the keyboard
+// hotkey already works with the game's natural state and we don't want to
+// disturb that.
+// Code defaults match the shipped INI defaults. Fields per row:
+//   name, initString, hotkey, modifier, xiButton, xiModifier,
+//   psButtonByteOff, psButtonBitMask, psModifierByteOff, psModifierBitMask,
+//   tabIndex
+// Keyboard defaults: F4..F9 (one per panel). Controller defaults: only
+// Private + Gatherables get controller bindings; the other housing chests
+// are keyboard-only (rows of 0/-1). PS5/PS4 mirrors the controller layout:
+// L1+L3 → Private, L1+R3 → Gatherables.
 static PanelDef g_panels[PANEL_COUNT] = {
-    { "Private",      "Character,Focus,True;CampWareHouse,Focus,True",                0,            0, 0, 0, -1, 0, -1, 0, -1 },
-    { "Gatherables",  "Character,Focus,True;Housing_GatheredMaterials,Focus,True",   0x76 /*F7*/,  0, 0, 0, -1, 0, -1, 0,  1 },
-    { "Dresser",      "Character,Focus,True;Housing_Dresser,Focus,True",              0x77 /*F8*/,  0, 0, 0, -1, 0, -1, 0,  1 },
-    { "Refrigerator", "Character,Focus,True;Housing_Refrigerator,Focus,True",         0x78 /*F9*/,  0, 0, 0, -1, 0, -1, 0,  1 },
-    { "Symbol",       "Character,Focus,True;Housing_Symbol,Focus,True",               0,            0, 0, 0, -1, 0, -1, 0,  1 },
-    { "Collecting",   "Character,Focus,True;Housing_Collecting,Focus,True",           0x60 /*Num0*/,0, 0, 0, -1, 0, -1, 0,  1 },
+    { "Private",      "Character,Focus,True;CampWareHouse,Focus,True",              0x73 /*F4*/,  0, 0x0040 /*LStick*/, 0x0100 /*LB*/, 1, 0x40 /*L3*/, 1, 0x01 /*L1*/, -1 },
+    { "Gatherables",  "Character,Focus,True;Housing_GatheredMaterials,Focus,True",  0x74 /*F5*/,  0, 0x0080 /*RStick*/, 0x0100 /*LB*/, 1, 0x80 /*R3*/, 1, 0x01 /*L1*/,  1 },
+    { "Dresser",      "Character,Focus,True;Housing_Dresser,Focus,True",            0x75 /*F6*/,  0, 0, 0, -1, 0, -1, 0,  1 },
+    { "Refrigerator", "Character,Focus,True;Housing_Refrigerator,Focus,True",       0x76 /*F7*/,  0, 0, 0, -1, 0, -1, 0,  1 },
+    { "Symbol",       "Character,Focus,True;Housing_Symbol,Focus,True",             0x77 /*F8*/,  0, 0, 0, -1, 0, -1, 0,  1 },
+    { "Collecting",   "Character,Focus,True;Housing_Collecting,Focus,True",         0x78 /*F9*/,  0, 0, 0, -1, 0, -1, 0,  1 },
 };
 // Per-panel last/current state for PS button edge detection (parallel to g_panels[]).
 static bool g_panelPsLastDown[PANEL_COUNT] = {};
@@ -682,37 +710,47 @@ static uintptr_t ReadModalDialog(uintptr_t handler) {
     } __except(EXCEPTION_EXECUTE_HANDLER) { return 0; }
 }
 
-// Check if a NEW sub-dialog (quantity/confirm) is visible that we haven't dismissed yet.
-// The ModalMessageView address changes each time a dialog opens.
-// After we pass ESC to the game once (dismissing it), we record the address so that
-// further ESC presses don't keep passing through (children cleanup is async).
+// Check if a NEW sub-dialog (quantity/confirm dialog OR "View Details" popup)
+// is visible. The two tracking sources are independent:
+//
+//   1. handler+0x258 (ModalDlgOff): the game writes a pointer here when a
+//      quantity/confirm sub-dialog opens. childCount at +0x30 of the view
+//      tells us if it still has visible children.
+//
+//   2. g_itemDetailActiveCount: incremented by the ItemDetailOpen hook
+//      (FUN_140b55860 in 1.06) when the game processes an
+//      "ItemDetailModalMessage" command. The "View Details" popup does NOT
+//      register at handler+0x258 — only the hook sees it.
+//
+// CRITICAL: never let one source clear the other. Earlier versions cleared
+// g_itemDetailActiveCount whenever +0x258 looked stale, which silently
+// suppressed the Details popup detection — ESC then closed the warehouse
+// instead of the popup.
 static bool IsNewModalDialogVisible() {
-    uintptr_t handler = (uintptr_t)InterlockedCompareExchange64(&g_handlerThis, 0, 0);
-    if (!handler) {
-        // Without a handler we can't poll the modal pointer — fall back to
-        // the open-hook flag. If the popup was caught by the hook but never
-        // dismissed (no handler to poll), assume it's still up.
-        return InterlockedCompareExchange(&g_itemDetailActiveCount, 0, 0) > 0;
+    // Source #2 is always consulted first because it's independent of the
+    // handler/+0x258 state and is the only source for Details popups.
+    if (InterlockedCompareExchange(&g_itemDetailActiveCount, 0, 0) > 0) {
+        return true;
     }
+
+    uintptr_t handler = (uintptr_t)InterlockedCompareExchange64(&g_handlerThis, 0, 0);
+    if (!handler) return false;
+
     __try {
         uintptr_t modalView = ReadModalDialog(handler);
         if (modalView > 0x10000 && modalView < 0x7FFFFFFFFFFF) {
             uint32_t childCount = *(uint32_t*)(modalView + 0x30);
             // childCount == 0: no modal visible.
-            // childCount > 0x100: freed-memory garbage (modal was dismissed, pointer not cleared
-            // — reading at the old address returns whatever the allocator wrote). Treat as dismissed.
+            // childCount > 0x100: freed-memory garbage (modal was dismissed,
+            // pointer not cleared — reading at the old address returns
+            // whatever the allocator wrote). Treat as dismissed.
             if (childCount == 0 || childCount > 0x100) {
                 InterlockedExchange64(&g_lastModalPassed, 0);
-                InterlockedExchange(&g_itemDetailActiveCount, 0);
+                // DO NOT touch g_itemDetailActiveCount here.
                 return false;
             }
             uintptr_t lastPassed = (uintptr_t)InterlockedCompareExchange64(&g_lastModalPassed, 0, 0);
             if (lastPassed == modalView) return false;
-            return true;
-        }
-        // No modal pointer at +0x258 — but the open-hook may still report
-        // an active popup (it ran AHEAD of the game writing the pointer).
-        if (InterlockedCompareExchange(&g_itemDetailActiveCount, 0, 0) > 0) {
             return true;
         }
     } __except(EXCEPTION_EXECUTE_HANDLER) {}
@@ -750,10 +788,10 @@ static bool ParsePSButtonName(const char* name, int* outOff, BYTE* outMask) {
 static void LoadConfig(const char* p) {
     g_enabled = GetPrivateProfileIntA("Settings","Enabled",1,p)!=0;
     g_debugLog = GetPrivateProfileIntA("Settings","DebugLog",0,p)!=0;
-    // Legacy "Hotkey" (single Private toggle). Default 0 = disabled, since the
-    // new INI layout uses PrivateHotkey=… for per-panel control. Keeping the
-    // old VK_F6 default would silently steal whatever F6 is now assigned to
-    // (e.g. Dresser).
+    // Legacy "Hotkey" (single Private toggle). Default 0 = disabled. The
+    // new per-panel layout uses PrivateHotkey=… for control. Keeping any
+    // non-zero legacy default would silently steal whatever that key is
+    // now assigned to in the per-panel layout (e.g. PrivateHotkey=F4).
     g_hotkey = ReadHexValue("Settings", "Hotkey", 0, p);
     g_modifierKey = ReadHexValue("Settings", "ModifierKey", 0, p);
     g_controllerButton = (WORD)ReadHexValue("Settings", "ControllerButton", 0, p);
@@ -1462,6 +1500,21 @@ static int FindPrologBoundary(uint8_t* code, int minBytes) {
         }
         // JMP [RIP+disp32] thunk: FF 25 xx xx xx xx + 8-byte inline address = 14 bytes
         if (b == 0xFF && code[pos+1] == 0x25) { pos += 14; continue; }
+        // 66 89 modrm [sib] [disp] — operand-size override + MOV r/m16, r16
+        // Seen in 1.06.00 ItemDetail open handler @ 0xB4D250 which starts with
+        // `66 89 54 24 10` (MOV word ptr [RSP+0x10], DX) before the PUSH chain.
+        if (b == 0x66 && code[pos+1] == 0x89) {
+            uint8_t modrm = code[pos+2];
+            uint8_t mod = modrm >> 6, rm = modrm & 0x07;
+            if (mod == 0x00) {
+                if (rm == 0x05) { pos += 7; continue; }            // [rip+disp32]
+                if (rm == 0x04) { pos += 4; continue; }            // [SIB]
+                pos += 3; continue;                                // [reg]
+            }
+            if (mod == 0x01) { pos += 4 + (rm == 0x04 ? 1 : 0); continue; }  // [reg+disp8] (+SIB)
+            if (mod == 0x02) { pos += 7 + (rm == 0x04 ? 1 : 0); continue; }  // [reg+disp32] (+SIB)
+            if (mod == 0x03) { pos += 3; continue; }                          // reg,reg
+        }
         // Unknown — bail out to avoid infinite loop
         Log("  FindPrologBoundary: unknown opcode 0x%02X at pos %d", b, pos);
         return 0;
@@ -1704,13 +1757,21 @@ static void InitWarehousePanel(uintptr_t handler, const char* initString) {
                     // Gatherables / Refrigerator / Dresser / Symbol /
                     // Collecting (works fine for Private/Camp because that
                     // path doesn't enter this branch).
-                    *(uint32_t*)(handler + 0x1D8) = 0xFFFFFFFF;
-                    // *(uint8_t* )(handler + 0x200) = 0x00;  // disabled — see comment above
-                    *(uint32_t*)(handler + 0x2A8) = 0x00000000;
-                    *(uint32_t*)(handler + 0x39C) = 1000;
+                    // 1.06.00: handler+0x1D8/+0x2A8 patches DISABLED. These
+                    // offsets came from a 1.0.4.x post-NPC memory diff and
+                    // 1.06 has restructured the handler struct — writing
+                    // 0xFFFFFFFF / 0x00000000 to these slots corrupts state
+                    // that 1.06 uses for housing-panel rendering, leading
+                    // to a crash on first frame. The +0x39C max-slots patch
+                    // is also redundant in 1.06 because PatchInventoryInfoSlots
+                    // already bumped the per-info slot count to 1000 (see
+                    // boot log: "InventoryInfo slot patch: 5 entries default 10 -> 1000").
+                    // *(uint32_t*)(handler + 0x1D8) = 0xFFFFFFFF;  // 1.06: disabled
+                    // *(uint32_t*)(handler + 0x2A8) = 0x00000000;  // 1.06: disabled
+                    // *(uint32_t*)(handler + 0x39C) = 1000;        // 1.06: redundant (InventoryInfo patch covers it)
 
                     InterlockedExchange64(&g_patchedContainer, (LONG64)handler);
-                    Log("  Patched handler fields for housing panel (sub patches disabled, +0x200 patch disabled)");
+                    Log("  Handler patches SKIPPED for housing panel in 1.06 (1.05 memory-diff offsets corrupt 1.06 state)");
 
                 } else {
                     if (InterlockedCompareExchange(&g_campValuesSaved, 0, 0)) {
@@ -1793,9 +1854,11 @@ static void InitWarehousePanel(uintptr_t handler, const char* initString) {
                     // via the global array: array[0x59] returns a Housing-type
                     // wrapper (vtable base+0x4FDC728) which crashes SetInventory.
                     Log("  Container bind: Private — keeping game's auto-bound container (no array override)");
-                    // Even when the game auto-binds, the grid widget may still
-                    // hold the previous panel's cached source-tuple. Invalidate.
-                    invalidateGridCache(handler);
+                    // 1.06.00: grid cache invalidate disabled for Private.
+                    // The +0x568 cache-key offset is from 1.05; in 1.06 this
+                    // slot may belong to a different field whose modification
+                    // contributed to the first-frame crash.
+                    Log("  Grid cache invalidate SKIPPED for Private (1.06 crash workaround)");
                 } else {
                     // Housing panels (F7+): The global container array is
                     // index-reachable per-panel, BUT the wrappers it returns
@@ -1827,97 +1890,59 @@ static void InitWarehousePanel(uintptr_t handler, const char* initString) {
                         } __except(EXCEPTION_EXECUTE_HANDLER) {
                             Log("  Container bind: sticky write EXCEPTION");
                         }
-                        invalidateGridCache(handler);
+                        // 1.06.00: grid cache invalidate disabled here too — the
+                        // +0x568 cache slot referenced a 1.05 field that does
+                        // not exist at the same offset in 1.06; writing -1 to
+                        // whatever now lives there contributes to the post-open
+                        // render crash. The natural SetInventory unbind+rebind
+                        // performs the same cache flush via the game's own path.
+                        // invalidateGridCache(handler);
                     } else {
                         Log("  Container bind: %s sticky 0x%llX stale (vtable mismatch) — clear",
                             g_panels[ap].name, (unsigned long long)panelSticky);
                         InterlockedExchange64(&g_panelStickyContainer[ap], 0);
                     }
                 } else {
-                    // 1.05.0 fix: prefer Private's auto-bound chest over the
-                    // factory-create path. The factory chest has no +0xA8 chain
-                    // and crashes FUN_140A754E0 (canonical refresh). Private's
-                    // chest has a valid hierarchy and passes the chest-walk
-                    // checks; channel routing via SetInventory (sub[1]+0x218 =
-                    // Housing_GM channel-id) determines which items render —
-                    // the chest is just a "reference" the renderer traverses.
-                    LONG64 privateSticky = InterlockedCompareExchange64(
-                        &g_panelStickyContainer[PANEL_PRIVATE], 0, 0);
-                    bool privateValid = false;
-                    if (privateSticky >= 0x10000000000LL) {
-                        __try {
-                            uintptr_t vt = *(uintptr_t*)(uintptr_t)privateSticky;
-                            privateValid = (vt >= 0x140000000ULL && vt < 0x180000000ULL);
-                        } __except(EXCEPTION_EXECUTE_HANDLER) { privateValid = false; }
-                    }
-                    bool boundFromPrivate = false;
-                    if (privateValid) {
-                        __try {
-                            *(uintptr_t*)(handler + 0x170) = (uintptr_t)privateSticky;
-                            // Don't claim ownership — Private's chest is
-                            // game-managed; we just borrow it as a renderer
-                            // reference for housing panels.
-                            Log("  Container bind: %s reuse Private chest 0x%llX",
-                                g_panels[ap].name, (unsigned long long)privateSticky);
-                            boundFromPrivate = true;
-                        } __except(EXCEPTION_EXECUTE_HANDLER) {
-                            Log("  Container bind: Private-chest reuse EXCEPTION");
-                        }
-                        if (boundFromPrivate) invalidateGridCache(handler);
-                    }
-
-                    // Last-resort fallback: factory-create only if we couldn't
-                    // borrow Private's chest. Has known limits (no +0xA8 chain
-                    // → FUN_140A754E0 crashes) but the slot-grid renderer
-                    // FUN_140A78690 can pass its outer gate with the
-                    // +0x7E8/+0x7F0 patch below.
-                    uintptr_t made = boundFromPrivate ? 0 : TryCreateContainerViaSingleton(handler);
-                    if (made >= 0x10000000000ULL) {
-                        bool madeValid = false;
-                        __try {
-                            uintptr_t vt = *(uintptr_t*)made;
-                            madeValid = (g_addrContainerVtable && vt == g_addrContainerVtable);
-                        } __except(EXCEPTION_EXECUTE_HANDLER) { madeValid = false; }
-                        if (madeValid) {
-                            __try {
-                                *(uintptr_t*)(handler + 0x170) = made;
-                                InterlockedExchange64(&g_panelStickyContainer[ap], (LONG64)made);
-                                InterlockedExchange(&g_panelStickyOwnedByMod[ap], 1);
-                                // NOTE: do NOT set g_currentBoundPanel here —
-                                // see same comment in sticky-restore path above.
-                                Log("  Container bind: %s factory-created 0x%llX (mod-owned)",
-                                    g_panels[ap].name, (unsigned long long)made);
-
-                                // Render-gate fix: FUN_140A78690 returns early if
-                                // cont+0x7E8 (short) == -1 OR cont+0x7F0 (qword)
-                                // <= 0. Factory-created containers have +0x7E0 =
-                                // 0xFFFFFFFFFFFFFFFF, +0x7E8 = -1, +0x7F0 = 0
-                                // (uninitialized slot-table). Without this patch
-                                // the renderer skips the rebuild and the grid
-                                // keeps showing whatever was last drawn (=
-                                // previous panel's items). Write minimal valid
-                                // sentinels so the gate passes; the actual item
-                                // list comes from InventoryInfo[channel] not
-                                // from this slot-table.
-                                __try {
-                                    *(uint16_t*)(made + 0x7E8) = 0;
-                                    *(int64_t*)(made + 0x7F0)  = 1;
-                                    Log("  Render-gate patch: cont+0x7E8=0 cont+0x7F0=1");
-                                } __except(EXCEPTION_EXECUTE_HANDLER) {
-                                    Log("  Render-gate patch EXCEPTION");
-                                }
-                            } __except(EXCEPTION_EXECUTE_HANDLER) {
-                                Log("  Container bind: factory write EXCEPTION");
-                            }
-                            invalidateGridCache(handler);
-                        } else {
-                            Log("  Container bind: %s factory result vtable mismatch — discard",
-                                g_panels[ap].name);
-                        }
-                    } else if (!boundFromPrivate) {
-                        Log("  Container bind: %s has no sticky and factory unavailable — letting game rebind via SetInventory",
+                    // 1.06.00 CRASH FIX (Dresser/Refrigerator/Symbol/Collecting
+                    // with stored items): the v1.05 "reuse Private's chest"
+                    // fallback worked because the 1.05 renderer treated the
+                    // container at handler+0x170 as a reference object and
+                    // pulled items via channel routing. In 1.06 the renderer
+                    // reads items directly from the container's per-slot
+                    // arrays — feeding it Private's chest with the housing
+                    // channel-id bound to sub[1] reads garbage out of bounds
+                    // and crashes on the first non-empty slot.
+                    //
+                    // We now NULL the container (handler+0x170 = 0) when no
+                    // per-panel sticky exists. The renderer's NULL guard
+                    // shows an empty grid instead of crashing. The trade-off
+                    // is that the user must visit each housing chest's NPC
+                    // at least once per session — then the sticky observer
+                    // saves the real chest container and the upper branch
+                    // (sticky-restore) takes over. Same behavior as v1.05
+                    // for non-empty chests.
+                    __try {
+                        *(uintptr_t*)(handler + 0x170) = 0;
+                        Log("  Container bind: %s no per-panel sticky — handler+0x170 cleared "
+                            "(visit the chest NPC at least once per session to enable item display)",
                             g_panels[ap].name);
+                    } __except(EXCEPTION_EXECUTE_HANDLER) {
+                        Log("  Container bind: NULL-out EXCEPTION");
                     }
+
+                    // 1.06.00: factory-create path DISABLED for housing chests.
+                    // The captured factory args (singleton, ctrl) are from
+                    // whichever chest the player happened to walk near — there
+                    // is no way to select a Dresser-typed ctrl without
+                    // TypeNameLookup (which we also can't resolve in 1.06).
+                    // Calling the factory with random captures produces a
+                    // wrong-type container that the renderer reads as garbage
+                    // and crashes on first non-empty slot of the requested
+                    // panel's channel. Leaving handler+0x170 = NULL is the
+                    // safe outcome — panel opens empty without a crash.
+                    Log("  Container bind: %s factory-create SKIPPED in 1.06 "
+                        "(captured args are not panel-typed and produce wrong-type containers)",
+                        g_panels[ap].name);
                 }
                 }
         }
@@ -2084,6 +2109,11 @@ static void InitWarehousePanel(uintptr_t handler, const char* initString) {
         }
 
         // Step 2: standard unbind+rebind of the current panel (forces refresh).
+        // 1.06.00: SetInventory IS needed — without it the panel renders the
+        // previous NPC's inventory layout (donation widget, wrong slot count,
+        // wrong tabs). The earlier crash was likely caused by the Grid cache
+        // invalidate (handler+0x178->+0x568 = -1), not SetInventory. Grid
+        // invalidate is now skipped for Private; SetInventory re-enabled.
         __try {
             if (curUnbind[0]) {
                 ((PFN_SetInv)g_fnSetInventory)((void*)handler, (void*)curUnbind);
@@ -2143,18 +2173,24 @@ static void InitWarehousePanel(uintptr_t handler, const char* initString) {
             } __except(EXCEPTION_EXECUTE_HANDLER) {}
             Log("  Refresh probe: +0x2A5=0x%02X chest=0x%llX walker=0x%llX",
                 a5, (unsigned long long)chest, (unsigned long long)walker);
-            if (walker >= 0x10000000000ULL) {
+            // 1.06.00: FUN_140a7d860 (the new WarehouseRefresh @ 0xA7D860)
+            // has different semantics than the 1.05 version — it null-derefs
+            // when called with the same walker structure the old function
+            // accepted. The __try below catches it, but skip the call entirely
+            // to keep the log clean. Force-refresh disabled in 1.06 until the
+            // new function's call contract is reverse-engineered.
+            if (false && walker >= 0x10000000000ULL) {
                 __try {
                     typedef char (__fastcall *PFN_Refresh)(void*, void*);
                     char rc = ((PFN_Refresh)g_fnWarehouseRefresh)(
                         (void*)handler, (void*)walker);
-                    Log("  Refresh: FUN_140A754E0(handler, walker) -> %d", (int)rc);
+                    Log("  Refresh: FUN_140A7D860(handler, walker) -> %d", (int)rc);
                 } __except(EXCEPTION_EXECUTE_HANDLER) {
-                    Log("  Refresh: FUN_140A754E0 EXCEPTION (walker=0x%llX)",
+                    Log("  Refresh: FUN_140A7D860 EXCEPTION (walker=0x%llX)",
                         (unsigned long long)walker);
                 }
             } else {
-                Log("  Refresh skipped: walker invalid");
+                Log("  Refresh skipped (1.06 WarehouseRefresh contract differs — see comment)");
             }
         }
     }
@@ -3610,9 +3646,9 @@ static LRESULT CALLBACK HookedWndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             // Per-panel hotkeys take precedence over the legacy single
             // hotkey. With the new defaults (F4=Private, F5=Gatherables,
             // F6=Dresser, F7=Refrigerator, F8=Symbol, F9=Collecting),
-            // the legacy `g_hotkey` (default F6) collides with Dresser —
-            // checking it first would shadow the per-panel binding and
-            // open Private on F6 instead.
+            // any legacy `g_hotkey` value would collide with one of these
+            // panels — checking it first would shadow the per-panel
+            // binding. Legacy default is now 0 (disabled).
             for (int i = 0; i < PANEL_COUNT; i++) {
                 if (g_panels[i].hotkey == 0 || (DWORD)w != g_panels[i].hotkey) continue;
                 bool modOk = (g_panels[i].modifier == 0) ||
@@ -3989,9 +4025,20 @@ static DWORD WINAPI InputThread(LPVOID) {
                     // Rising-edge toggle
                     if (down && !g_panelXiLastDown[i] && modOk) {
                         if (warehouseActiveBtn) {
-                            InterlockedExchange(&g_itemDetailActiveCount, 0);
-                            PostMessageA(g_gameWindow, WM_TRIGGER_WAREHOUSE, 2, 0);
-                            s_panelHoldFiredClose[i] = true;
+                            // Modal-aware close: when a quantity dialog or Details popup
+                            // is up, pressing the panel-button should NOT force-close the
+                            // warehouse. Clear our tracked itemDetail flag (so the game's
+                            // own close path can dismiss the popup) and skip the close.
+                            // Users press the button again after the popup is gone to
+                            // close the warehouse.
+                            if (IsNewModalDialogVisible()) {
+                                InterlockedExchange(&g_itemDetailActiveCount, 0);
+                                s_panelHoldFiredClose[i] = true;  // absorb hold-detection
+                            } else {
+                                InterlockedExchange(&g_itemDetailActiveCount, 0);
+                                PostMessageA(g_gameWindow, WM_TRIGGER_WAREHOUSE, 2, 0);
+                                s_panelHoldFiredClose[i] = true;
+                            }
                         } else {
                             InterlockedExchange(&g_nextOpenPanel, i);
                             PostMessageA(g_gameWindow, WM_TRIGGER_WAREHOUSE, 0, 0);
@@ -4005,8 +4052,13 @@ static DWORD WINAPI InputThread(LPVOID) {
                         s_panelHoldStart[i] != 0 &&
                         !s_panelHoldFiredClose[i] &&
                         (nowHb - s_panelHoldStart[i]) >= 700) {
-                        InterlockedExchange(&g_itemDetailActiveCount, 0);
-                        PostMessageA(g_gameWindow, WM_TRIGGER_WAREHOUSE, 2, 0);
+                        // Same modal guard as the rising-edge close path.
+                        if (!IsNewModalDialogVisible()) {
+                            InterlockedExchange(&g_itemDetailActiveCount, 0);
+                            PostMessageA(g_gameWindow, WM_TRIGGER_WAREHOUSE, 2, 0);
+                        } else {
+                            InterlockedExchange(&g_itemDetailActiveCount, 0);
+                        }
                         s_panelHoldFiredClose[i] = true;
                     }
 
@@ -4018,18 +4070,24 @@ static DWORD WINAPI InputThread(LPVOID) {
                     g_panelXiLastDown[i] = down;
                 }
 
-                // ---- B button (default close): rising edge marks pending,
-                //      falling edge triggers close. ItemDetailModal flag is
-                //      cleared on press so the pending → release sequence can
-                //      never be blocked.
+                // ---- B button (default close): mirrors DirectInput Circle.
+                //  - Rising edge with a modal up (quantity dialog at +0x258
+                //    or ItemDetailModal counter > 0): just clear the popup
+                //    flag — game's own input handler will close the modal.
+                //    Do NOT mark pending close so the release doesn't trigger
+                //    warehouse-close on top of the modal-close.
+                //  - Rising edge with no modal: mark pending. Falling edge
+                //    triggers warehouse-close (force, bypass modal-block).
                 bool bDown = (buttons & 0x2000) != 0;
                 if (bDown && !g_xiBWasDown && warehouseActiveBtn) {
-                    InterlockedExchange(&g_itemDetailActiveCount, 0);
-                    InterlockedExchange(&g_pendingBClose, 1);
+                    if (IsNewModalDialogVisible()) {
+                        InterlockedExchange(&g_itemDetailActiveCount, 0);
+                    } else {
+                        InterlockedExchange(&g_pendingBClose, 1);
+                    }
                 }
-                if (!bDown && g_xiBWasDown && warehouseActiveBtn) {
+                if (!bDown && g_xiBWasDown && InterlockedCompareExchange(&g_pendingBClose, 0, 0)) {
                     InterlockedExchange(&g_pendingBClose, 0);
-                    InterlockedExchange(&g_itemDetailActiveCount, 0);
                     PostMessageA(g_gameWindow, WM_TRIGGER_WAREHOUSE, 2, 0);
                 }
                 g_xiBWasDown = bDown;
@@ -4076,30 +4134,74 @@ static bool ResolveAddresses() {
     Log("Handler:      %s base+0x%llX (string-xref)", g_fnHandler?"OK":"FAIL",
         g_fnHandler?(unsigned long long)(g_fnHandler-g_gameBase):0);
 
-    // Step 2: Find SetInventory via "SetInventory" string → CALL target in Handler
+    // Step 2: Find SetInventory via "SetInventory" string → CALL target in Handler.
+    //
+    // 1.06.00 RE: the real SetInventory @ 0xA82F70 (1898 bytes) starts with
+    // `48 89 4C 24 08; 55; 53; 56; 57; 41 54; 41 55; 41 56; 41 57` — NOT
+    // `40 55` like in 1.05. The previous resolver rejected it and picked
+    // the NEXT 40-55 CALL which is SetChannels @ 0xA836E0 (452 bytes, only
+    // writes handler+0x350/+0x352/+0x354). Calling SetChannels with our
+    // 2-token filter string skipped the inventory bind entirely and the
+    // game crashed on first frame of rendering with a NULL container.
+    //
+    // Fix: accept any "big function" prolog. SetInventory candidates are
+    // expected to be substantially larger than SetChannels (>=600 bytes),
+    // so we additionally check that the CALL target body extends through
+    // at least 0x200 bytes of plausible code (not a 0xC3 RET in first
+    // 0x40 bytes — SetChannels is the only short candidate here).
     if (g_fnHandler) {
         uintptr_t strSetInv = FindString("SetInventory");
         if (strSetInv) {
-            // Find LEA to "SetInventory" string within the handler range
             uintptr_t leaAddr = FindLEA(strSetInv, g_fnHandler);
             if (leaAddr && leaAddr < g_fnHandler + 0x1000) {
-                // The CALL to FUN_140a638e0 is within ~30 bytes after the strcmp branch
                 uintptr_t targets[16];
                 int n = FindAllCALLsAfter(leaAddr, 60, targets, 16);
                 for (int i = 0; i < n; i++) {
-                    // SetInventory is the CALL after strcmp succeeds — it's the larger function
-                    // Verify by checking its prolog starts with 40 55 (REX PUSH RBP)
                     uint8_t* p = (uint8_t*)targets[i];
-                    if (p[0] == 0x40 && p[1] == 0x55) {
-                        g_fnSetInventory = targets[i];
-                        break;
+                    // Accept any of the known SetInventory prologs:
+                    //   1.05: 40 55                             (REX PUSH RBP)
+                    //   1.06: 48 89 4C 24 08                    (MOV [RSP+8], RCX)
+                    //   alt:  48 89 5C 24 ??                    (MOV [RSP+disp8], RBX)
+                    //   alt:  48 83 EC ??                       (SUB RSP, imm8)
+                    bool prologOk = false;
+                    if (p[0] == 0x40 && p[1] == 0x55) prologOk = true;
+                    else if (p[0] == 0x48 && p[1] == 0x89 && p[2] == 0x4C && p[3] == 0x24 && p[4] == 0x08) prologOk = true;
+                    else if (p[0] == 0x48 && p[1] == 0x89 && p[2] == 0x5C && p[3] == 0x24) prologOk = true;
+                    if (!prologOk) continue;
+                    // Size guard: SetInventory is large (~1900 bytes in 1.05/1.06).
+                    // SetChannels is small (~450 bytes) and contains a RET within
+                    // the first 0x40 bytes; SetInventory does not. Use this to
+                    // reject the small wrong-target.
+                    bool earlyRet = false;
+                    for (int k = 1; k < 0x40; k++) {
+                        if (p[k] == 0xC3) { earlyRet = true; break; }
                     }
+                    if (earlyRet) continue;
+                    g_fnSetInventory = targets[i];
+                    break;
                 }
             }
         }
     }
     Log("SetInventory: %s base+0x%llX (string-xref)", g_fnSetInventory?"OK":"FAIL",
         g_fnSetInventory?(unsigned long long)(g_fnSetInventory-g_gameBase):0);
+
+    // 1.06.00 fix-up: if dynamic resolution still picks SetChannels @ 0xA836E0
+    // (small 452-byte wrong target — only writes handler+0x350/+0x352/+0x354),
+    // override to the verified real SetInventory @ 0xA82F70 (1898 bytes —
+    // iterates handler+0x138 sub-array, binds each sub via vtable[0x20/0x28],
+    // writes sub+0x218 channel-id and sub+0x248 focus-index).
+    {
+        uintptr_t realSetInv  = g_gameBase + 0xA82F70;  // 1.06: verified via Ghidra
+        uintptr_t wrongTarget = g_gameBase + 0xA836E0;  // 1.06: SetChannels
+        if (g_fnSetInventory == wrongTarget) {
+            Log("SetInventory: detected wrong target (SetChannels @ +0xA836E0) — overriding to real SetInventory @ +0xA82F70");
+            g_fnSetInventory = realSetInv;
+        } else if (!g_fnSetInventory) {
+            g_fnSetInventory = realSetInv;
+            Log("SetInventory: fallback to hardcoded 1.06 address base+0xA82F70");
+        }
+    }
 
     // Step 3: Find SetTitle via "SetWareHouseInventoryName" string → CALL chain in Handler
     if (g_fnHandler) {
@@ -4579,45 +4681,33 @@ static bool ResolveAddresses() {
             g_fnSetInventory?(unsigned long long)(g_fnSetInventory-g_gameBase):0);
     }
 
-    // 1.05 RE OVERRIDE: The "SetInventory" string in 1.05 has 0 LEA xrefs (dead string),
-    // and the byte-pattern fallback matches an adjacent vtable slot (FUN_140a7b2a0 =
-    // SetChannels) instead of the real worker (FUN_140a7ab30). Detect and correct.
-    //
-    // Real SetInventory @ base+0xA7AB30: 1898-byte function that iterates handler+0x138
-    // sub-controller array (count at +0x140), parses filter via DAT_1449e9264 delimiter,
-    // matches token[0] against PTR_s_Focus_14492c220[8] Focus-mode strings, and binds
-    // each sub via FUN_140c11530 + vtable[0x20]/[0x28]. Sets sub+0x218 = channel-id
-    // and sub+0x248 = focus-index.
-    //
-    // Wrong target @ base+0xA7B2A0: only sets handler+0x350/+0x352/+0x354 (channel IDs)
-    // and triggers tab-selector refresh on +0x2E8. Does NOT load inventory data.
-    {
-        uintptr_t realSetInv  = g_gameBase + 0xA7AB30;
-        uintptr_t wrongTarget = g_gameBase + 0xA7B2A0;
-        if (g_fnSetInventory == wrongTarget) {
-            Log("SetInventory: detected wrong target (SetChannels @ +0xA7B2A0) \u2014 overriding to real SetInventory @ +0xA7AB30");
-            g_fnSetInventory = realSetInv;
-        } else if (!g_fnSetInventory) {
-            // Resolver chain failed entirely \u2014 hardcode the verified 1.05 address.
-            g_fnSetInventory = realSetInv;
-            Log("SetInventory: fallback to hardcoded 1.05 address base+0xA7AB30");
-        }
+    // SetInventory resolution + 1.06 wrong-target fix-up is handled in Step 2
+    // above. By this point g_fnSetInventory should be set to either the real
+    // worker (0xA82F70 in 1.06) or 0 (if everything failed).
+    if (!g_fnSetInventory) {
+        Log("SetInventory: WARN dynamic resolver failed and 1.06 hardcoded fallback also missed \u2014 inventory binding will not work.");
     }
 
-    // 1.05 RE: WarehouseBindRefresh = FUN_140a754e0. Replicates the NPC-open
-    // bind+refresh path. Hardcoded for 1.05 (no reliable string anchor).
-    g_fnWarehouseRefresh = g_gameBase + 0xA754E0;
-    Log("WarehouseRefresh: hardcoded base+0xA754E0");
+    // 1.06.00 RE: WarehouseBindRefresh moved from FUN_140a754e0 -> FUN_140a7d860.
+    // Same behavior: takes (handler, sub), reads sub+0x140 (or walks sub+0xa8+0x50
+    // chain via FUN_143540740), type-checks via vfunc[0x188] with &DAT_145e57854,
+    // writes resolved container into handler+0x170, calls inner refresh FUN_140a80ab0.
+    g_fnWarehouseRefresh = g_gameBase + 0xA7D860;
+    Log("WarehouseRefresh: hardcoded base+0xA7D860 (1.06)");
 
-    // 1.05 RE: helpers for FUN_140a754e0's bind path.
-    g_fnContainerWalker     = g_gameBase + 0x35115C0;
-    g_fnChestRegistryLookup = g_gameBase + 0x3511520;
+    // 1.06.00 RE: chain walker moved 0x35115C0 -> 0x3540740 (FUN_143540740).
+    // SubObjectResolver still at 0xA31F00 (unchanged).
+    // ContainerMarker DAT moved 0x5E215B0 -> 0x5E57854.
+    // ChestRegistryLookup: not located in 1.06 \u2014 disabled (set to 0).
+    // Callers must guard against g_fnChestRegistryLookup == 0 before using.
+    g_fnContainerWalker     = g_gameBase + 0x3540740;
+    g_fnChestRegistryLookup = 0;
     g_fnSubObjectResolver   = g_gameBase + 0xA31F00;
-    g_addrContainerMarker   = g_gameBase + 0x5E215B0;
-    Log("ContainerWalker:    hardcoded base+0x35115C0");
-    Log("ChestRegistryLookup: hardcoded base+0x3511520");
-    Log("SubObjectResolver:  hardcoded base+0xA31F00");
-    Log("ContainerMarker:    hardcoded base+0x5E215B0");
+    g_addrContainerMarker   = g_gameBase + 0x5E57854;
+    Log("ContainerWalker:    hardcoded base+0x3540740 (1.06)");
+    Log("ChestRegistryLookup: DISABLED (not re-resolved for 1.06)");
+    Log("SubObjectResolver:  hardcoded base+0xA31F00 (unchanged in 1.06)");
+    Log("ContainerMarker:    hardcoded base+0x5E57854 (1.06)");
 
     if (!g_fnHandler && g_fnSetInventory) {
         // Old handler scan: CMP [RBX],0x15 + SetInventory CALL verify + backward search
@@ -4734,43 +4824,41 @@ static bool ResolveAddresses() {
             g_langByteAddr?(unsigned long long)(g_langByteAddr-g_gameBase):0);
     }
 
-    // Type-name resolver — verified for CD 1.05.00 (May 2026 patch).
-    // - 0x5E738C8: slot holding canonical "Housing_GatheredMaterials" string
-    //   (set by the namespace setup function FUN_1401698e0 via FUN_1403016b0)
-    // - 0xF07E700: function (char* name, short* outId) → returns 1 + writes id
-    //   to outId. Resolves namespace strings to their per-session 16-bit IDs
-    //   via the global hash table at DAT_145ef1dc0.
-    g_pHGMStringSlot    = g_gameBase + 0x5E738C8;
-    g_fnTypeNameLookup  = g_gameBase + 0xF07E700;
-    Log("HGM string slot: base+0x%llX", (unsigned long long)(g_pHGMStringSlot   - g_gameBase));
-    Log("Type resolver:   base+0x%llX", (unsigned long long)(g_fnTypeNameLookup - g_gameBase));
+    // 1.06.00 RE: type-name resolver chain.
+    //   HGM string slot @ base+0x5EA9B08 — holds wrapper pointer created by
+    //   FUN_14016a0f0 via FUN_140302e70("Housing_GatheredMaterials"). Use
+    //   exactly like the 1.05 slot: *slot → wrapper, *wrapper → char* string.
+    //   TypeNameLookup function: not yet re-located for 1.06. Mod relies on
+    //   INI fallback values for housing panel IDs in the meantime.
+    g_pHGMStringSlot    = g_gameBase + 0x5EA9B08;
+    g_fnTypeNameLookup  = 0;
+    Log("HGM string slot: hardcoded base+0x5EA9B08 (1.06)");
+    Log("Type resolver:   DISABLED (function not re-resolved; INI fallback used for housing chests)");
 
-    // === Weg G: container singleton-factory addresses ===
-    // v1.5.0 RVAs (verified via Ghidra static RE, May 2026):
-    //   FUN_14ab90710 — factory wrapper (alloc 0x918 + ctor FUN_14ae7f3c0)
-    //   vtable +0x4A4ACA0 — Camp-WH / Housing container vtable
-    //   FUN_14ae7f3c0 sets vftable__UIGamePlayControlCommonInfoDescription
-    // The other singleton-related slots (FactorySingletonVt, SingletonTypeIdSlot,
-    // SingletonGetter) have no verified v1.5.0 equivalents yet — left at 0 so the
-    // synthesized-owner / heap-scan fallback path is disabled. Only the captured-
-    // factory-args path is active (CaptureOnFactory must fire at least once per
-    // session, e.g. when player walks near any chest, before F-keys can use it).
-    g_addrContainerVtable     = g_gameBase + 0x4A4ACA0;
-    g_addrFactorySingletonVt  = 0;  // v1.5.0: not yet identified
-    g_addrSingletonTypeIdSlot = 0;  // v1.5.0: not yet identified
-    g_addrSingletonGetter     = 0;  // v1.5.0: not yet identified
-    g_addrFactoryWrapper      = g_gameBase + 0xAB90710;
-    // 1.05.0: real InventoryInfoManager singleton is at DAT_145ef1dc0
-    // (base+0x5EF1DC0), not base+0x5F0DA18. The wrong address caused every
-    // PatchInventoryInfoSlots call to throw SEH and the slot patch to never
-    // apply — leaving displayed slot counts at whatever the game default is.
-    // RE-confirmed from FUN_140A7AB30 (SetInventory) which dereferences
-    // DAT_145ef1dc0 + 0x60/0x70/0x78 for the channel-id hash table.
-    g_addrInventoryInfoMgrPtr = g_gameBase + 0x5EF1DC0;
-    g_addrItemDetailCtor      = g_gameBase + 0xB4D310;  // FUN_140b4d310: ItemDetailModal open handler (processes "ItemDetailModalMessage")
-    Log("Container vtable:    base+0x%llX", (unsigned long long)(g_addrContainerVtable    - g_gameBase));
-    Log("Factory wrapper:     base+0x%llX", (unsigned long long)(g_addrFactoryWrapper  - g_gameBase));
-    Log("Inventory mgr ptr:   base+0x%llX", (unsigned long long)(g_addrInventoryInfoMgrPtr - g_gameBase));
+    // === Weg G: container singleton-factory addresses (1.06.00 verified) ===
+    //   ContainerVtable @ base+0x4A76450 — vftable_UIGamePlayControlCommonInfoDescription
+    //     (auto-relearned by the mod itself when a chest is opened; this is the
+    //     starting value so the first open already has it).
+    //   FactoryWrapper @ base+0xA928BB0 — alloc 0x988 + ctor FUN_140c58af0.
+    //     Verified caller of the ctor that writes ContainerVtable[0] = vftable.
+    //   InventoryInfoMgrPtr @ base+0x5F28400 — DAT slot holding the singleton.
+    //     SetInventory @ 0xA82F70 reads from this exact address and dereferences
+    //     +0x60/+0x70/+0x78 for the channel-id hash table.
+    g_addrContainerVtable     = g_gameBase + 0x4A76450;
+    g_addrFactorySingletonVt  = 0;  // not yet identified for 1.06
+    g_addrSingletonTypeIdSlot = 0;  // not yet identified for 1.06
+    g_addrSingletonGetter     = 0;  // not yet identified for 1.06
+    g_addrFactoryWrapper      = g_gameBase + 0xA928BB0;
+    g_addrInventoryInfoMgrPtr = g_gameBase + 0x5F28400;
+    // 1.06.00 RE: ItemDetailModal open handler at FUN_140b55860 (verified
+    // via "ItemDetailModalMessage" string LEA xref at 0x140b55946 — the
+    // string itself is at 0x144a30f38). Previous candidate 0xB4D250 was
+    // a different function entirely and hooking it crashed the game.
+    g_addrItemDetailCtor      = g_gameBase + 0xB55860;
+    Log("Container vtable:    hardcoded base+0x4A76450 (1.06)");
+    Log("Factory wrapper:     hardcoded base+0xA928BB0 (1.06)");
+    Log("Inventory mgr ptr:   hardcoded base+0x5F28400 (1.06)");
+    Log("ItemDetailCtor:      hardcoded base+0xB55860 (1.06)");
 
     return g_fnHandler && g_fnModeSwitcher && g_fnCanShow && g_fnSetInventory && g_mainCharGlobalPtr;
 }
@@ -4792,15 +4880,24 @@ static DWORD WINAPI ModThread(LPVOID) {
         if (!g_vehHandle) Log("[HWBP] AddVectoredExceptionHandler FAILED (err=%lu)", GetLastError());
     }
 
-    Log("=== Private Storage Anywhere v1.4.4 ===");
+    Log("=== Private Storage Anywhere v1.5.0 (CD 1.06.00) ===");
     {char cls[256]={};char ttl[256]={};GetClassNameA(g_gameWindow,cls,256);GetWindowTextA(g_gameWindow,ttl,256);
     Log("Game window: class='%s' title='%s'",cls,ttl);}
     g_gameBase=(uintptr_t)GetModuleHandleA("CrimsonDesert.exe");
     if(!g_gameBase){Log("FATAL: no game base");return 0;}
     MODULEINFO mi;GetModuleInformation(GetCurrentProcess(),(HMODULE)g_gameBase,&mi,sizeof(mi));
     g_imageSize=mi.SizeOfImage;
-    Log("Base: 0x%llX  Size: 0x%X  Hotkey: 0x%02X",
+    Log("Base: 0x%llX  Size: 0x%X  LegacyHotkey: 0x%02X",
         (unsigned long long)g_gameBase, g_imageSize, g_hotkey);
+    for (int i = 0; i < PANEL_COUNT; i++) {
+        Log("  Panel[%d] %-12s: kb=0x%02X mod=0x%02X xi=0x%04X xiMod=0x%04X "
+            "psBtn=(off=%d,mask=0x%02X) psMod=(off=%d,mask=0x%02X)",
+            i, g_panels[i].name,
+            g_panels[i].hotkey, g_panels[i].modifier,
+            g_panels[i].controllerButton, g_panels[i].controllerModifier,
+            g_panels[i].psButtonByteOff, g_panels[i].psButtonBitMask,
+            g_panels[i].psModifierByteOff, g_panels[i].psModifierBitMask);
+    }
 
     // Hash meta/0.papgt to detect modded game files (JSON mods etc.)
     // Find game root by locating \bin64\ in the DLL path (works regardless of subdirectory depth)
@@ -4852,9 +4949,10 @@ static DWORD WINAPI ModThread(LPVOID) {
         }
     }
 
-    // Hook the ItemDetailModal open handler so ESC passes through to close
-    // the popup instead of closing the warehouse. Close-detection is via
-    // polling handler+0x258 (ModalDlgOff) inside IsNewModalDialogVisible.
+    // ItemDetailOpen hook — 1.06 target is FUN_140b55860 (verified via the
+    // "ItemDetailModalMessage" string LEA xref at +0xb55946). The hook
+    // increments g_itemDetailActiveCount so ESC/B/Circle close the popup
+    // first instead of closing the warehouse.
     if (g_addrItemDetailCtor) {
         if (!InstallHook(g_addrItemDetailCtor, (uintptr_t)&CaptureOnItemDetailCtor,
                          "ItemDetailOpen")) {
