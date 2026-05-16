@@ -139,6 +139,13 @@ Delete [b]PrivateStorageAnywhere.asi[/b] and [b]PrivateStorageAnywhere.ini[/b] f
 
 [size=3][b]Changelog[/b][/size]
 
+[b]v1.5.1[/b]
+[list]
+[*]Updated for game version [b]1.07.00[/b].
+[*]Fixed: Inventory slot expansion (10 → 1000) works again.
+[*]Hotkeys are now blocked while the Inventar / Map / Quest journal overlay is open (previously only the full pause menu blocked them).
+[/list]
+
 [b]v1.5.0[/b]
 [list]
 [*]Updated for game version [b]1.06.00[/b]. Every panel (Private Storage and all five housing chests) opens and closes without crashing.

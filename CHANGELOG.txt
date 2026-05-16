@@ -1,80 +1,14 @@
 Private Storage Anywhere — Changelog
 
-v1.5.0 (2026-05-11)
-- Updated for game version 1.06.00. Every panel — Private Storage and all
-  five housing chests — opens and closes without crashing.
-- New default keybindings: F4 Private, F5 Gatherables, F6 Dresser,
-  F7 Refrigerator, F8 Symbol, F9 Collecting. Controller defaults: Private
-  = LB + LeftStick (XInput) / L1 + L3 (DualSense); Gatherables = LB +
-  RightStick / L1 + R3. The other housing panels are keyboard-only by
-  default. Code defaults now match the shipped INI defaults exactly so a
-  user with a missing INI file gets identical bindings.
-- Boot log now lists per-panel keybindings so users can see exactly which
-  key/button each panel is wired to.
-- Housing chests (F5–F9) require visiting the chest's NPC at least once
-  per game session for items to display. Without a per-panel sticky the
-  mod opens the panel with an empty grid (no crash). Private Storage works
-  immediately from game start as before. The cause is that 1.06 changed
-  how the renderer reads chest data — the v1.05 "borrow Private's chest"
-  fallback now reads out-of-bounds and crashes, so it has been removed.
+v1.5.1 (2026-05-16)
+- Updated for game version 1.07.00.
+- Fixed: Inventory slot expansion (10 -> 1000) works again.
+- Added: Hotkeys are now blocked while the Inventar / Map / Quest journal
+  overlay is open (previously only the full pause menu blocked them).
 
-Detailed RE work for 1.06.00 (skip if you don't care about internals):
-- Re-resolved hardcoded RVAs via Ghidra:
-    Handler             dynamic via "ShowPackageCampMoneyList" string-xref
-    SetInventory        0xA7AB30 -> 0xA82F70 (extended prolog filter to
-                        accept `48 89 4C 24 08` in addition to `40 55`,
-                        plus an early-RET size guard to reject the
-                        adjacent SetChannels @ 0xA836E0)
-    WarehouseRefresh    0xA754E0 -> 0xA7D860 (call disabled in 1.06 —
-                        param_2 contract no longer matches the v1.05
-                        walker layout, SEH-faults every time)
-    ContainerWalker     0x35115C0 -> 0x3540740
-    ContainerMarker DAT 0x5E215B0 -> 0x5E57854
-    ItemDetailCtor      0xB4D310 -> 0xB55860 (FUN_140b55860, verified via
-                        the "ItemDetailModalMessage" string LEA xref at
-                        +0xb55946; previous 0xB4D250 candidate was wrong
-                        and crashed the game when hooked)
-    SubObjectResolver   unchanged at 0xA31F00
-    Container vtable    0x4A4ACA0 -> 0x4A76450
-    FactoryWrapper      0xAB90710 -> 0xA928BB0 (alloc 0x988 + ctor
-                        FUN_140c58af0 which writes the new vtable)
-    InventoryInfoMgrPtr 0x5EF1DC0 -> 0x5F28400 (singleton slot read by
-                        SetInventory @ 0xA82F70 for the channel-id hash
-                        table at +0x60/+0x70/+0x78)
-    HGM string slot     0x5E738C8 -> 0x5EA9B08
-    TypeNameLookup      function not re-located in 1.06; mod uses INI
-                        fallback GatherablesPanelValue=0x02D1
-- Bumped FindPrologBoundary to recognize the `66 89 ??` operand-size
-  prefix used by ItemDetailOpen and similar 16-bit-param spillers.
-- Disabled all of the 1.05 post-NPC memory-diff writes for housing
-  chests (handler+0x1D8 / +0x2A8 / +0x39C) and the grid-cache invalidate
-  at grid+0x568. These offsets reference different fields in 1.06 and
-  writing them crashed the renderer on first frame.
-- Disabled the "reuse Private's chest" fallback for housing chests in
-  1.06 — the 1.05 renderer treated handler+0x170 as an opaque reference
-  and pulled items via channel routing, but the 1.06 renderer reads
-  items directly from the bound container's per-slot arrays. Reusing
-  Private's chest with a housing channel-id now reads out-of-bounds
-  and crashes on the first non-empty slot. handler+0x170 is now NULL'd
-  when no per-panel sticky exists, which yields an empty grid instead.
-- Disabled the factory-create fallback for housing chests in 1.06. The
-  captured factory args come from whatever chest the player happened to
-  walk near, with no way to select a panel-typed ctrl (would need
-  TypeNameLookup). Calling the factory with random captures produces a
-  wrong-type container that the renderer reads as garbage and crashes.
-- IsNewModalDialogVisible: never clear g_itemDetailActiveCount when the
-  handler+0x258 modal slot looks stale. The two tracking sources (the
-  +0x258 pointer for quantity/confirm dialogs and the ItemDetailOpen
-  hook counter for "View Details" popups) are now fully independent.
-  This fixes ESC closing the warehouse instead of the popup when both
-  signals are active.
-- XInput per-panel button (e.g. LB + LeftStick for Private) now checks
-  for an active modal before force-closing the warehouse. Previously
-  pressing the close-combo while a quantity dialog or Details popup was
-  up would skip the modal-dismiss step and close the warehouse outright,
-  matching the existing behavior of the DualSense Circle path.
-- XInput hold-to-close (700 ms continuous hold of the close-combo) also
-  now respects the modal guard.
+v1.5.0 (2026-05-11)
+- Updated for game version 1.06.00.
+
 
 v1.4.4 (2026-05-08)
 - Fixed: B button (XInput) now closes Gatherables / Refrigerator / Dresser / Symbol / Collecting reliably. The mod's housing-panel patch wrote 0x00 to handler+0x200 (a leftover from the 1.0.4.x post-NPC memory diff), which put the game's input pipeline into a state where B-press events were consumed before reaching XInput's per-process state — so the mod's polling never saw the press. The +0x200 patch is now disabled; the value stays at 0x01 (Camp/normal input mode), and B-close works on every panel.

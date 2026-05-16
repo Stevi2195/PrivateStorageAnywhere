@@ -7,10 +7,21 @@
 #include <string>
 
 // ============================================================
-//  Private Storage Anywhere v1.5.0
+//  Private Storage Anywhere v1.5.1
 //
 //  Opens the Camp Warehouse (Private Storage) from anywhere
 //  with a hotkey (default F4) or controller button (default LB + LeftStick).
+//
+//  v1.5.1: ported to Crimson Desert 1.07.00 (May 2026 patch).
+//  Most v1.5.0 hardcoded RVAs still hit valid code/data and are
+//  reused as-is. The InventoryInfoMgr singleton slot DID drift
+//  (1.06=0x5F28400 → 1.07=0x5F2A340) and is now resolved
+//  dynamically by scanning SetInventory's body for the canonical
+//  load+deref pattern, so future shifts no longer require a
+//  manual update. Also: hotkeys are now blocked while a game-UI
+//  overlay (inventory / map / quest journal — sub-mode 0x0D) is
+//  open, matching the existing block for the full pause menu
+//  (sub-mode 0x0E).
 //
 //  v1.5.0: ported to Crimson Desert 1.06.00 (May 2026 patch).
 //  Re-resolved hardcoded RVAs via Ghidra:
@@ -2489,13 +2500,15 @@ static void TriggerWarehouse(int triggerKind = 0) {
         }
 
         uint8_t curSub = mc[g_offSubByte];
-        // Apr-23 safe sub-modes: 0x0D, 0x0F, 0x10, 0x11 (gameplay variants).
-        // 0x0E between 0x0D and 0x0F is "ingamemenu" — MUST NOT open from there.
-        // 0x11 added after user-log analysis showed legitimate gameplay state
-        // (slightly different player flags than 0x10) being blocked, leading
-        // to multiple failed open attempts when pressing the panel combo.
-        if (curSub != 0x0D && curSub != 0x0F &&
-            curSub != 0x10 && curSub != 0x11) {
+        // Safe sub-modes in 1.06 (Pearl Abyss tags from FUN_1406f5a70 switch):
+        //   0x0F = hud-info + hud-play + quickslot (regular gameplay)
+        //   0x10 = +interaction (NPC dialog approach)
+        //   0x11 = transient gameplay sub-state (kept from prior user-log analysis)
+        // Blocked: 0x04 photomode, 0x05 dialog/store, 0x06 cinema/cutscene,
+        //   0x07-0x0A minigame/QTE, 0x0B gimmick, 0x0C worldobserver,
+        //   0x0D mainmenu (game-UI overlay: inventory/map/quest journal),
+        //   0x0E ingamemenu (full pause menu).
+        if (curSub != 0x0F && curSub != 0x10 && curSub != 0x11) {
             Log("BLOCKED: unsafe state (sub=0x%02X)", curSub);
             return;
         }
@@ -3948,21 +3961,18 @@ static DWORD WINAPI InputThread(LPVOID) {
             }
         }
 
-        // Safe sub-mode whitelist (Apr-23 build):
-        //   0x0D = gameplay variant
-        //   0x0F = hud-info + hud-play + quickslot
-        //   0x10 = hud-info + hud-play + interaction + quickslot
-        //   0x11 = 0x10 + one extra flag (sprinting / crouching variant) —
-        //          observed in user logs as a state the player frequently
-        //          enters during normal play; opens were getting blocked
-        //          for several seconds at a time. 0x0E between 0x0D/0x0F is
-        //          still "ingamemenu" — MUST NOT open from there.
+        // Safe sub-mode whitelist (1.06):
+        //   0x0F = regular gameplay HUD
+        //   0x10 = +interaction (NPC dialog approach)
+        //   0x11 = transient gameplay variant
+        // All other sub-modes (including 0x0D game-UI overlay
+        // [inventory/map/quest journal] and 0x0E full pause menu) are blocked.
         uintptr_t mc = (uintptr_t)InterlockedCompareExchange64(&g_mainChar, 0, 0);
         LONG warehouseActive = InterlockedCompareExchange(&g_warehouseActive, 0, 0);
         bool inSafeState = true;
         if (mc && !warehouseActive) {
             uint8_t curSub = ((uint8_t*)mc)[g_offSubByte];
-            inSafeState = (curSub == 0x0D || curSub == 0x0F ||
+            inSafeState = (curSub == 0x0F ||
                            curSub == 0x10 || curSub == 0x11);
         }
 
@@ -4849,7 +4859,73 @@ static bool ResolveAddresses() {
     g_addrSingletonTypeIdSlot = 0;  // not yet identified for 1.06
     g_addrSingletonGetter     = 0;  // not yet identified for 1.06
     g_addrFactoryWrapper      = g_gameBase + 0xA928BB0;
-    g_addrInventoryInfoMgrPtr = g_gameBase + 0x5F28400;
+
+    // Dynamic resolver for the InventoryInfoMgr singleton slot — scan
+    // SetInventory's body for the canonical load+deref pattern:
+    //   [48|4C] 8B Y disp32        mov regX, [rip+disp32]   ← singleton slot
+    //                              (Y encodes dest reg: 05=rax, 0D=rcx,
+    //                               15=rdx, 1D=rbx, 25=rsp(no), 2D=rbp,
+    //                               35=rsi, 3D=rdi; 4C prefix extends to r8-r15)
+    //   ...                        (null-check / setup) ...
+    //   [48..4D] 8B Z [0x60|0x70|0x78]
+    //                              mov reg, [regX+0x60/+0x70/+0x78]
+    //                              (Z's rm bits must match regX's encoding,
+    //                               i.e. base reg of the deref is the same
+    //                               reg the singleton was loaded into)
+    // The +0x60/+0x70/+0x78 fields are the channel-id hash table on the
+    // manager struct (per the original RE notes). Hardcoded RVAs drift
+    // every game update (1.05=0x5EF1DC0, 1.06=0x5F28400, ...); this scan
+    // re-locates the slot from SetInventory itself, which is already
+    // resolved via the "ShowPackageCampMoneyList" string-xref.
+    // Compiler may target any of rax/rcx/rdx/rbx/rbp/rsi/rdi (1.06 used
+    // rax, post-1.06 update used rcx — hardcoded `48 8B 05` matcher missed it).
+    g_addrInventoryInfoMgrPtr = 0;
+    if (g_fnSetInventory) {
+        uint8_t* fn = (uint8_t*)g_fnSetInventory;
+        const int SCAN = 0x1000;   // SetInventory body is ~3 KB; cover full prologue + first half
+        for (int i = 0; i + 7 < SCAN && !g_addrInventoryInfoMgrPtr; i++) {
+            uint8_t rex = fn[i];
+            if (rex != 0x48 && rex != 0x4C) continue;
+            if (fn[i+1] != 0x8B) continue;
+            uint8_t mrmLoad = fn[i+2];
+            // RIP-relative: mod=00, rm=101 → (mrm & 0xC7) == 0x05
+            if ((mrmLoad & 0xC7) != 0x05) continue;
+            int loadDest = ((mrmLoad >> 3) & 0x07) | ((rex == 0x4C) ? 8 : 0);
+            int32_t disp = *(int32_t*)(fn + i + 3);
+            uintptr_t target = (uintptr_t)(fn + i + 7) + disp;
+            if (target < g_gameBase || target >= g_gameBase + g_imageSize) continue;
+            // Skip targets in the .text-style executable range; we want data slots.
+            // Heuristic: data slots are well past the typical code region (>0x3000000).
+            if (target - g_gameBase < 0x3000000) continue;
+            // Look ahead within next 96 bytes for a deref `[REX] 8B [mod=01,rm=loadDest] [0x60|0x70|0x78]`.
+            // REX prefix variants 48/49/4C/4D — bit 0 (REX.B) extends rm to r8-r15.
+            bool hasMatchingDeref = false;
+            for (int j = i + 7; j + 3 < i + 96 && j + 3 < SCAN; j++) {
+                uint8_t rd = fn[j];
+                bool isRex = (rd == 0x48 || rd == 0x49 || rd == 0x4C || rd == 0x4D);
+                if (!isRex || fn[j+1] != 0x8B) continue;
+                uint8_t mrm = fn[j+2];
+                if ((mrm & 0xC0) != 0x40) continue;
+                int rm = (mrm & 0x07) | ((rd & 0x01) ? 8 : 0);
+                if (rm != loadDest) continue;
+                uint8_t d8 = fn[j+3];
+                if (d8 == 0x60 || d8 == 0x70 || d8 == 0x78) {
+                    hasMatchingDeref = true;
+                    break;
+                }
+            }
+            if (hasMatchingDeref) {
+                g_addrInventoryInfoMgrPtr = target;
+                Log("Inventory mgr ptr:   OK base+0x%llX (SetInventory scan @ +0x%X, dest=r%d)",
+                    (unsigned long long)(target - g_gameBase), i, loadDest);
+            }
+        }
+    }
+    if (!g_addrInventoryInfoMgrPtr) {
+        g_addrInventoryInfoMgrPtr = g_gameBase + 0x5F28400;
+        Log("Inventory mgr ptr:   FALLBACK base+0x5F28400 (1.06 hardcoded, dynamic scan failed)");
+    }
+
     // 1.06.00 RE: ItemDetailModal open handler at FUN_140b55860 (verified
     // via "ItemDetailModalMessage" string LEA xref at 0x140b55946 — the
     // string itself is at 0x144a30f38). Previous candidate 0xB4D250 was
@@ -4857,7 +4933,6 @@ static bool ResolveAddresses() {
     g_addrItemDetailCtor      = g_gameBase + 0xB55860;
     Log("Container vtable:    hardcoded base+0x4A76450 (1.06)");
     Log("Factory wrapper:     hardcoded base+0xA928BB0 (1.06)");
-    Log("Inventory mgr ptr:   hardcoded base+0x5F28400 (1.06)");
     Log("ItemDetailCtor:      hardcoded base+0xB55860 (1.06)");
 
     return g_fnHandler && g_fnModeSwitcher && g_fnCanShow && g_fnSetInventory && g_mainCharGlobalPtr;
@@ -4880,7 +4955,7 @@ static DWORD WINAPI ModThread(LPVOID) {
         if (!g_vehHandle) Log("[HWBP] AddVectoredExceptionHandler FAILED (err=%lu)", GetLastError());
     }
 
-    Log("=== Private Storage Anywhere v1.5.0 (CD 1.06.00) ===");
+    Log("=== Private Storage Anywhere v1.5.1 (CD 1.07.00) ===");
     {char cls[256]={};char ttl[256]={};GetClassNameA(g_gameWindow,cls,256);GetWindowTextA(g_gameWindow,ttl,256);
     Log("Game window: class='%s' title='%s'",cls,ttl);}
     g_gameBase=(uintptr_t)GetModuleHandleA("CrimsonDesert.exe");
