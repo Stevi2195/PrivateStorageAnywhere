@@ -1,0 +1,96 @@
+Short per-version notes for the Nexus "Version notes" field (max 255 characters each).
+Copy the line(s) below the version number when uploading that file version.
+=======================================================================
+
+v1.5.10
+Fixes housing-chest capacity briefly showing 10 slots instead of 1000 right after a teleport or load (now re-applied the instant you open a box). Also hardens the mod against future game updates so storage hotkeys are less likely to break on a patch.
+
+v1.5.9
+Top header title shows the specific chest name again (fixes the v1.5.8 known limitation). The title is now derived from the game's own UI data at startup, so it survives future updates safely.
+
+v1.5.8
+Updated for game 1.13.00/1.13.01. Fixes the mod not loading at all (hotkeys dead) and housing-chest crashes after the update. Known limitation: the top header title stays generic (fixed in 1.5.9).
+
+v1.5.7
+Updated for game 1.12.00. Fixes storage panels not opening at all (hotkeys did nothing) after the update.
+
+v1.5.6
+Updated for game 1.10.01. Fixes vendor/bank/camp/cooking menus no longer appearing after using a mod storage (forced Alt+F4). Item category tabs now also show on hotkey-opened storages.
+
+v1.5.5
+Updated for game 1.10.00. Fixes hotkeys hiding the HUD without a warehouse panel appearing.
+
+v1.5.4
+Updated for game 1.09.00. Fixes crash on every warehouse open after the update.
+
+v1.5.3
+Fixes the hotkey opening the warehouse during loading screens and other non-gameplay states.
+
+v1.5.2
+Updated for game 1.08.00. Fixes the top title being stuck on "Camp Provision"; adds localized housing-chest titles in all 14 languages; removes code that triggered antivirus false positives.
+
+v1.5.1
+Updated for game 1.07.00. Inventory slot expansion works again; hotkeys are now blocked while the inventory/map/quest overlay is open.
+
+v1.5.0
+Updated for game 1.06.00. All five housing chests open and close without crashing; ESC no longer closes the warehouse while a quantity dialog or details popup is open.
+
+v1.4.4
+New default keys F4-F9 and controller combos (LB+LeftStick / LB+RightStick). Fixes the B button not reliably closing housing chests; all four controller slots are polled.
+
+v1.4.3
+Updated for game 1.05.1 hotfix.
+
+v1.4.2
+Adds a PS5/PS4 modifier button (e.g. L1+Triangle). ESC now closes the item details popup first instead of the storage.
+
+v1.4.1
+Per-chest Xbox and PS5/PS4 controller bindings, configurable in the INI.
+
+v1.4.0
+All five housing storage chests can now be opened from anywhere with their own hotkeys.
+
+v1.3.3
+Updated for game 1.0.4.1. Fixes ESC handling with dialogs, the wrong keyguide, and the warehouse opening during the ingame menu.
+
+v1.3.2
+Updated for game 1.0.3.1.
+
+v1.3.1
+Fixes the wrong keyguide after visiting a donation NPC and a first-open activation issue.
+
+v1.3.0
+Fixes random crashes after the 2026-04-11 game update; struct offsets are now resolved dynamically.
+
+v1.2.6
+Fixes the toggle closing the warehouse while a quantity/confirm dialog is open, and a phantom modal after visiting the camp NPC.
+
+v1.2.5
+Fixes the warehouse sometimes not opening after a game update (auto-capture could lock onto a wrong UI controller).
+
+v1.2.4
+Fixes auto-capture grabbing the wrong UI controller and a wrong modal dialog offset.
+
+v1.2.3
+Cursor is hidden immediately when closing the warehouse; update-proof CanShow detection.
+
+v1.2.2
+Compatible with the 2026-04-04 game update; the warehouse panel renders correctly again.
+
+v1.2.1
+ESC now closes the quantity dialog before closing the warehouse; exact game window detection.
+
+v1.2.0
+Localized warehouse titles (14 languages), native PS5/PS4 controller support, close deferred to button release to prevent dodge rolls.
+
+v1.1.2
+More robust warehouse detection (vtable-based) and safer hook installation.
+
+v1.1.1
+Mouse cursor shows automatically when opening the warehouse with the keyboard and hides again on close.
+
+v1.1
+Fixes store panel suppression, DLL unload, and B button close; function resolution now uses string cross-references.
+
+v1.0.0
+Initial release: open Private Storage from anywhere with F6.

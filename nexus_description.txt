@@ -20,7 +20,7 @@ Open your [b]Private Storage[/b] and all five [b]Housing Storage Chests[/b] (Gat
 [*]Each chest also supports optional XInput controller buttons + modifier and PS5/PS4 (DualSense/DualShock 4) buttons, all configurable in the INI.
 [*][b]ESC[/b] to close
 [*][b]Native UI:[/b] Uses the game's built-in warehouse interface — no custom overlay
-[*][b]Localized titles:[/b] Private Storage and Gatherables Chest titles automatically match your game language (14 languages supported); the four other housing chests use English titles
+[*][b]Localized titles:[/b] Every panel title (Private Storage, Gatherables, Dresser, Refrigerator, Symbol, Collecting) automatically matches your game language — all 14 supported languages (KR/EN/JP/RU/TR/ES/MX/FR/DE/IT/PL/BR/TW/CN)
 [*][b]Full interaction:[/b] Move items in and out of every chest, same as at the chest in person
 [*][b]Private Storage works immediately[/b] after game start, no NPC visit required. [b]Housing chests[/b] (Gatherables, Dresser, Refrigerator, Symbol, Collecting) need an NPC visit once per game session before the mod can display their contents.
 [*][b]Update-proof:[/b] Uses automatic pattern scanning, vtable matching, and runtime string cross-references to locate internal game functions instead of hardcoded offsets
@@ -138,6 +138,76 @@ Delete [b]PrivateStorageAnywhere.asi[/b] and [b]PrivateStorageAnywhere.ini[/b] f
 [line]
 
 [size=3][b]Changelog[/b][/size]
+
+[b]v1.5.10[/b]
+[list]
+[*][b]Fixed:[/b] A housing chest could briefly show its vanilla capacity ([b]10[/b] slots instead of [b]1000[/b]) when opened right after a teleport or loading a save. The game resets the slot count on those transitions and the mod only re-applied it on a background timer, so there was a short window where a chest opened at the old capacity. The expansion is now re-applied the instant you open a storage, so it is always at full capacity.
+[*][b]Update-safety:[/b] the mod now auto-detects the internal "warehouse mode" index that Pearl Abyss reshuffles on almost every patch. That value was previously hardcoded and had to be re-found by hand after each update — a wrong value silently killed all storage hotkeys. It is now derived from the game's own code at startup and cross-checked, so this class of breakage should no longer happen on a routine patch.
+[*][b]Hardening:[/b] two internal writes that relied on fixed struct offsets are now self-validating — if a future update moves the field, the mod skips the write and degrades gracefully instead of risking a delayed crash.
+[*]No changes to features, keybindings, or on-screen behaviour.
+[/list]
+
+[b]v1.5.9[/b]
+[list]
+[*]Fixed: The [b]top header title[/b] shows the specific chest name again (Private Storage, Gatherables, Dresser, Refrigerator, Symbol, Collecting) — the known limitation of v1.5.8 is resolved. The 1.13 update had not removed the internal title hook after all: it recompiled the title function (so the mod no longer recognized it) and moved the title element inside the warehouse controller. The mod now derives both from the game's own UI binding data at startup, with a built-in cross-check that cleanly disables the title override if a future update changes the layout again — worst case is a generic title, never a crash.
+[/list]
+
+[b]v1.5.8[/b]
+[list]
+[*]Updated for game versions [b]1.13.00[/b] and [b]1.13.01[/b].
+[*]Fixed: The mod stopped loading after these updates (hotkeys did nothing). The game reorganized its executable and moved the internal object the mod uses to reach the player state. The mod now re-locates it automatically on every build — it even survived a second game update the same week without a rebuild.
+[*]Known limitation on these builds: the warehouse's top header title is generic instead of showing the specific chest name (the game removed the internal hook the mod used for this). Contents, items and the category tabs are unaffected.
+[/list]
+
+[b]v1.5.7[/b]
+[list]
+[*]Updated for game version [b]1.12.00[/b].
+[*]Fixed: Storage panels did not open at all after the 1.12.00 update — the hotkeys did nothing. The update moved internal game addresses and re-flipped the game-state value that the mod uses to open the warehouse view. The mod now derives the relevant game object dynamically (so it survives future updates without a rebuild) and uses the correct 1.12.00 state value. All other internal functions had already re-located themselves automatically.
+[/list]
+
+[b]v1.5.6[/b]
+[list]
+[*]Updated for game version [b]1.10.01[/b].
+[*]Fixed: After opening any storage via the mod, [b]store-type menus stopped appearing[/b] — vendor buy/sell, camp provisions, bank, mission dispatch and cooking-result screens opened the NPC interaction (camera zoomed in) but showed no UI, forcing Alt+F4. Two related leftovers from the 1.5.5 view-mount caused this: the game's internal menu-layer state stayed flagged "open" after closing a storage (the game's own menu opens only fire when that flag [i]changes[/i], so later requests were silently swallowed), and the menu-layer request byte was never returned to its idle value, which kept the player permanently flagged as "in a cinematic" — the cinematic mode shadowed the store mode, which is why the camera zoom still played but no menu ever mounted. The mod now parks the menu-layer in exactly the state the game itself uses when idle, on every close path.
+[*]Fixed: Pressing a storage hotkey while a game menu was still closing (e.g. immediately after leaving a shop, or after skipping the cooking animation) created an invisible "ghost" session that blocked all other UI until restart. The open is now aborted cleanly in that situation — press the hotkey again a moment later and it works normally.
+[*]Fixed: The HUD interaction prompt could stay hidden after using mod storages (same root cause as above).
+[*]New: The [b]item category tabs[/b] (bag / armor / weapon / food / scroll / gem icons above the grid) now appear on hotkey-opened storages — they previously only showed when opening a storage at its NPC. The mod now asks the game to build the category bar through its own inventory path, so it works the same as a normal warehouse open. Item display is unchanged.
+[*]Internal: removed a broken event-queue call that silently failed on every storage open since 1.5.5.
+[/list]
+
+[b]v1.5.5[/b]
+[list]
+[*]Updated for game version [b]1.10.00[/b].
+[*]Fixed: F-key hotkeys hid the HUD but no warehouse panel appeared after the 1.10 update. Pearl Abyss shifted the sub-mode enum: the mod's "open warehouse" mode-flag pattern derived [i]sub-mode 5[/i] (alert/cinema) instead of [i]sub-mode 6[/i] (dialog/store). The warehouse HTML view is only mounted by the panel-manager when the current mode-tag list contains "store", so the panel stayed unmounted and invisible. The mod now sets the subtype flag at index 6, which makes the game's tick-based mode resolver derive sub-mode 6 on the next frame, the panel-manager mounts the warehouse view, and the panel renders normally.
+[/list]
+
+[b]v1.5.4[/b]
+[list]
+[*]Updated for game version [b]1.09.00[/b].
+[*]Fixed: Game CTD on every warehouse open after the 1.09 update.
+[/list]
+
+[b]v1.5.3[/b]
+[list]
+[*]Fixed: Hotkey could open the warehouse during the [b]loading screen[/b] (and other non-gameplay states). The safe-state check only inspected the sub-mode byte, which still carried a stale value from the previous gameplay frame while the game-mode byte had already moved to "loading". The check now requires BOTH bytes to match the in-game running state. Game-state enum values were verified by Ghidra decompile of the game's debug state-name builder.
+[*]Fixed: removed the stale "0x11 = transient gameplay" entry from the safe-state whitelist — that sub-mode value is undefined in 1.08, so treating it as safe could let unexpected states through.
+[/list]
+
+[b]v1.5.2[/b]
+[list]
+[*]Updated for game version [b]1.08.00[/b].
+[*]Fixed: Top title at the warehouse window was stuck on the game's default "Camp Provision" / "UI_WareHouse_Title" text for every panel — in 1.08 the warehouse handler stopped writing the top title via SetTitle, so the mod's static resolver couldn't find the node. The top-title node was traced via a runtime SetTitle hook during a natural NPC-warehouse open; it now lives at handler+0xE8 and switches per panel like the bottom label.
+[*]Fixed: Resolver false-positive that accepted [RSP+disp32] stack offsets as if they were handler-relative loads. Now requires the source base register of the MOV to match the register the (known-good) BottomLabel MOV uses, and skips SIB encodings. Prevented silent corruption from writing to wrong handler slots.
+[*]Added: Per-language titles for the four housing panels — [b]Dresser[/b], [b]Refrigerator[/b], [b]Symbol Storage[/b], [b]Collecting Storage[/b] — in all 14 game languages. Previously these always showed English text regardless of game language. The two storage chests with native game-localized titles (Private Storage, Gatherables Chest) were already localized in earlier versions.
+[*]Improved: Drift-resistance for future game updates.
+[list]
+[*]HGM string slot resolved dynamically via the "Housing_GatheredMaterials" string-xref (LEA+MOV-RIP pattern) instead of a 1.06 hardcoded RVA.
+[*]Container vtable starts unset and is filled via auto-relearn, now requiring 5 consecutive sightings of the same vtable pointer before adopting it. Prevents the previous single-frame stale adoption that could crash on later SetInventory.
+[*]Cleared all remaining 1.06 hardcoded RVAs (WarehouseRefresh / ContainerWalker / SubObjectResolver / ContainerMarker) — these were inside disabled call paths since 1.06 and would silently drift on future patches.
+[*]One-shot prolog sanity check at the first FilterRender call — if the bytes don't look like a function prolog, the log emits a clear WARN instead of jumping into wrong code.
+[/list]
+[*]Cleanup: ~560 lines (~10% of the source) of dead diagnostic code removed. The most impactful removal was an unused hardware-breakpoint subsystem (Vectored-Exception-Handler + per-thread DR0/DR7 register manipulation via Toolhelp thread enumeration). It was never actually armed at runtime, but the API combination matches anti-debug / process-injection patterns that antivirus heuristics and Chrome SafeBrowsing flag as suspicious. Also removed: five unused filter-hook diagnostic capture functions, the SetTitle diagnostic hook used to find the top-title node, a per-Handler-call packet-byte dump, a dead BindRefresh fallback chain, and RTTI heap-scan helpers.
+[/list]
 
 [b]v1.5.1[/b]
 [list]

@@ -20,6 +20,7 @@ src/imgui/
 
 # Old backups / notes
 *.bak
+backup/
 
 # Local build scripts
 compile.bat
