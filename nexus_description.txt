@@ -6,7 +6,7 @@ Open your [b]Private Storage[/b] and all five [b]Housing Storage Chests[/b] (Gat
 
 [line]
 
-[b]Final version.[/b] v1.6.0 for game version [b]2.02.00[/b] is the last update; the mod is no longer maintained. The complete source code is public on [url=https://github.com/Stevi2195/PrivateStorageAnywhere]https://github.com/Stevi2195/PrivateStorageAnywhere[/url] — MIT-licensed, so anyone is welcome to pick it up and continue it.
+[b]Final version.[/b] v1.6.0 for game version [b]2.02.00[/b] is the last update; the mod is no longer maintained. The complete source code is public on [url=https://github.com/Stevi2195/PrivateStorageAnywhere]https://github.com/Stevi2195/PrivateStorageAnywhere[/url] — anyone is welcome to pick it up and continue it.
 
 [line]
 
