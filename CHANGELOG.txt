@@ -1,5 +1,33 @@
 Private Storage Anywhere — Changelog
 
+v1.6.0 (2026-09-11)
+- Updated for game version 2.02.00 (covers the September "Enhanced" update 2.01.00 as well). Fixes
+  the mod not loading and every storage hotkey doing nothing after the
+  update: the storage is now opened through the game's own menu-request
+  call (the previous mode-switch approach no longer exists in 2.01), and
+  the warehouse screen id is derived from the game code at startup.
+- Fixed: the correct chest opens for every hotkey again, and the chest
+  name in the header shows again (since 2.01 the title element is
+  registered by two UI controls; the mod now follows the one that is
+  actually bound instead of the first one it finds).
+- Fixed: the Dresser kept showing 10 slots while the other chests had 1000.
+  Root cause: the game indexes its inventory table by position, not by the
+  id stored in the data file (they differ by one). Every earlier version
+  therefore raised the wrong five records (Refrigerator, Symbol, Collecting,
+  Gathered Materials and an internal BirdFeed inventory) and never the
+  Dresser. The five housing chests are now resolved through the game's own
+  index table and verified by name.
+- Changed: the housing-chest capacity is raised once at startup and
+  re-checked when a storage opens. The mod no longer rewrites game memory
+  on a background timer every few seconds.
+- Removed: the TraceMode option and the diagnostic code left over from
+  earlier game versions (memory diffs, heap scans, container tracking).
+  The mod is about half its previous size and touches less game state.
+- New: INI key InvDumpKey (default F10, needs DebugLog=1) writes the live
+  capacity of every storage to the log for troubleshooting. Read-only.
+- All pointer chains are self-validating and skip cleanly if a future
+  update moves them. The camp warehouse is never modified.
+
 v1.5.10 (2026-07-08)
 - Fixed: A housing chest could briefly show its vanilla capacity (10 slots
   instead of 1000) when opened right after a teleport or loading a save.

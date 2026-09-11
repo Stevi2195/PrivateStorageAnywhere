@@ -1,6 +1,5 @@
 #include <windows.h>
 #include <psapi.h>
-#include <intrin.h>
 #include <cstdio>
 #include <cstring>
 #include <string>
@@ -24,15 +23,6 @@ static HMODULE g_hModule = nullptr;
 static HWND g_gameWindow = nullptr;
 static WNDPROC g_originalWndProc = nullptr;
 static bool g_enabled = true, g_debugLog = true;
-// Trace mode: when 1 in INI, installs additional hooks on warehouse Init
-// (vtable[1] = base+0xAA39E0), Show (vtable[51] = base+0xA9F4E0), and
-// the panel-descriptor show primitive (base+0x346A3E0). Every call to
-// any of these — plus every Handler call — logs a full warehouse state
-// snapshot (+0x218, +0x2CD, +0x120, descriptor+0x269, descriptor+0x26A).
-// Used to capture the exact call sequence the game runs during natural
-// NPC warehouse-open in CD 1.10, so we can replicate it from the mod.
-// MUST be 0 in normal use (very noisy log + 4 extra hooks).
-static bool g_traceMode = false;
 // Legacy "single hotkey" global. Kept for backwards compatibility with old
 // INIs that used `Hotkey=...` instead of per-panel <Name>Hotkey keys.
 // LoadConfig() overrides this with the INI value (default 0 = disabled).
@@ -47,8 +37,6 @@ static char g_iniPath[MAX_PATH] = {};
 static uintptr_t g_fnHandler = 0;
 static uintptr_t g_fnModeSwitcher = 0, g_fnCanShow = 0, g_fnSetInventory = 0;
 static uintptr_t g_fnSetTitle = 0;
-static uintptr_t g_fnSetTitleDirect = 0;  // FUN_1434159c0: UTF-8 aware wchar text setter (bypasses bridge check)
-static uintptr_t g_fnSetCursorVisible = 0;  // QOL: hides cursor immediately on warehouse close
 static uintptr_t g_warehouseVtableEntry = 0;  // vtable address containing handler — used for auto-capture verification
 static uintptr_t g_warehouseVtableStart = 0;  // vtable start of warehouse class — set on first successful capture
 static uint32_t  g_modalDialogOff = 0;     // handler+N: move-quantity dialog pointer
@@ -56,84 +44,78 @@ static bool      g_modalOffValid  = true;  // set false once the slot at +g_moda
                                            // modal-dialog pointer (handler-struct drift guard; disables modal tracking)
 static uintptr_t g_langByteAddr = 0;      // address of language byte (resolved dynamically from Steam API init function)
 
-// ItemDetailModal ("View Details" popup) tracking. The legacy 1.0.4.x ctor
-// (base+0xC316D0) and dtor (base+0xB90360) addresses moved in 1.0.5.0; the
-// canonical entry is now the open-handler FUN_140B4D310 (base+0xB4D310),
-// found via the "ItemDetailModalMessage" string xref. We hook entry to
-// increment the active count, then poll handler+0x258 (ModalDlgOff) for
-// dismissal — when childCount goes to 0 the count is cleared. This avoids
-// having to chase a dtor address that drifts every patch.
+// ItemDetailModal ("View Details" popup) tracking. The popup's open handler is
+// found via the "ItemDetailModalMessage" string xref and hooked to raise the
+// active flag; ESC/B/Circle clear it again when they dismiss the popup.
 static volatile LONG g_itemDetailActiveCount = 0;
 static uintptr_t g_addrItemDetailCtor = 0;
 
-// Struct offsets — all resolved dynamically from game code at runtime (update-proof).
-// Defaults match the build in which each offset was first discovered; they serve as
-// a sane fallback if the dynamic resolver fails.  DO NOT use the default values
-// directly in code — always go through these variables.
-static uint32_t g_offActiveFlag   = 0x118;  // handler+N: u8 active flag (read by CanShow)
-static uint32_t g_offPanelValue   = 0x110;  // handler+N: panel value (set by base-class 0x0e)
-static uint32_t g_offBottomLabel  = 0x308;  // handler+N: cpp-ware-house-inventory-title node
-static uint32_t g_offTopTitle     = 0x0E8;  // handler+N: top title text node (NpcInteractionTitle). Resolved via the
-                                            // "selector-title-subtext-stage" binding chain (1.13.01: 0xF0); forced
-                                            // to 0 (=write disabled) when the chain can't be cross-validated.
-static uint32_t g_offSubObject    = 0x08;   // handler+N: ptr to sub-object (contains panelId)
-static uint32_t g_offSubPanelId   = 0x92;   // subObject+N: u16 panelId
-static uint32_t g_offModeByte     = 0xCA8;  // mainChar+N: u8 current mode
-static uint32_t g_offSubByte      = 0xCA9;  // mainChar+N: u8 current sub-mode
-static uint32_t g_offModeFlags    = 0xCB1;  // mainChar+N: mode flag array (7 bytes)
-static uint32_t g_offSubtypes     = 0xCB8;  // mainChar+N: subtype array (15 bytes; matches g_savedSubtypes[15])
-static uint32_t g_storeSubIndex   = 5;      // subtype index whose derived sub-mode emits the "store" view-tag.
-                                            // VERSION-SPECIFIC (flips between updates): 1.09=5, 1.10=6, 1.12.00=5.
-                                            // Re-find: decompile ModeSwitcher (base+0x721BD0 on 1.12.00),
-                                            // read switch(sub), pick the case that appends the "store" string.
+// Struct offsets. Everything below is resolved from the game code at startup;
+// the initial values are only the layout of the build each one was first seen
+// on and must never be used directly. A resolver that fails leaves the feature
+// disabled rather than writing through a stale offset.
+static uint32_t g_offActiveFlag   = 0x118;  // handler+N: u8 active flag, read by CanShow (2.01.00: 0x130)
+static uint32_t g_offPanelValue   = 0x110;  // handler+N: panel value; moves with the active flag (2.01.00: 0x128)
+static uint32_t g_offBottomLabel  = 0x308;  // handler+N: lower inventory label node (2.01.00: 0x3E0)
+static uint32_t g_offTopTitle     = 0x0E8;  // handler+N: top title node, from the
+                                            // "selector-title-subtext-stage" binding (2.01.00: 0xF0);
+                                            // 0 = write disabled (chain could not be cross-validated)
 static uint32_t g_offDonationState = 0x330; // handler+N: first of 3 donation faction shorts (cleared on open)
-static uintptr_t g_fnSetDonationFaction = 0; // handler for "SetDonationFaction" command — scanned for donation-state offset
-// 0x15 "prepare" sub-object offsets — game's 0x15 dispatcher does 3 virtual calls on these.
-// Must be validated non-null before sending an empty 0x15, otherwise the dispatcher crashes
-// (sub-objects are only initialized after NPC interaction).  Resolved dynamically from the
-// Handler body (scan for 3 consecutive `MOV RCX,[param_1+disp32]; MOV RAX,[RCX]; CALL [RAX+imm]`).
-// Defaults match the pre-Apr-11 game layout; the Apr-23 layout is 0x2e8/0x2f8/0x320.
+static uintptr_t g_fnSetDonationFaction = 0; // "SetDonationFaction" command handler, scanned for the offset above
+// Sub-objects the handler's 0x15 ("prepare") command makes three virtual calls
+// on. All three must be non-null before an empty 0x15 is sent, otherwise the
+// dispatcher crashes (they are only initialised after an NPC interaction).
+// Resolved from the Handler body: three consecutive
+// `MOV RCX,[param_1+disp32]; MOV RAX,[RCX]; CALL [RAX+imm]` (2.01.00: 0x3A0/0x3B0/0x3D8).
 static uint32_t g_offPrepare1 = 0x2c8;
 static uint32_t g_offPrepare2 = 0x2d8;
 static uint32_t g_offPrepare3 = 0x300;
-static uintptr_t g_mainCharGlobalPtr = 0;   // address of global singleton pointer; mainChar = *(*(globalPtr) + 0x48)
+// Game-manager singleton slot; mainChar = *(*(slot) + 0x48). Resolved as the
+// global that is by far most often loaded and then dereferenced at +0x48
+// (2.01.00: base+0x6C29C70, 247 sites vs 22 for the runner-up). mainChar only
+// serves as a "session is loaded" gate and as the neighbourhood for the
+// session-global fallback scan in ResolveInvContainer().
+static uintptr_t g_mainCharGlobalPtr = 0;
+
+// ---- CD 2.01.00 menu-request API -------------------------------------------
+// The mode/sub-mode cluster left mainChar in 2.01.00, which killed the old
+// "write the flag bytes and let the tick derive the view tags" approach. The
+// replacement is the game's own request queue:
+//
+//     MenuRequest(menuObj, screenId, open)
+//
+// It allocates a small request record, stores screenId at +8 and the open flag
+// at +9, and pushes it onto the queue at menuObj+0x68. Call sites prove the
+// signature: the same screenId appears once with open=1 and once with open=0
+// (screen 3 and screen 7 both do). The warehouse needs the screen whose
+// ModeSwitcher case emits the "store" view tag — WareHouseView is declared in
+// uigameconfig2.xml as tag2="store ingamemenu", so that tag is what mounts it.
+static uintptr_t g_menuRequestFn  = 0;
+static uintptr_t g_menuRootGlobal = 0;   // menuObj = *( *(global) + g_menuObjOff )
+static uint32_t  g_menuObjOff     = 0;
+static int32_t   g_storeScreenId  = -1;  // derived from ModeSwitcher; -1 = unknown
+static int32_t   g_storeScreenIdIni = -1; // INI override, -1 = use the derived value
 
 // Captured game state (accessed from multiple threads via Interlocked ops)
 static volatile LONG64 g_mainChar = 0;
-// Single handler slot. The Gatherables Chest uses the SAME UIGamePlayControlRootWarehouse2
-// controller (same panelId 0x0058, same vtable) as Private Storage — they differ only in
-// which SetInventory filter string is passed when opening. So we track one handler and
-// switch inventories by re-calling SetInventory with the other string.
+// Single handler slot. All six storages use the same UIGamePlayControlRootWarehouse2
+// controller; they differ only in the SetInventory filter string passed on open.
 static volatile LONG64 g_handlerThis = 0;
-// Save+restore for handler+0x110 (in 1.06 = PanelValue scalar; in 1.08 layout
-// changed — may be a pointer slot, zeroing it crashes the natural NPC-open
-// path that follows our mod's close). Captured at first F-key open, restored
-// on close. -1 = not yet captured.
+// Original content of handler+g_offPanelValue, captured at the first open and
+// restored on close. -1 = not yet captured.
 static volatile LONG64 g_savedPanelValueSlot = -1;
 // false once the captured PanelValue slot holds a canonical pointer instead of a
 // small type-id scalar — i.e. handler+g_offPanelValue has drifted to a different
 // field. Then the override/restore writes are skipped so we never clobber a live
 // pointer with a valid-but-wrong write (which SEH cannot catch).
 static bool g_panelValueSlotValid = true;
-static volatile LONG64 g_cursorObj = 0;
 static volatile LONG g_warehouseActive = 0;
-
-// CD 1.10 capture-and-replay groundwork (capture phase only for now).
-// The warehouse VIEW only mounts when the menu-manager's "interaction target"
-// (menuMgr+0x10C8) is set — which the game does only during a real warehouse
-// interaction. We can't synthesise a valid target (guessing crashes), so we
-// CAPTURE the real one the game produces during a natural open, validate it,
-// and (later) replay it on hotkey. menuMgr = *(*(g_mainCharGlobalPtr)+0x90).
-static volatile LONG64 g_capturedMenuTarget = 0;  // last non-null menuMgr+0x10C8 seen
-static volatile LONG64 g_capturedMenuTargetVt = 0; // its vtable (for identity/validation)
 static volatile LONG g_handlerHitCount = 0;
-static volatile LONG g_canShowSeen118 = 0;  // set to 1 once +0x118 has been seen as 1
-static volatile LONG g_canShowZeroCount = 0; // consecutive frames where +0x118==0 (de-bounce close detection)
 
-// Active panel selector. F6 opens PRIVATE; F7/F8/F9/F12/Num0 open the housing
-// chests directly. Each press is a fresh open from cold.
+// Active panel selector. Every hotkey opens its own panel from cold; pressing
+// any panel hotkey while the warehouse is open closes it.
 enum ActivePanel {
-    PANEL_PRIVATE      = 0,  // CampWareHouse (Private Storage, ~640 slots)
+    PANEL_PRIVATE      = 0,  // CampWareHouse (Private Storage, capacity never touched)
     PANEL_GATHERABLES  = 1,  // Housing_GatheredMaterials (Gatherables Chest)
     PANEL_DRESSER      = 2,  // Housing_Dresser
     PANEL_REFRIGERATOR = 3,  // Housing_Refrigerator
@@ -157,30 +139,21 @@ struct PanelDef {
     BYTE        psButtonBitMask;     // PS5/PS4 HID: bit mask within that byte
     int         psModifierByteOff;   // PS5/PS4 HID modifier byte offset; -1 = no modifier
     BYTE        psModifierBitMask;   // PS5/PS4 HID modifier bit mask
-    int         tabIndex;            // handler+0x1E0 value for this panel (-1 = don't write)
 };
-// tabIndex = handler+0x1E0 value to write before SetInventory. The slot-grid
-// renderer (FUN_140A78690 @ base+0xA78690) reads sub[handler+0x1E0]+0x218 to
-// pick which channel feeds items. With a 2-token initString
-// ("Character;ChannelX"), ChannelX always lands in sub[1] — so tabIndex=1 for
-// every chest panel. Private is left at -1 (don't write) because the keyboard
-// hotkey already works with the game's natural state and we don't want to
-// disturb that.
 // Code defaults match the shipped INI defaults. Fields per row:
 //   name, initString, hotkey, modifier, xiButton, xiModifier,
-//   psButtonByteOff, psButtonBitMask, psModifierByteOff, psModifierBitMask,
-//   tabIndex
+//   psButtonByteOff, psButtonBitMask, psModifierByteOff, psModifierBitMask
 // Keyboard defaults: F4..F9 (one per panel). Controller defaults: only
 // Private + Gatherables get controller bindings; the other housing chests
 // are keyboard-only (rows of 0/-1). PS5/PS4 mirrors the controller layout:
 // L1+L3 → Private, L1+R3 → Gatherables.
 static PanelDef g_panels[PANEL_COUNT] = {
-    { "Private",      "Character,Focus,True;CampWareHouse,Focus,True",              0x73 /*F4*/,  0, 0x0040 /*LStick*/, 0x0100 /*LB*/, 1, 0x40 /*L3*/, 1, 0x01 /*L1*/, -1 },
-    { "Gatherables",  "Character,Focus,True;Housing_GatheredMaterials,Focus,True",  0x74 /*F5*/,  0, 0x0080 /*RStick*/, 0x0100 /*LB*/, 1, 0x80 /*R3*/, 1, 0x01 /*L1*/,  1 },
-    { "Dresser",      "Character,Focus,True;Housing_Dresser,Focus,True",            0x75 /*F6*/,  0, 0, 0, -1, 0, -1, 0,  1 },
-    { "Refrigerator", "Character,Focus,True;Housing_Refrigerator,Focus,True",       0x76 /*F7*/,  0, 0, 0, -1, 0, -1, 0,  1 },
-    { "Symbol",       "Character,Focus,True;Housing_Symbol,Focus,True",             0x77 /*F8*/,  0, 0, 0, -1, 0, -1, 0,  1 },
-    { "Collecting",   "Character,Focus,True;Housing_Collecting,Focus,True",         0x78 /*F9*/,  0, 0, 0, -1, 0, -1, 0,  1 },
+    { "Private",      "Character,Focus,True;CampWareHouse,Focus,True",              0x73 /*F4*/,  0, 0x0040 /*LStick*/, 0x0100 /*LB*/, 1, 0x40 /*L3*/, 1, 0x01 /*L1*/ },
+    { "Gatherables",  "Character,Focus,True;Housing_GatheredMaterials,Focus,True",  0x74 /*F5*/,  0, 0x0080 /*RStick*/, 0x0100 /*LB*/, 1, 0x80 /*R3*/, 1, 0x01 /*L1*/ },
+    { "Dresser",      "Character,Focus,True;Housing_Dresser,Focus,True",            0x75 /*F6*/,  0, 0, 0, -1, 0, -1, 0 },
+    { "Refrigerator", "Character,Focus,True;Housing_Refrigerator,Focus,True",       0x76 /*F7*/,  0, 0, 0, -1, 0, -1, 0 },
+    { "Symbol",       "Character,Focus,True;Housing_Symbol,Focus,True",             0x77 /*F8*/,  0, 0, 0, -1, 0, -1, 0 },
+    { "Collecting",   "Character,Focus,True;Housing_Collecting,Focus,True",         0x78 /*F9*/,  0, 0, 0, -1, 0, -1, 0 },
 };
 // Per-panel last/current state for PS button edge detection (parallel to g_panels[]).
 static bool g_panelPsLastDown[PANEL_COUNT] = {};
@@ -195,119 +168,33 @@ static bool g_panelXiLastDown[PANEL_COUNT] = {};
 // XInput B-button last-down state (parallel to g_circleWasDown for DualSense Circle).
 static bool g_xiBWasDown = false;
 
-// Per-panel panelValue (handler+0x110). The game sets this from a type-0x05 sub-command
-// in the 0x0e-show packet (parsed as uint64 from string via strtoull). Our 0x0e packet
-// has no sub-commands, so panelValue stays at 0 and the container isn't bound.
-// Workaround: after the 0x0e call, write panelValue manually for the active panel.
-// For Gatherables we look up the per-session ID via the global Inventory-Type
-// hash-map at runtime (see LookupInventoryTypeId).
+// PanelValue written to handler+g_offPanelValue on every open. The game parses
+// it from a sub-command of its own 0x0E show packet; the mod's packet has none,
+// so the value is written by hand. All six storages open correctly with the
+// shipped defaults (Private 0x276, everything else 0x2D1) — the per-chest INI
+// keys exist only as an override should a future build change the value space.
+static volatile LONG g_panelValueCfg[PANEL_COUNT] = {};
 static volatile LONG g_privatePanelValueCfg     = 0;       // 0 = no override
 static volatile LONG g_gatherablesPanelValueCfg = 0;       // 0 = use runtime lookup
 
-// Resolved addresses (Weg F).
-// DAT_145e8f768 holds a POINTER to the canonical "Housing_GatheredMaterials" string.
-// FUN_14ee1ecd0 takes a string pointer and writes a 16-bit panel-ID into out param 2.
-// Internally it walks a global lookup table populated at game-init.
-static uintptr_t g_pHGMStringSlot = 0;       // Address of the slot holding the string pointer
-static uintptr_t g_fnTypeNameLookup = 0;     // Address of the lookup function
-
-// Cached panel-id resolved via hash-map lookup once per session.
-static volatile LONG g_resolvedGatherablesId = 0;  // 0 = not resolved yet, -1 = lookup failed
-
-// Container vtable for the panel-bound object at handler+0x170. Starts at 0
-// and is auto-relearned at runtime by the sticky observer (5 consecutive
-// sightings of the same vtable pointer → adopted as canonical). Used to
-// validate sticky-restore candidates so we don't write a stale heap pointer.
-static uintptr_t g_addrContainerVtable      = 0;
-
-// InventoryInfoManager singleton ptr-of-ptr. Layout (verified via Ghidra
-// FUN_1404e9780 — GetInventoryInfo by InventoryKey):
-//   *(mgr + 0x08) = uint32 count
-//   *(mgr + 0x50) = InventoryInfo*[] (8 bytes per entry, indexed by key)
-// InventoryInfo + 0x48 = ushort base slot count (default 10 for housing,
-// 640 for CampWareHouse). FUN_1404de7c0 reads it as the "max slots" base
-// before adding character expansions. Patching this at runtime updates
-// every consumer (UI, item put-in, etc).
-static uintptr_t g_addrInventoryInfoMgrPtr  = 0;  // resolved dynamically via SetInventory scan (drift-resistant)
-
-// Per-panel sticky-binding state. When a warehouse panel is active and the
-// game has written a valid container pointer into handler+0x170, we save it
-// indexed by the currently-active panel. On a later open/switch to that
-// panel we restore the saved pointer (after validating its vtable). Without
-// per-panel storage, all housing panels would share Gatherables's container
-// and show the wrong items.
-static volatile LONG64 g_panelStickyContainer[PANEL_COUNT] = {};
-// Marks "mod owns this sticky for the current session" — set when mod writes
-// a known-good container (factory-create / sticky-restore), cleared on panel
-// close. While set, the observer must NOT overwrite the sticky from
-// handler+0x170 — that pointer can be a game-recycled placeholder during
-// active warehouse, not the chest-specific container we wrote.
-static volatile LONG g_panelStickyOwnedByMod[PANEL_COUNT] = {};
-// Tracks which panel's container is currently bound to handler+0x170. When
-// we switch to a different panel, we force a re-bind so SetInventory sees
-// the correct inventory pool.
+// Which panel's SetInventory channels are currently subscribed. Subscriptions
+// accumulate on the controller until an explicit ",False" unbind, so the next
+// open must unbind this panel first or the previous chest's items stay visible.
 static volatile LONG g_currentBoundPanel = -1;
 
-// In-place handler/sub-field patching for housing chests: when F7 opens GC
-// we don't replace the container at handler+0x170 (that crashes — and pre-
-// NPC it's NULL anyway). Instead we save + patch a few specific fields on
-// the warehouse handler that control panel-mode and capacity, then restore
-// them on close. Values originally from post-NPC memory diff +
-// runtime field-scan (handler+0x39C identified as the max-slots field).
-static volatile LONG   g_savedCamp_9C      = 0;
-static volatile LONG   g_savedCamp_A0      = 0;
-static volatile LONG   g_savedCamp_84      = 0;
-static volatile LONG   g_savedCamp_B8      = 0;
-static volatile LONG   g_savedCamp_39C     = 0;   // handler+0x39C = max-slots
-static volatile LONG   g_campValuesSaved   = 0;
-
-// Diff-Snapshot scaffolding: handler-object + sub-object + container-object
-// (handler+0x170 → container). The container holds max-slots/capacity etc.
-#define HANDLER_SNAPSHOT_SIZE  0x800
-#define SUB_SNAPSHOT_SIZE      0x800
-#define CONT_SNAPSHOT_SIZE     0x800
-static uint8_t g_snapshotBefore[HANDLER_SNAPSHOT_SIZE]    = {};
-static uint8_t g_snapshotAfter[HANDLER_SNAPSHOT_SIZE]     = {};
-static uint8_t g_subSnapshotBefore[SUB_SNAPSHOT_SIZE]     = {};
-static uint8_t g_subSnapshotAfter[SUB_SNAPSHOT_SIZE]      = {};
-static uint8_t g_contSnapshotBefore[CONT_SNAPSHOT_SIZE]   = {};
-static uint8_t g_contSnapshotAfter[CONT_SNAPSHOT_SIZE]    = {};
-static volatile LONG64 g_subSnapshotAddr                  = 0;
-static volatile LONG64 g_contBeforeAddr                   = 0;
-static volatile LONG g_snapshotState = 0;
-static DWORD g_diffSnapshotKey = 0x79;  // VK_F10
-static DWORD g_diffSnapshotModifier = 0;
+// Debug key (INI InvDumpKey, default F10): writes the live inventory groups to
+// the log. Read-only; that output is what pins a wrong capacity to its cause.
+static DWORD g_invDumpKey = 0x79;  // VK_F10
 
 // Set by the hotkey handler right before posting WM_TRIGGER_WAREHOUSE. The Open path
 // in TriggerWarehouse reads this and sets g_activePanel accordingly, then resets it.
 static volatile LONG g_nextOpenPanel = PANEL_PRIVATE;
 
-// Saved mode bytes for restore on close
-static uint8_t g_savedModes[7] = {};
-static uint8_t g_savedSubtypes[15] = {};
-// In CD 1.10 the panel-manager mounts UI views by tag-list derived from
-// mainChar[+0xCA9] (sub byte). WareHouseView2.html is tagged "store
-// ingamemenu" — only mounts when sub == 6 (dialog/store) or 0xE
-// (ingamemenu). The mod's old approach kept sub at the gameplay value
-// (0xF/0x10) and tweaked auxiliary mode flags at +0xCB1/+0xCB8; that
-// happened to work in 1.06-1.09 via side effects but in 1.10 the view
-// stays unmounted → no panel. New: force sub = 6 (store) on open and
-// restore the original on close, mirroring what natural NPC-open does.
-static uint8_t g_savedSubByte = 0xFF;
-static bool    g_savedSubByteValid = false;
-// NOTE: g_cursorShownByMod removed — not needed, we always hide cursor on close
-static volatile LONG g_modeByteLock = 0;  // Spinlock for mode byte read/write
-static volatile LONG g_modeSwitchByMod = 0;  // 1 when WE call fnMode, 0 otherwise
-static volatile ULONGLONG g_openTimestamp  = 0;  // GetTickCount64 at warehouse open (grace period)
 static volatile ULONGLONG g_closeTimestamp = 0;  // GetTickCount64 at last close (re-open cooldown)
 static volatile LONG64 g_lastModalPassed = 0;   // ModalMessageView addr when ESC was last passed to game for a modal
 
 // Forward declaration (defined later in Utilities section)
 static void Log(const char* fmt, ...);
-static uint16_t GetGatherablesPanelId(void);
-static uint16_t LookupInventoryTypeId(uintptr_t pTypeHash);
-static uint16_t GetPanelTypeId(int panelIdx);
-static uintptr_t ResolveContainerForPanelId(uintptr_t handler, uint16_t panelId);
 static void InitWarehousePanel(uintptr_t handler, const char* initString);
 static bool TriggerWarehouseViewMount(void);
 static void TriggerWarehouseViewUnmount(void);
@@ -326,14 +213,6 @@ static volatile LONG g_pendingBClose      = 0;  // XInput B
 // FreeLibrary hot-reload the flag gives workers a chance to bail before
 // the image is unmapped under them.
 static volatile LONG g_shutdown = 0;
-
-// Diagnostic epoch — bumped on every F-press (TriggerWarehouse open path).
-// HookedCanShow's entry/mismatch loggers reset their per-epoch counters
-// when they see a new value here. Lets us see CanShow polls AFTER each
-// F-press cycle, not just the first 10 calls from program start.
-static volatile LONG g_diagEpoch = 0;
-
-static uintptr_t ResolveContainerForPanelId(uintptr_t handler, uint16_t panelId);
 
 // GetInitStringForActive: returns the SetInventory filter string for the currently active panel.
 static inline const char* GetInitStringForActive() {
@@ -563,12 +442,6 @@ static uint32_t FileCRC32(const char* path) {
 //    2. Scan .rdata for pointer to "koreana" → language table start
 //    3. Find code referencing the table → Steam API init function
 //    4. Scan forward for MOV byte [rip+disp32], reg → language byte write
-//  SetTitle (FUN_1433ab4b0) stores text as raw char bytes in nodes.
-//  Only the bridge/redirect path (FUN_1434159c0 via node+0xA8)
-//  properly decodes UTF-8 to wchar_t (via FUN_141010f90).
-//  When no bridge exists, the renderer zero-extends each byte,
-//  garbling multi-byte UTF-8 (Korean/CJK/Cyrillic/accented chars).
-//  Fix: after SetTitle, call SetTitleDirect on node renderers.
 // ============================================================
 static int GetGameLanguage() {
     if (!g_langByteAddr) return 1; // EN
@@ -725,54 +598,6 @@ static const char* GetWarehouseTitle() {
     }
 }
 
-// ============================================================
-//  UTF-8 title fix — call SetTitleDirect (FUN_1434159c0) on
-//  renderers found via bridge chain for proper UTF-8→wchar_t.
-// ============================================================
-static bool IsAscii(const char* s) {
-    for (; *s; s++)
-        if ((unsigned char)*s > 0x7F) return false;
-    return true;
-}
-
-// Walk a UI node tree and call SetTitleDirect on any renderer found
-// through the bridge chain: node+0xA8 → bridge → *(bridge+8) → renderer.
-static bool SetTitleOnRenderer(uintptr_t node, const char* utf8Title, int depth) {
-    if (!node || depth > 5) return false;
-    __try {
-        uintptr_t bridge = *(uintptr_t*)(node + 0xA8);
-        if (bridge > 0x10000 && bridge < 0x7FFFFFFFFFFF) {
-            uintptr_t renderer = *(uintptr_t*)(bridge + 8);
-            if (renderer > 0x10000 && renderer < 0x7FFFFFFFFFFF) {
-                if (g_fnSetTitleDirect) {
-                    typedef uint8_t (__fastcall *PFN_STD)(uintptr_t, const char*, uint64_t, uint64_t);
-                    ((PFN_STD)g_fnSetTitleDirect)(renderer, utf8Title, 0, 0);
-                    Log("    SetTitleOnRenderer: OK depth=%d renderer=0x%llX",
-                        depth, (unsigned long long)renderer);
-                    return true;
-                }
-            }
-        }
-        // Recurse into children
-        int32_t childCount = *(int32_t*)(node + 0x38);
-        if (childCount > 0 && childCount < 100) {
-            uintptr_t childArr = *(uintptr_t*)(node + 0x30);
-            if (childArr > 0x10000 && childArr < 0x7FFFFFFFFFFF) {
-                for (int i = 0; i < childCount; i++) {
-                    uintptr_t child = *(uintptr_t*)(childArr + i * 8);
-                    if (child > 0x10000 && child < 0x7FFFFFFFFFFF) {
-                        if (SetTitleOnRenderer(child, utf8Title, depth + 1))
-                            return true;
-                    }
-                }
-            }
-        }
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        Log("    SetTitleOnRenderer: EXCEPTION depth=%d", depth);
-    }
-    return false;
-}
-
 // Read the active modal dialog pointer from the handler struct.
 static uintptr_t ReadModalDialog(uintptr_t handler) {
     if (!g_modalDialogOff || !g_modalOffValid) return 0;
@@ -788,9 +613,8 @@ static uintptr_t ReadModalDialog(uintptr_t handler) {
 //      quantity/confirm sub-dialog opens. childCount at +0x30 of the view
 //      tells us if it still has visible children.
 //
-//   2. g_itemDetailActiveCount: incremented by the ItemDetailOpen hook
-//      (FUN_140b55860 in 1.06) when the game processes an
-//      "ItemDetailModalMessage" command. The "View Details" popup does NOT
+//   2. g_itemDetailActiveCount: set by the ItemDetailOpen hook when the game
+//      processes an "ItemDetailModalMessage" command. The popup does NOT
 //      register at handler+0x258 — only the hook sees it.
 //
 // CRITICAL: never let one source clear the other. Earlier versions cleared
@@ -859,11 +683,6 @@ static bool ParsePSButtonName(const char* name, int* outOff, BYTE* outMask) {
 static void LoadConfig(const char* p) {
     g_enabled = GetPrivateProfileIntA("Settings","Enabled",1,p)!=0;
     g_debugLog = GetPrivateProfileIntA("Settings","DebugLog",0,p)!=0;
-    // TraceMode is a SEPARATE opt-in (default 0). It installs 8 diagnostic
-    // hooks on the natural NPC-open pipeline, is very noisy, and several of
-    // those hooks fail to install on drifted hardcoded RVAs. Keep it OFF for
-    // normal use; DebugLog alone still logs resolver state + open flow.
-    g_traceMode = GetPrivateProfileIntA("Settings","TraceMode",0,p)!=0;
     // Legacy "Hotkey" (single Private toggle). Default 0 = disabled. The
     // new per-panel layout uses PrivateHotkey=… for control. Keeping any
     // non-zero legacy default would silently steal whatever that key is
@@ -874,8 +693,12 @@ static void LoadConfig(const char* p) {
     g_controllerModifier = (WORD)ReadHexValue("Settings", "ControllerModifier", 0, p);
     g_reloadKey = ReadHexValue("Settings", "ReloadKey", 0, p);
 
-    g_diffSnapshotKey      = ReadHexValue("Settings", "DiffSnapshotKey",      0x79, p);
-    g_diffSnapshotModifier = ReadHexValue("Settings", "DiffSnapshotModifier", 0,    p);
+    // Manual override for the warehouse screen id. -1 (default) uses the value
+    // derived from ModeSwitcher. Only touch this if the boot log shows the
+    // derivation failed or the wrong screen opens.
+    g_storeScreenIdIni = GetPrivateProfileIntA("Settings", "StoreScreenId", -1, p);
+
+    g_invDumpKey = ReadHexValue("Settings", "InvDumpKey", 0x79, p);
 
     InterlockedExchange(&g_privatePanelValueCfg,
         (LONG)ReadHexValue("Settings", "PrivatePanelValue",     0,      p));
@@ -896,6 +719,12 @@ static void LoadConfig(const char* p) {
         "Private", "Gatherables", "Dresser", "Refrigerator", "Symbol", "Collecting"
     };
     for (int i = 0; i < PANEL_COUNT; i++) {
+        {
+            char kv[64];
+            snprintf(kv, sizeof(kv), "%sPanelValue", kIniKey[i]);
+            InterlockedExchange(&g_panelValueCfg[i],
+                (LONG)ReadHexValue("Settings", kv, 0, p));
+        }
         char keyName[64];
         snprintf(keyName, sizeof(keyName), "%sHotkey", kIniKey[i]);
         g_panels[i].hotkey = ReadHexValue("Settings", keyName, g_panels[i].hotkey, p);
@@ -962,13 +791,6 @@ static void LoadConfig(const char* p) {
     }
 }
 
-static uintptr_t ScanPattern(const uint8_t* pat, int len) {
-    uint8_t* base = (uint8_t*)g_gameBase;
-    for (DWORD i = 0; (DWORD)(i+len) <= g_imageSize; i++)
-        if (memcmp(base+i, pat, len)==0) return g_gameBase+i;
-    return 0;
-}
-
 // String-Xref helpers (from QuickMenuHotkeys)
 static uintptr_t FindString(const char* str) {
     uint8_t* base = (uint8_t*)g_gameBase;
@@ -1006,32 +828,10 @@ static uintptr_t FindLEA(uintptr_t targetAddr, uintptr_t afterAddr = 0) {
 //     LEA R8,[this+OFFSET]; LEA R9,[rip -> DESCRIPTOR]; CALL BindSelector
 // Returns OFFSET, or 0 if any link is missing or the offset is ambiguous
 // (multiple bind sites with different offsets).
-static uint32_t ResolveSelectorMemberOffset(const char* attrName) {
-    uintptr_t strVA = FindString(attrName);
-    if (!strVA) return 0;
-    // 1) registration thunk: LEA RDX,[rip->string] with LEA RCX,[rip->descriptor] nearby
-    uintptr_t desc = 0;
-    uintptr_t lea = 0;
-    for (int guard = 0; guard < 8 && !desc; guard++) {
-        lea = FindLEA(strVA, lea ? lea + 1 : 0);
-        if (!lea) break;
-        // The descriptor LEA always FOLLOWS the string LEA inside the same
-        // thunk (LEA RDX,[str] +0; MOV r8d,1 +7; LEA RCX,[desc] +13). Never
-        // scan backwards: thunks are packed at a 0x20-byte stride, so a
-        // backward window would adopt the PREVIOUS attribute's descriptor.
-        for (int d = 1; d <= 0x20; d++) {
-            uint8_t* p = (uint8_t*)(lea + d);
-            if (p[0] == 0x48 && p[1] == 0x8D && p[2] == 0x0D) {   // LEA RCX,[rip+disp32]
-                int32_t disp = *(int32_t*)(p + 3);
-                uintptr_t t = (uintptr_t)(p + 7) + disp;
-                if (t > g_gameBase && t < g_gameBase + g_imageSize) { desc = t; break; }
-            }
-        }
-    }
-    if (!desc) return 0;
-    // 2) bind sites: LEA R9,[rip->desc] (4C 8D 0D disp32); the LEA R8,[reg+disp]
-    //    a few bytes earlier carries the member offset. Collect from ALL bind
-    //    sites; adopt only if every site agrees on one offset.
+// Step 2 of the selector chain, for ONE descriptor: its bind sites
+//     LEA R8,[this+OFFSET]; LEA R9,[rip -> DESCRIPTOR]; CALL BindSelector
+// Returns OFFSET when every bind site agrees on a single value, else 0.
+static uint32_t BindOffsetForDescriptor(uintptr_t desc) {
     uint32_t offs[8]; int nOffs = 0;
     uint8_t* base = (uint8_t*)g_gameBase;
     for (DWORD i = 0x40; i + 7 < g_imageSize; i++) {   // 0x40: keep the back-walk inside the image
@@ -1063,82 +863,38 @@ static uint32_t ResolveSelectorMemberOffset(const char* attrName) {
     return (nOffs == 1) ? offs[0] : 0;
 }
 
-// Auto-derive g_storeSubIndex from the already-resolved ModeSwitcher.
-// ModeSwitcher's inner switch(sub) is a jump table; the case that appends the
-// "store" view-tag is exactly the subtype index the mod must flag to mount the
-// warehouse view. That index flips on almost every game update, so deriving it
-// from code (instead of hardcoding) is the single biggest update-safety win.
-// Returns the derived index [0,0x10], or -1 on ANY failure (caller keeps the
-// hardcoded default — never worse than before). No capstone: hand byte-decode.
-static int32_t ResolveStoreSubIndex() {
-    if (!g_fnModeSwitcher) return -1;
-    const uint32_t WIN = 0xA00;                       // ModeSwitcher body window
-    uint8_t* fn = (uint8_t*)g_fnModeSwitcher;
-
-    uintptr_t strStore = FindString("store");
-    if (!strStore) return -1;
-
-    // 1) The UNIQUE  LEA reg,[rip->"store"]  inside the ModeSwitcher body.
-    //    LEA: (0x48|0x4C) 8D modrm(&0xC7==0x05) disp32.
-    uintptr_t storeLea = 0; int storeHits = 0;
-    for (uint32_t i = 0; i + 7 <= WIN; i++) {
-        uint8_t* p = fn + i;
-        if ((p[0] == 0x48 || p[0] == 0x4C) && p[1] == 0x8D && (p[2] & 0xC7) == 0x05) {
-            int32_t disp = *(int32_t*)(p + 3);
-            if ((uintptr_t)(p + 7) + disp == strStore) { storeLea = (uintptr_t)p; storeHits++; }
-        }
-    }
-    if (storeHits != 1) return -1;                    // ambiguous / not found -> bail
-
-    // 2) The inner switch(sub) dispatch:  mov r32,[rdi+rsi*4+disp32]
-    //    opcode 8B, modrm mod=10 rm=100(SIB) -> (modrm&0xC7)==0x84,
-    //    SIB 0xB7 (scale*4, index=rsi, base=rdi).  base rdi = image base
-    //    (set by an earlier  lea rdi,[rip-x]).  Preceding  cmp esi,imm8 (83 FE ..)
-    //    gives the entry count.  (The OUTER mode switch uses index=rax -> SIB 0x87,
-    //    so requiring SIB==0xB7 selects the sub table.)
-    uintptr_t tableVA = 0; uint32_t caseLimit = 0;
-    for (uint32_t i = 0; i + 7 <= WIN; i++) {
-        uint8_t* p = fn + i;
-        if (p[0] == 0x8B && (p[1] & 0xC7) == 0x84 && p[2] == 0xB7) {
-            tableVA = g_gameBase + *(uint32_t*)(p + 3);     // slots are image-base-relative
-            for (int b = 3; b <= 0x12; b++) {                // cmp esi,imm8 -> entry count
-                uint8_t* q = p - b;
-                if (q < fn) break;
-                if (q[0] == 0x83 && q[1] == 0xFE) { caseLimit = q[2]; break; }
+static uint32_t ResolveSelectorMemberOffset(const char* attrName) {
+    uintptr_t strVA = FindString(attrName);
+    if (!strVA) return 0;
+    // 1) registration thunks: LEA RDX,[rip->string]; MOV r8d,1; LEA RCX,[rip->descriptor];
+    //    JMP registerFn. The descriptor LEA always FOLLOWS the string LEA inside
+    //    the same thunk; never scan backwards (thunks are packed at a 0x20 stride).
+    //    Since 2.01 the SAME attribute name is registered by more than one control
+    //    class (one descriptor each) and only the class that really binds it has
+    //    bind sites: "selector-title-subtext-stage" has descriptor A without any
+    //    bind site and descriptor B bound at +0xF0. So walk every thunk instead of
+    //    stopping at the first descriptor, and require the binding ones to agree.
+    uint32_t result = 0;
+    uintptr_t lea = 0;
+    for (int guard = 0; guard < 8; guard++) {
+        lea = FindLEA(strVA, lea ? lea + 1 : 0);
+        if (!lea) break;
+        uintptr_t desc = 0;
+        for (int d = 1; d <= 0x20; d++) {
+            uint8_t* p = (uint8_t*)(lea + d);
+            if (p[0] == 0x48 && p[1] == 0x8D && p[2] == 0x0D) {   // LEA RCX,[rip+disp32]
+                int32_t disp = *(int32_t*)(p + 3);
+                uintptr_t t = (uintptr_t)(p + 7) + disp;
+                if (t > g_gameBase && t < g_gameBase + g_imageSize) { desc = t; break; }
             }
-            break;
         }
+        if (!desc) continue;
+        uint32_t off = BindOffsetForDescriptor(desc);
+        if (!off) continue;
+        if (result && result != off) return 0;   // two binding classes disagree
+        result = off;
     }
-    if (!tableVA || !caseLimit || caseLimit > 0x40) return -1;
-    uint32_t nEntries = caseLimit + 1;
-
-    // 3) Read + sanity-check the whole jump table: every case target must land
-    //    inside the ModeSwitcher body. This confirms tableVA and the image-base-
-    //    relative slot encoding are right (guards a wrong dispatch match or a
-    //    future 8-byte table) and bounds the search — cheaper and more robust than
-    //    trying to locate the shared "lea rdi,[rip->imagebase]" base-register load,
-    //    which sits far above the inner dispatch. The winning slot is the one whose
-    //    case body linearly contains storeLea before the next case boundary (case
-    //    blocks are laid out in address order).
-    int32_t winner = -1;
-    __try {
-        uintptr_t lo = g_fnModeSwitcher, hi = g_fnModeSwitcher + WIN;
-        uintptr_t tgts[0x41];
-        for (uint32_t i = 0; i < nEntries; i++) {
-            uintptr_t t = g_gameBase + *(uint32_t*)(tableVA + i * 4);
-            if (t < lo || t >= hi) return -1;
-            tgts[i] = t;
-        }
-        for (uint32_t i = 0; i < nEntries && winner < 0; i++) {
-            uintptr_t nextB = hi;
-            for (uint32_t j = 0; j < nEntries; j++)
-                if (tgts[j] > tgts[i] && tgts[j] < nextB) nextB = tgts[j];
-            if (storeLea >= tgts[i] && storeLea < nextB) winner = (int32_t)i;
-        }
-    } __except(EXCEPTION_EXECUTE_HANDLER) { return -1; }
-
-    if (winner < 0 || winner > 0x10) return -1;
-    return winner;
+    return result;
 }
 
 static int FindAllCALLsAfter(uintptr_t from, int maxRange,
@@ -1321,100 +1077,20 @@ static void RemoveXInputIATHook() {
 // ============================================================
 //  Game Hooks
 // ============================================================
-// TraceMode helper: dump warehouse-controller state plus the linked
-// panel-descriptor state in one log line. Used by the trace hooks below
-// to capture the exact field-by-field sequence the game runs during a
-// natural NPC warehouse open. Reads everything under SEH so partial /
-// stale objects do not crash. desc fields (+0x269 / +0x26A) are only
-// read when handler+0x120 is a non-NULL pointer.
-static void TraceDumpWhState(uintptr_t handler, const char* prefix) {
-    if (!handler) { Log("    %s: this=0x0", prefix); return; }
-    __try {
-        uintptr_t vt   = *(uintptr_t*)handler;
-        uintptr_t s218 = *(uintptr_t*)(handler + 0x218);
-        uint8_t   s2CD = *(uint8_t*)(handler + 0x2CD);
-        uintptr_t s120 = *(uintptr_t*)(handler + 0x120);
-        uint8_t   d269 = 0, d26A = 0;
-        bool      descOk = false;
-        if (s120 > 0x10000 && s120 < 0x7FFFFFFFFFFF) {
-            d269 = *(uint8_t*)(s120 + 0x269);
-            d26A = *(uint8_t*)(s120 + 0x26A);
-            descOk = true;
-        }
-        Log("    %s: this=0x%llX vt=base+0x%llX +0x218=0x%llX +0x2CD=%u +0x120=0x%llX%s",
-            prefix, (unsigned long long)handler,
-            vt > g_gameBase ? (unsigned long long)(vt - g_gameBase) : (unsigned long long)vt,
-            (unsigned long long)s218, (unsigned)s2CD, (unsigned long long)s120,
-            descOk ? "" : " (desc not readable)");
-        if (descOk) {
-            Log("      desc=0x%llX +0x269=%u +0x26A=%u",
-                (unsigned long long)s120, (unsigned)d269, (unsigned)d26A);
-        }
-    } __except(EXCEPTION_EXECUTE_HANDLER) {
-        Log("    %s: state-read EXCEPTION (this=0x%llX)", prefix, (unsigned long long)handler);
-    }
-}
-
 extern "C" void __fastcall CaptureOnHandler(void* thisPtr, void* rdx, void* r8, void* r9) {
     InterlockedIncrement(&g_handlerHitCount);
-    if (g_traceMode) {
-        uint8_t cmdByte = 0xFF;
-        __try { if (rdx) cmdByte = *(uint8_t*)rdx; } __except(EXCEPTION_EXECUTE_HANDLER) {}
-        Log("[TRACE] Handler#%ld this=0x%llX cmd=0x%02X r8=0x%llX r9=0x%llX",
-            (long)g_handlerHitCount,
-            (unsigned long long)(uintptr_t)thisPtr, (unsigned)cmdByte,
-            (unsigned long long)(uintptr_t)r8, (unsigned long long)(uintptr_t)r9);
-        TraceDumpWhState((uintptr_t)thisPtr, "Handler-entry");
-    }
-    // Multi-instance tracker (additive — does NOT change the first-hit capture
-    // policy below). 1.10's natural NPC-open builds a fresh Warehouse2 instance
-    // per opening via the descriptor's spawn-instance slot, so the shell we
-    // captured at boot may never receive the engine's real Init. This ring
-    // logs every distinct Handler-this we ever see so the trace can show
-    // whether multiple instances coexist. Capacity is intentionally small (4)
-    // and overflow is silently ignored — purely a diagnostic.
-    if (g_traceMode) {
-        static volatile LONG64 g_seenHandlerThis[4] = { 0, 0, 0, 0 };
-        uintptr_t self = (uintptr_t)thisPtr;
-        bool known = false;
-        int firstFree = -1;
-        for (int i = 0; i < 4; ++i) {
-            LONG64 cur = InterlockedCompareExchange64(&g_seenHandlerThis[i], 0, 0);
-            if ((uintptr_t)cur == self) { known = true; break; }
-            if (cur == 0 && firstFree < 0) firstFree = i;
-        }
-        if (!known && firstFree >= 0) {
-            if (InterlockedCompareExchange64(&g_seenHandlerThis[firstFree],
-                                             (LONG64)self, 0) == 0) {
-                Log("[TRACE] Handler-instance ring: new slot[%d]=0x%llX (capacity 4)",
-                    firstFree, (unsigned long long)self);
-            }
-        }
-    }
-
     if (g_handlerHitCount == 1 && !g_handlerThis) {
         InterlockedExchange64(&g_handlerThis, (LONG64)(uintptr_t)thisPtr);
         Log("CAPTURED warehouse controller via handler: 0x%llX",
             (unsigned long long)(uintptr_t)thisPtr);
         __try {
-            // CRITICAL DIAGNOSTIC: log the vtable of the captured object so we
-            // can tell whether it matches g_warehouseVtableStart. If it does
-            // NOT match, our HookedCanShow will never recognise this object
-            // (vtable-match check at line ~1367 fails), and the game polls
-            // some OTHER CanShow override that we didn't hook — explaining
-            // why the panel never renders even with handler captured.
+            // A vtable mismatch means HookedCanShow will never recognise this
+            // object and the panel cannot render — worth one log line.
             uintptr_t capturedVt = *(uintptr_t*)thisPtr;
-            Log("  Captured vtable: 0x%llX (base+0x%llX) — %s g_warehouseVtableStart=base+0x%llX",
-                (unsigned long long)capturedVt,
+            Log("  Captured vtable: base+0x%llX — %s warehouse vtable base+0x%llX",
                 capturedVt > g_gameBase ? (unsigned long long)(capturedVt - g_gameBase) : (unsigned long long)capturedVt,
-                (capturedVt == g_warehouseVtableStart) ? "MATCH" : "MISMATCH vs",
+                (capturedVt == g_warehouseVtableStart) ? "MATCHES" : "MISMATCH vs",
                 g_warehouseVtableStart > g_gameBase ? (unsigned long long)(g_warehouseVtableStart - g_gameBase) : 0ULL);
-            uintptr_t sub = *(uintptr_t*)((uint8_t*)thisPtr + g_offSubObject);
-            if (sub) {
-                uint16_t realId = *(uint16_t*)((uint8_t*)sub + g_offSubPanelId);
-                if (realId != 0xFFFF && realId != 0)
-                    Log("  Dynamic panelId: 0x%04X", realId);
-            }
         } __except(EXCEPTION_EXECUTE_HANDLER) {}
 
         // If a F-key trigger is currently waiting on init (warehouse object
@@ -1449,241 +1125,485 @@ extern "C" void __fastcall CaptureOnHandler(void* thisPtr, void* rdx, void* r8, 
     }
 }
 
-// ---------- TraceMode-only hooks (warehouse Init / Show / panel-desc Show) -----
-// Installed only when [Settings] TraceMode=1 in INI. Their only job is to
-// log entry + a state snapshot. Each runs under SEH; if the game's call
-// signature differs from what we expect, the worst case is one bogus log
-// line. Original bytes are saved by InstallHook into g_hookTable so the
-// DLL-unload path can restore them.
-static volatile LONG g_traceInitHits   = 0;
-static volatile LONG g_traceShowHits   = 0;
-static volatile LONG g_traceDescHits   = 0;
+// ============================================================
+//  InventoryInfo manager, resolved through RTTI
+// ============================================================
+// The manager singleton lives in one global. No code anchor for it survives
+// across updates (the singleton load moves between functions), but RTTI gives
+// a path that depends on no register allocation and no struct offset at all:
+//
+//   ".?AVInventoryInfoManager@pa@@"  -> TypeDescriptor (name - 0x10)
+//   -> CompleteObjectLocator (signature 1 at +0x00, TD rva at +0x0C)
+//   -> the qword that points at the COL; the vtable starts 8 bytes after it
+//   -> vtable[2] is  MOV [rip+disp32], RCX ; RET   (the instance setter)
+//   -> vtable[3] is  MOV [rip+disp32], 0   ; RET   (the clearer)
+//
+// Both slots must decode to the SAME global — that is the cross-check, and it
+// is what makes this safe to write through.
+//
+// Layout (Ghidra FUN_140432c20 = GetInventoryInfo, confirmed in the running
+// game against gamedata/inventory.staticinfobody):
+//     mgr+0x08  u32   record count (21)
+//     mgr+0x28  ptr   index table, {u32 file id, u32 body offset} per record
+//     mgr+0x58  ptr   array of InventoryInfo*, indexed by POSITION in that table
+//     info+0x48 u16   base slot count (housing chests 10)
+//     info+0x4A u16   maximum         (housing chests 1000)
+// Records are created lazily; a NULL entry means "not loaded yet", so the walk
+// must skip and retry rather than stop.
+static uintptr_t g_invMgrGlobal = 0;
+static uint32_t  g_invSlotFieldOff = 0x48;
 
-// Helper: capture g_handlerThis from a verified Warehouse2 pointer if not
-// already set. Used by Init/Binder hooks below as a fallback when the game
-// doesn't call Handler before the user presses F-key (observed in 1.10
-// fresh-load + immediate F-press scenario where Handler never fires and
-// the mod's deferred WM_INIT_WAREHOUSE poll can't proceed without a
-// captured handler). Verifies vtable matches the warehouse class before
-// adopting; SEH-protected.
-static void CaptureHandlerIfEmpty(void* candidate, const char* source) {
-    if (!candidate) return;
-    if (InterlockedCompareExchange64(&g_handlerThis, 0, 0)) return;
+static uintptr_t DecodeSetterGlobal(uintptr_t fn) {
     __try {
-        uintptr_t vt = *(uintptr_t*)candidate;
-        if (vt != g_warehouseVtableStart) return;
-        if (InterlockedCompareExchange64(&g_handlerThis, (LONG64)(uintptr_t)candidate, 0) == 0) {
-            Log("CAPTURED warehouse via %s: 0x%llX (vtable match — Handler-hook fallback)",
-                source, (unsigned long long)(uintptr_t)candidate);
+        const uint8_t* q = (const uint8_t*)fn;
+        // 48 89 0D <disp32> C3   -> mov [rip+d], rcx ; ret
+        if (q[0] == 0x48 && q[1] == 0x89 && q[2] == 0x0D && q[7] == 0xC3)
+            return fn + 7 + *(int32_t*)(q + 3);
+        // 48 C7 05 <disp32> 00000000 C3  -> mov qword [rip+d], 0 ; ret
+        if (q[0] == 0x48 && q[1] == 0xC7 && q[2] == 0x05 && q[11] == 0xC3)
+            return fn + 11 + *(int32_t*)(q + 3);
+    } __except(EXCEPTION_EXECUTE_HANDLER) {}
+    return 0;
+}
+
+static bool ResolveInventoryMgrViaRtti() {
+    if (g_invMgrGlobal) return true;
+    uintptr_t nameAddr = FindString(".?AVInventoryInfoManager@pa@@");
+    if (!nameAddr) { Log("InvMgr: RTTI name not found"); return false; }
+    uint32_t tdRva = (uint32_t)(nameAddr - 0x10 - g_gameBase);
+
+    uint8_t* base = (uint8_t*)g_gameBase;
+    uintptr_t col = 0;
+    for (DWORD i = 0; (size_t)i + 0x18 < g_imageSize; i += 4) {
+        if (*(uint32_t*)(base + i + 0x0C) != tdRva) continue;
+        if (*(uint32_t*)(base + i) != 1) continue;          // COL signature
+        col = g_gameBase + i;
+        break;
+    }
+    if (!col) { Log("InvMgr: CompleteObjectLocator not found"); return false; }
+
+    uintptr_t vtable = 0;
+    for (DWORD i = 0; (size_t)i + 16 < g_imageSize; i += 8) {
+        if (*(uintptr_t*)(base + i) == col) { vtable = g_gameBase + i + 8; break; }
+    }
+    if (!vtable) { Log("InvMgr: vtable for the COL not found"); return false; }
+
+    uintptr_t gSet = 0, gClear = 0;
+    __try {
+        gSet   = DecodeSetterGlobal(*(uintptr_t*)(vtable + 2 * 8));
+        gClear = DecodeSetterGlobal(*(uintptr_t*)(vtable + 3 * 8));
+    } __except(EXCEPTION_EXECUTE_HANDLER) {}
+
+    if (!gSet || gSet != gClear) {
+        Log("InvMgr: setter/clearer disagree (set=0x%llX clear=0x%llX) — refusing",
+            (unsigned long long)gSet, (unsigned long long)gClear);
+        return false;
+    }
+    g_invMgrGlobal = gSet;
+    Log("InvMgr: OK global=base+0x%llX (RTTI -> vtable base+0x%llX, slots 2 and 3 agree)",
+        (unsigned long long)(gSet - g_gameBase),
+        (unsigned long long)(vtable - g_gameBase));
+    return true;
+}
+
+// The InventoryInfo manager indexes its record array by POSITION in the index
+// table at mgr+0x28 (one {u32 id, u32 offset} entry per record, in file order),
+// not by the id stored in the data file. The file ids start at 1, so
+// Housing_Dresser (file id 0x0F) is arr[0x0E] at runtime. Earlier versions
+// assumed index == id and therefore raised the five records AFTER the dresser
+// (fridge, symbol, collecting, materials, BirdFeed) while the dresser kept its
+// 10 — the F6 bug. Resolve every chest through the table instead.
+static uint16_t RuntimeIndexForFileId(uint16_t fileId) {
+    if (!g_invMgrGlobal) return 0xFFFF;
+    __try {
+        uintptr_t mgr = *(uintptr_t*)g_invMgrGlobal;
+        if (mgr <= 0x10000) return 0xFFFF;
+        uint32_t count = *(uint32_t*)(mgr + 0x08);
+        uintptr_t tbl = *(uintptr_t*)(mgr + 0x28);
+        if (tbl <= 0x10000 || count == 0 || count > 4096) return 0xFFFF;
+        for (uint32_t i = 0; i < count; i++)
+            if (*(uint16_t*)(tbl + (uintptr_t)i * 8) == fileId) return (uint16_t)i;
+    } __except(EXCEPTION_EXECUTE_HANDLER) {}
+    return 0xFFFF;
+}
+
+static uint16_t FileIdForRuntimeIndex(uint16_t idx) {
+    if (!g_invMgrGlobal) return 0xFFFF;
+    __try {
+        uintptr_t mgr = *(uintptr_t*)g_invMgrGlobal;
+        if (mgr <= 0x10000) return 0xFFFF;
+        uint32_t count = *(uint32_t*)(mgr + 0x08);
+        uintptr_t tbl = *(uintptr_t*)(mgr + 0x28);
+        if (tbl <= 0x10000 || idx >= count) return 0xFFFF;
+        return *(uint16_t*)(tbl + (uintptr_t)idx * 8);
+    } __except(EXCEPTION_EXECUTE_HANDLER) {}
+    return 0xFFFF;
+}
+
+// Record names by FILE id (gamedata/inventory.staticinfoheader + body, 2.01.00).
+// Only used for logging; nothing is resolved through this table.
+static const char* InvNameForFileId(uint16_t fileId) {
+    static const char* const kNames[] = {
+        "?", "Money", "Character", "PearlUser", "PearlCharacter", "Quest",
+        "Wagon", "PetAndVehicle", "CampWareHouse", "WareHouse", "Bank",
+        "CampStraw", "Recovery", "Kuku", "InvisibleInventory", "Housing_Dresser",
+        "Housing_Refrigerator", "Housing_Symbol", "Housing_Collecting",
+        "Housing_GatheredMaterials", "BirdFeed", "Ship",
+    };
+    return (fileId < sizeof(kNames) / sizeof(kNames[0])) ? kNames[fileId] : "?";
+}
+
+// Confirm the field offset by content before writing anything: the housing
+// chests must read 10/1000 and the camp warehouse 240/1000.
+static bool ValidateSlotField(uintptr_t arr, uint32_t count, uint32_t off) {
+    __try {
+        if (0x13 >= count) return false;
+        uint16_t iD = RuntimeIndexForFileId(0x0F), iF = RuntimeIndexForFileId(0x10);
+        if (iD == 0xFFFF || iF == 0xFFFF || iD >= count || iF >= count) return false;
+        uintptr_t dres = *(uintptr_t*)(arr + (uintptr_t)iD * 8);
+        uintptr_t frig = *(uintptr_t*)(arr + (uintptr_t)iF * 8);
+        if (!dres || !frig) return false;
+        // Two housing chests reading 10 / 1000 at the SAME offset pins both the
+        // field position and its meaning. Two independent records agreeing is
+        // specific enough; a third condition is not worth its risk.
+        //
+        // Deliberately NOT checked: the camp warehouse. Its capacity depends on
+        // the camp upgrade level, so it differs per save and changes over time.
+        if (*(uint16_t*)(dres + off) != 10 || *(uint16_t*)(dres + off + 2) != 1000) return false;
+        if (*(uint16_t*)(frig + off) != 10 || *(uint16_t*)(frig + off + 2) != 1000) return false;
+        return true;
+    } __except(EXCEPTION_EXECUTE_HANDLER) {}
+    return false;
+}
+
+// Read one record's base slot count (info+0x48) by runtime index; for the open log.
+static int ReadChestSlots(uint16_t id) {
+    if (!g_invMgrGlobal) return -1;
+    __try {
+        uintptr_t mgr = *(uintptr_t*)g_invMgrGlobal;
+        if (mgr <= 0x10000) return -1;
+        uint32_t count = *(uint32_t*)(mgr + 0x08);
+        uintptr_t arr = *(uintptr_t*)(mgr + 0x58);
+        if (!arr || id >= count) return -1;
+        uintptr_t info = *(uintptr_t*)(arr + (uintptr_t)id * 8);
+        if (!info) return -2;
+        return (int)*(uint16_t*)(info + g_invSlotFieldOff);
+    } __except(EXCEPTION_EXECUTE_HANDLER) {}
+    return -1;
+}
+
+
+// ---------------------------------------------------------------------------
+// Live inventory groups (2.01.00, from Ghidra):
+//   FUN_142073710  container = *(*(actor + 0x68) + 0xB8); container+0x08 points
+//                  back to the actor, +0x18 = array of group pointers, +0x20 = count.
+//   FUN_14234e0c0  furniture bonus: +0x14 = min(+0x16 + info->0x48 + delta, info->0x4A);
+//                  +0x16 += delta; +0x18 += growth. Nothing else is written.
+//   FUN_14207ed50  housing re-seed: +0x16 = bonus; +0x14 = bonus + info->0x48.
+//   FUN_14234e1f0  group: +0x00 entries (0xC8 each: +8 item key, +0x10 count),
+//                  +0x08 / +0x0C entry counts, +0x10 u16 type id, +0x12 used.
+// The record (info+0x48) only seeds the group; what the panel shows is the
+// group's +0x14. With the record patched before the save loads, the game seeds
+// every housing group at the maximum itself; PatchGroupCapacities() is the
+// safety net for a save that was already loaded when the patch ran.
+// Validate one actor candidate: container = *(*(actor+0x68)+0xB8) has to point
+// back to the actor at +0x08 and hold a sane group array (distinct type ids).
+static uintptr_t ContainerOfActor(uintptr_t actor) {
+    if (actor <= 0x10000 || actor >= 0x7FFFFFFFFFFFULL) return 0;
+    __try {
+        uintptr_t owner = *(uintptr_t*)(actor + 0x68);
+        if (owner <= 0x10000 || owner >= 0x7FFFFFFFFFFFULL) return 0;
+        uintptr_t cont = *(uintptr_t*)(owner + 0xB8);
+        if (cont <= 0x10000 || cont >= 0x7FFFFFFFFFFFULL) return 0;
+        if (*(uintptr_t*)(cont + 0x08) != actor) return 0;
+        uint32_t n = *(uint32_t*)(cont + 0x20);
+        uintptr_t arr = *(uintptr_t*)(cont + 0x18);
+        if (n == 0 || n > 64 || arr <= 0x10000 || arr >= 0x7FFFFFFFFFFFULL) return 0;
+        uint32_t seen = 0;
+        for (uint32_t i = 0; i < n; i++) {
+            uintptr_t g = *(uintptr_t*)(arr + (uintptr_t)i * 8);
+            if (g <= 0x10000 || g >= 0x7FFFFFFFFFFFULL) return 0;
+            uint16_t key = *(uint16_t*)(g + 0x10);
+            if (key >= 32 || (seen & (1u << key))) return 0;
+            seen |= 1u << key;
+        }
+        return cont;
+    } __except(EXCEPTION_EXECUTE_HANDLER) {}
+    return 0;
+}
+
+// The player actor the game's own inventory code starts from
+// (FUN_1405dd4a0 -> FUN_14083d050):  actor = *(*(G + 0x30) + 0x50), where G is
+// the session global (2.01.00: DAT_146c29760, resolved into g_sessionGlobal).
+static uintptr_t ActorViaSessionGlobal(uintptr_t G) {
+    __try {
+        uintptr_t sess = *(uintptr_t*)G;
+        if (sess <= 0x10000 || sess >= 0x7FFFFFFFFFFFULL) return 0;
+        uintptr_t pl = *(uintptr_t*)(sess + 0x30);
+        if (pl <= 0x10000 || pl >= 0x7FFFFFFFFFFFULL) return 0;
+        return *(uintptr_t*)(pl + 0x50);
+    } __except(EXCEPTION_EXECUTE_HANDLER) {}
+    return 0;
+}
+
+static uintptr_t g_sessionGlobal = 0;   // resolved in ResolveAddresses (dominant "+0x30" global)
+static uintptr_t g_invContainer = 0, g_invActor = 0;
+
+// Every candidate goes through ContainerOfActor(): the container must point
+// back at the actor and hold a group array with distinct small type ids. That
+// check is what makes a wrong global harmless — it simply fails to validate.
+static uintptr_t ResolveInvContainer() {
+    if (g_invContainer && ContainerOfActor(g_invActor) == g_invContainer) return g_invContainer;
+    g_invContainer = 0;
+    uintptr_t actor = 0, cont = 0, viaG = 0;
+    const char* how = "";
+    // 1) the session global the game's own inventory code uses
+    if (g_sessionGlobal) {
+        viaG  = g_sessionGlobal;
+        actor = ActorViaSessionGlobal(viaG);
+        cont  = ContainerOfActor(actor);
+        if (cont) how = "session global";
+    }
+    // 2) any global in the singleton cluster around the game manager with the
+    //    same shape (the session global sits 0x510 below it on 2.01.00)
+    if (!cont && g_mainCharGlobalPtr) {
+        uintptr_t lo = g_mainCharGlobalPtr - 0x2000, hi = g_mainCharGlobalPtr + 0x2000;
+        if (lo < g_gameBase) lo = g_gameBase;
+        if (hi > g_gameBase + g_imageSize - 8) hi = g_gameBase + g_imageSize - 8;
+        for (uintptr_t G = lo; G < hi && !cont; G += 8) {
+            actor = ActorViaSessionGlobal(G);
+            cont  = ContainerOfActor(actor);
+            if (cont) { viaG = G; how = "cluster scan"; }
+        }
+    }
+    static bool logged = false, loggedFail = false;
+    if (cont) {
+        g_invContainer = cont; g_invActor = actor;
+        if (!logged) { logged = true;
+            Log("InvGroups: container=0x%llX actor=0x%llX groups=%u via %s (base+0x%llX)",
+                (unsigned long long)cont, (unsigned long long)actor, *(uint32_t*)(cont + 0x20),
+                how, (unsigned long long)(viaG - g_gameBase)); }
+    } else if (!loggedFail) {
+        loggedFail = true;
+        Log("InvGroups: no actor/container yet (session global base+0x%llX -> actor 0x%llX)",
+            g_sessionGlobal ? (unsigned long long)(g_sessionGlobal - g_gameBase) : 0ULL,
+            (unsigned long long)(g_sessionGlobal ? ActorViaSessionGlobal(g_sessionGlobal) : 0));
+    }
+    return cont;
+}
+
+static uintptr_t FindInvGroup(uintptr_t cont, uint16_t id) {
+    __try {
+        uint32_t n = *(uint32_t*)(cont + 0x20);
+        uintptr_t arr = *(uintptr_t*)(cont + 0x18);
+        for (uint32_t i = 0; i < n; i++) {
+            uintptr_t g = *(uintptr_t*)(arr + (uintptr_t)i * 8);
+            if (g > 0x10000 && *(uint16_t*)(g + 0x10) == id) return g;
         }
     } __except(EXCEPTION_EXECUTE_HANDLER) {}
+    return 0;
 }
 
-extern "C" void __fastcall TraceOnWarehouseInit(void* thisPtr, void* outStatus) {
-    LONG n = InterlockedIncrement(&g_traceInitHits);
-    Log("[TRACE] Warehouse.Init#%ld (vtable[1]) this=0x%llX out=0x%llX",
-        (long)n, (unsigned long long)(uintptr_t)thisPtr,
-        (unsigned long long)(uintptr_t)outStatus);
-    TraceDumpWhState((uintptr_t)thisPtr, "Init-entry");
-    // Adopt this as handler if game hasn't called Handler yet (1.10 fix).
-    CaptureHandlerIfEmpty(thisPtr, "Init");
-}
-
-extern "C" void __fastcall TraceOnWarehouseShow(void* thisPtr) {
-    LONG n = InterlockedIncrement(&g_traceShowHits);
-    Log("[TRACE] Warehouse.Show#%ld (vtable[51]) this=0x%llX",
-        (long)n, (unsigned long long)(uintptr_t)thisPtr);
-    TraceDumpWhState((uintptr_t)thisPtr, "Show-entry");
-}
-
-// Wrappers that ultimately reach FUN_140A9F4E0 ("Show" sink) — but each
-// runs different side-effects first. Without hooking these distinctly we
-// only see the sink fire and cannot tell which entry the natural NPC-open
-// dialog actually uses. AA3BF0 = "Show + focus-handoff + SetInventoryName"
-// (the strongest NPC-open candidate). A9D4A0 = "Show + focus-handoff only"
-// (simpler wrapper for re-shows). Confirmed via Ghidra preflight.
-static volatile LONG g_traceShowFocusHits  = 0;
-static volatile LONG g_traceShowSimpleHits = 0;
-
-extern "C" void __fastcall TraceOnWarehouseShowFocus(void* thisPtr) {
-    LONG n = InterlockedIncrement(&g_traceShowFocusHits);
-    Log("[TRACE] Warehouse.ShowFocus#%ld (FUN_140AA3BF0 — NPC-open candidate) this=0x%llX",
-        (long)n, (unsigned long long)(uintptr_t)thisPtr);
-    TraceDumpWhState((uintptr_t)thisPtr, "ShowFocus-entry");
-}
-
-extern "C" void __fastcall TraceOnWarehouseShowSimple(void* thisPtr) {
-    LONG n = InterlockedIncrement(&g_traceShowSimpleHits);
-    Log("[TRACE] Warehouse.ShowSimple#%ld (FUN_140A9D4A0 — re-show wrapper) this=0x%llX",
-        (long)n, (unsigned long long)(uintptr_t)thisPtr);
-    TraceDumpWhState((uintptr_t)thisPtr, "ShowSimple-entry");
-}
-
-// Panel-descriptor show primitive (FUN_14346A3E0). param_1 is a panel
-// descriptor, NOT the warehouse controller — so the warehouse state-dump
-// helper won't make sense here. Instead log the descriptor's own gate
-// fields (+0x269 / +0x26A), its +0x120 parent panel-group pointer, AND
-// its vtable. Warehouse descriptors share vtable base+0x4BC1028 — when
-// we see PanelDescShow hit with that vtable, we know natural NPC-open
-// is reaching the descriptor layer and we can correlate to the trace.
-extern "C" void __fastcall TraceOnPanelDescShow(void* descPtr) {
-    LONG n = InterlockedIncrement(&g_traceDescHits);
+static void LogInvGroup(const char* tag, uintptr_t g) {
     __try {
-        uintptr_t d   = (uintptr_t)descPtr;
-        uintptr_t vt  = d ? *(uintptr_t*)d : 0;
-        uintptr_t par = d ? *(uintptr_t*)(d + 0x120) : 0;
-        uint8_t   v269 = d ? *(uint8_t*)(d + 0x269) : 0;
-        uint8_t   v26A = d ? *(uint8_t*)(d + 0x26A) : 0;
-        bool isWh = (vt == g_gameBase + 0x4BC1028);
-        Log("[TRACE] PanelDescShow#%ld desc=0x%llX vt=base+0x%llX%s +0x120=0x%llX +0x269=%u +0x26A=%u",
-            (long)n, (unsigned long long)d,
-            vt > g_gameBase ? (unsigned long long)(vt - g_gameBase) : (unsigned long long)vt,
-            isWh ? " [WAREHOUSE-DESC]" : "",
-            (unsigned long long)par, (unsigned)v269, (unsigned)v26A);
+        Log("  %s group 0x%llX: id=0x%02X entries=0x%llX size=%d cap=%d used=%d "
+            "slots=%u bonus=%u f18=%u last=%u",
+            tag, (unsigned long long)g, *(uint16_t*)(g + 0x10),
+            (unsigned long long)*(uintptr_t*)g,
+            (int)*(int16_t*)(g + 0x08), (int)*(int16_t*)(g + 0x0C), (int)*(int16_t*)(g + 0x12),
+            *(uint16_t*)(g + 0x14), *(uint16_t*)(g + 0x16),
+            *(uint16_t*)(g + 0x18), *(uint16_t*)(g + 0x1A));
     } __except(EXCEPTION_EXECUTE_HANDLER) {
-        Log("[TRACE] PanelDescShow#%ld desc=0x%llX (state-read EXCEPTION)",
-            (long)n, (unsigned long long)(uintptr_t)descPtr);
+        Log("  %s group 0x%llX: unreadable", tag, (unsigned long long)g);
     }
 }
 
-// ---------- TraceMode-only hooks added after CD 1.10 architecture investigation -----
-// The mod's existing Init/Show hooks on Warehouse2 vtable[1]/[51] never fire on
-// the natural NPC-open path — proven by 06-Jun trace data. Ghidra deep-dive
-// identified three more candidate functions and one read-only dump that together
-// pinpoint the missing piece:
-//   * FUN_140AA3910 — deleting destructor of Warehouse2; tracks instance lifecycle
-//   * FUN_140A9C820 — master widget binder (the +0x2CD=1 writer); sole caller is
-//     vtable[1] Init, so this hook proves whether NPC-open reaches the binder at
-//     all and on WHICH this-pointer
-//   * FUN_141004DE0 — panel-descriptor registry getter; logging its callers
-//     reveals the engine-side OpenPanel dispatch site we never identified
-//   * 8-slot dump of descriptor vtable @ base+0x4BC1028 — one slot is the
-//     spawn-instance method we'd ultimately want to call directly
-static volatile LONG g_traceDtorHits     = 0;
-static volatile LONG g_traceBinderHits   = 0;
-static volatile LONG g_traceRegGetHits   = 0;
-
-// FUN_140AA3910 is the deleting destructor (confirmed via Ghidra: writes own
-// vtable then chains to parent dtor FUN_140A9C5F0, with the standard
-// (param_2 & 1) operator-delete tail). Hooking it gives us a per-instance
-// death log + return-address (= the delete site). Combined with the heap-scan
-// poller, this tells us instance lifecycle around natural NPC-open.
-extern "C" void __fastcall TraceOnWarehouseDtor(void* thisPtr, int param2) {
-    LONG n = InterlockedIncrement(&g_traceDtorHits);
-    void* retAddr = _ReturnAddress();
-    uintptr_t ret = (uintptr_t)retAddr;
-    uintptr_t handler = (uintptr_t)InterlockedCompareExchange64(&g_handlerThis, 0, 0);
-    Log("[TRACE] Warehouse.Dtor#%ld this=0x%llX param2=%d ret=base+0x%llX %s captured=0x%llX",
-        (long)n, (unsigned long long)(uintptr_t)thisPtr, param2,
-        ret > g_gameBase ? (unsigned long long)(ret - g_gameBase) : (unsigned long long)ret,
-        ((uintptr_t)thisPtr == handler) ? "SAME-AS-CAPTURED" : "DIFFERENT-INSTANCE",
-        (unsigned long long)handler);
-}
-
-// FUN_140A9C820 is the master widget binder — the function that actually sets
-// +0x2CD=1 once all sub-handlers (+0x218, +0x250...+0x2C8) are bound. Its
-// only static caller is vtable[1] Init (FUN_140AA39E0). If this hook fires
-// during natural NPC-open with a DIFFERENT this than g_handlerThis, the
-// wrong-instance hypothesis is confirmed. If it never fires, natural open
-// uses a parallel init mechanism that bypasses the binder.
-extern "C" void __fastcall TraceOnWarehouseBinder(void* thisPtr, void* outStatus) {
-    LONG n = InterlockedIncrement(&g_traceBinderHits);
-    void* retAddr = _ReturnAddress();
-    uintptr_t ret = (uintptr_t)retAddr;
-    uintptr_t handler = (uintptr_t)InterlockedCompareExchange64(&g_handlerThis, 0, 0);
-    Log("[TRACE] Warehouse.Binder#%ld (FUN_140A9C820) this=0x%llX ret=base+0x%llX %s out=0x%llX",
-        (long)n, (unsigned long long)(uintptr_t)thisPtr,
-        ret > g_gameBase ? (unsigned long long)(ret - g_gameBase) : (unsigned long long)ret,
-        ((uintptr_t)thisPtr == handler) ? "SAME-AS-CAPTURED" : "DIFFERENT-INSTANCE",
-        (unsigned long long)(uintptr_t)outStatus);
-    // Adopt as handler if not yet set (1.10 fallback when Handler never fires).
-    CaptureHandlerIfEmpty(thisPtr, "Binder");
-}
-
-// FUN_141004DE0 is the panel-descriptor registry getter (returns
-// &DAT_1460F9E50). Rate-limited (first 8 hits, then every 64th) because
-// many panel-system ticks call it. Each hit logs the caller return-address
-// — that's our hook on the engine-side OpenPanel/ShowPanel dispatch sites.
-extern "C" void __fastcall TraceOnPanelRegistryGet() {
-    LONG n = InterlockedIncrement(&g_traceRegGetHits);
-    if (n > 8 && (n & 63) != 0) return;
-    void* retAddr = _ReturnAddress();
-    uintptr_t ret = (uintptr_t)retAddr;
-    Log("[TRACE] PanelRegistryGet#%ld ret=base+0x%llX",
-        (long)n, ret > g_gameBase ? (unsigned long long)(ret - g_gameBase) : (unsigned long long)ret);
-}
-
-// Read-only 8-slot dump of the panel-descriptor vtable shared by the WareHouse
-// and CampWareHouse descriptors (base+0x4BC1028). Extracted to its own function
-// because MSVC forbids __try inside any function with C++ objects requiring
-// unwinding (ModThread has std::string). Called once from the install block
-// when TraceMode is active.
-static void TraceDumpDescriptorVtable() {
-    if (!g_gameBase || !g_imageSize) return;
+static void DumpInvGroups() {
+    uintptr_t cont = ResolveInvContainer();
+    if (!cont) {
+        Log("InvGroups: container not resolved");
+        return;
+    }
     __try {
-        uintptr_t descVt = g_gameBase + 0x4BC1028;
-        Log("[TRACE] DescVtable @ base+0x4BC1028 dump (8 slots):");
-        for (int i = 0; i < 8; ++i) {
-            uintptr_t slot = *(uintptr_t*)(descVt + i * 8);
-            if (slot > g_gameBase && slot < g_gameBase + g_imageSize) {
-                Log("  desc.vtable[%d] = base+0x%llX",
-                    i, (unsigned long long)(slot - g_gameBase));
-            } else {
-                Log("  desc.vtable[%d] = 0x%llX (out-of-image or null)",
-                    i, (unsigned long long)slot);
+        uint32_t n = *(uint32_t*)(cont + 0x20);
+        uintptr_t arr = *(uintptr_t*)(cont + 0x18);
+        Log("InvGroups: container=0x%llX groups=%u", (unsigned long long)cont, n);
+        for (uint32_t i = 0; i < n; i++) {
+            uintptr_t g = *(uintptr_t*)(arr + (uintptr_t)i * 8);
+            if (g > 0x10000) {
+                uint16_t rt = *(uint16_t*)(g + 0x10);
+                uint16_t fileId = FileIdForRuntimeIndex(rt);
+                char tag[80];
+                snprintf(tag, sizeof(tag), "[file 0x%02X %s]", fileId, InvNameForFileId(fileId));
+                LogInvGroup(tag, g);
             }
+            else Log("  group[%u] = 0x%llX", i, (unsigned long long)g);
         }
-    } __except(EXCEPTION_EXECUTE_HANDLER) {
-        Log("[TRACE] DescVtable dump EXCEPTION (descriptor not yet constructed?)");
-    }
+    } __except(EXCEPTION_EXECUTE_HANDLER) { Log("InvGroups: EXCEPTION"); }
 }
 
-// Walk the InventoryInfoManager singleton and patch every InventoryInfo's
-// base slot count (ushort at +0x48) from 10 to 1000. Found via Ghidra:
-// FUN_1404e9780 (GetInventoryInfo by InventoryKey) reads from
-// *(manager + 0x50)[key], FUN_1404de7c0 reads (info + 0x48) as the slot base.
-// Returns number of entries patched, or -1 if manager not yet loaded.
-static int PatchInventoryInfoSlots() {
-    if (!g_addrInventoryInfoMgrPtr) return -1;
+// Raise the live capacity of the five housing chests to the record maximum
+// (info+0x4A) the way the game's own bonus path does: growth = max - slots;
+// slots = max; bonus += growth; +0x18 += growth. CampWareHouse (0x08) is left
+// alone. openingId selects which group gets a before/after line; quiet
+// suppresses the per-chest lines after the first few (worker thread).
+static int PatchGroupCapacities(uint16_t openingId, bool quiet = false) {
+    uintptr_t cont = ResolveInvContainer();
+    if (!cont || !g_invMgrGlobal) return 0;
+    static const uint16_t kIds[] = { 0x0F, 0x10, 0x11, 0x12, 0x13 };   // FILE ids
+    static LONG quietLogs = 0;
+    int raised = 0;
+    __try {
+        uintptr_t mgr = *(uintptr_t*)g_invMgrGlobal;
+        if (mgr <= 0x10000) return 0;
+        uint32_t count = *(uint32_t*)(mgr + 0x08);
+        uintptr_t infoArr = *(uintptr_t*)(mgr + 0x58);
+        for (int k = 0; k < 5; k++) {
+            uint16_t id = RuntimeIndexForFileId(kIds[k]);   // file id -> runtime index
+            if (id == 0xFFFF) continue;
+            if (id >= count) continue;
+            uintptr_t info = *(uintptr_t*)(infoArr + (uintptr_t)id * 8);
+            uintptr_t g = FindInvGroup(cont, id);
+            if (!info || !g) {
+                if (id == openingId)
+                    Log("  InvGroups: id 0x%02X info=0x%llX group=0x%llX — not raised",
+                        id, (unsigned long long)info, (unsigned long long)g);
+                continue;
+            }
+            uint16_t max = *(uint16_t*)(info + 0x4A);
+            uint16_t cur = *(uint16_t*)(g + 0x14);
+            if (id == openingId) LogInvGroup("before", g);
+            if (max == 0 || max > 5000 || cur >= max) continue;
+            uint16_t growth = (uint16_t)(max - cur);
+            *(uint16_t*)(g + 0x14) = max;
+            *(uint16_t*)(g + 0x16) = (uint16_t)(*(uint16_t*)(g + 0x16) + growth);
+            *(uint16_t*)(g + 0x18) = (uint16_t)(*(uint16_t*)(g + 0x18) + growth);
+            raised++;
+            if (!quiet || InterlockedIncrement(&quietLogs) <= 20)
+                Log("  InvGroups: id 0x%02X live slots %u -> %u%s", id, cur, max,
+                    quiet ? " (worker)" : "");
+            if (id == openingId) LogInvGroup("after ", g);
+        }
+    } __except(EXCEPTION_EXECUTE_HANDLER) { Log("InvGroups: EXCEPTION while patching"); }
+    return raised;
+}
+
+// Raise the five housing records (info+0x48) to their own maximum (info+0x4A).
+// Returns the number of chests handled (patched or already at max) once every
+// record is loaded, else 0 so the caller keeps polling. CampWareHouse and
+// InvisibleInventory are never in the list.
+static int PatchSlotsViaManager() {
+    if (!g_invMgrGlobal) return 0;
+    static const struct { uint16_t id; const char* name; } kChests[] = {
+        { 0x0F, "Housing_Dresser" }, { 0x10, "Housing_Refrigerator" },
+        { 0x11, "Housing_Symbol" },  { 0x12, "Housing_Collecting" },
+        { 0x13, "Housing_GatheredMaterials" },
+        // CampWareHouse (id 0x08) is deliberately left at its 240.
+    };
     int patched = 0;
+    int done = 0;
+    bool allDone = true;
     __try {
-        uintptr_t mgr = *(uintptr_t*)g_addrInventoryInfoMgrPtr;
-        if (!mgr) return -1;
-        uint32_t count = *(uint32_t*)(mgr + 8);
-        uintptr_t arr  = *(uintptr_t*)(mgr + 0x50);
-        if (!arr || count == 0 || count > 4096) return -1;
-        for (uint32_t i = 0; i < count; i++) {
-            uintptr_t info = *(uintptr_t*)(arr + i * 8);
-            if (!info) continue;
-            uint16_t* pSlots = (uint16_t*)(info + 0x48);
-            if (*pSlots == 10) {
-                *pSlots = 1000;
-                patched++;
+        uintptr_t mgr = *(uintptr_t*)g_invMgrGlobal;
+        static int reportCount = 0;
+        if (mgr <= 0x10000) {
+            if (reportCount < 3) { reportCount++; Log("InvMgr: instance not created yet (global holds 0x%llX)", (unsigned long long)mgr); }
+            return 0;
+        }
+        uint32_t count = *(uint32_t*)(mgr + 0x08);
+        uintptr_t arr  = *(uintptr_t*)(mgr + 0x58);
+        static bool mgrLogged = false;
+        if (!mgrLogged) {
+            mgrLogged = true;
+            Log("InvMgr: instance=0x%llX  count(+0x08)=%u  array(+0x58)=0x%llX",
+                (unsigned long long)mgr, count, (unsigned long long)arr);
+        }
+        if (!arr || count == 0 || count > 4096) return 0;
+
+        static bool fieldOk = false;
+        if (!fieldOk) {
+            if (ValidateSlotField(arr, count, 0x48)) {
+                g_invSlotFieldOff = 0x48;
+                fieldOk = true;
+            } else {
+                // The struct may shift again; find the offset that satisfies the
+                // same content test rather than trusting 0x48.
+                for (uint32_t o = 0; o <= 0x200 && !fieldOk; o += 2)
+                    if (ValidateSlotField(arr, count, o)) {
+                        g_invSlotFieldOff = o;
+                        fieldOk = true;
+                    }
+            }
+            if (!fieldOk) return 0;                          // stay silent, retry later
+            Log("InvMgr: table OK — count=%u array=0x%llX slot field at info+0x%X "
+                "(validated: Dresser and Refrigerator read 10/1000)",
+                count, (unsigned long long)arr, g_invSlotFieldOff);
+        }
+
+        static bool tableLogged = false;
+        if (!tableLogged) {
+            tableLogged = true;
+            for (int c = 0; c < 5; c++) {
+                uint16_t rt = RuntimeIndexForFileId(kChests[c].id);
+                uintptr_t info = (rt != 0xFFFF && rt < count) ? *(uintptr_t*)(arr + (uintptr_t)rt * 8) : 0;
+                Log("  index: %s file id 0x%02X -> runtime 0x%02X (record 0x%llX)",
+                    kChests[c].name, kChests[c].id, rt, (unsigned long long)info);
             }
         }
+        for (int c = 0; c < 5; c++) {
+            uint16_t rt = RuntimeIndexForFileId(kChests[c].id);
+            if (rt == 0xFFFF || rt >= count) { allDone = false; continue; }
+            uintptr_t info = *(uintptr_t*)(arr + (uintptr_t)rt * 8);
+            if (!info) {
+                // Entries are materialised lazily; some sit far from the others in
+                // the table and appear only later. Report it once per chest so a
+                // permanently missing entry is visible instead of silently costing
+                // that chest its capacity, and let the worker retry.
+                static bool nullLogged[5] = {};
+                if (!nullLogged[c]) { nullLogged[c] = true;
+                    Log("  slots: %s not loaded yet — will retry", kChests[c].name); }
+                allDone = false;
+                continue;
+            }
+            uint16_t* pSlots = (uint16_t*)(info + g_invSlotFieldOff);
+            uint16_t maxSlots = *(uint16_t*)(info + g_invSlotFieldOff + 2);
+            if (*pSlots == maxSlots) { done++; continue; }   // already at its maximum
+            // Every housing record ships as 10/1000. Anything else means the data
+            // changed; leave it alone and say so once.
+            if (maxSlots != 1000 || *pSlots == 0 || *pSlots > maxSlots) {
+                static bool oddLogged[5] = {};
+                if (!oddLogged[c]) { oddLogged[c] = true;
+                    Log("  slots: %s has %u/%u — unexpected, left alone",
+                        kChests[c].name, (unsigned)*pSlots, (unsigned)maxSlots); }
+                continue;
+            }
+            uint16_t before = *pSlots;
+            DWORD oldProt = 0;
+            bool unlocked = VirtualProtect(pSlots, 2, PAGE_READWRITE, &oldProt) != 0;
+            *pSlots = maxSlots;
+            if (unlocked) VirtualProtect(pSlots, 2, oldProt, &oldProt);
+            patched++;
+            Log("  slots: %s  %u -> %u", kChests[c].name, (unsigned)before, maxSlots);
+        }
     } __except(EXCEPTION_EXECUTE_HANDLER) {
-        Log("PatchInventoryInfoSlots: SEH exception");
-        return -1;
+        Log("InvMgr: EXCEPTION while patching");
+        return 0;
     }
-    return patched;
+    if (patched) Log("Slot capacity: %d chest(s) raised%s", patched,
+                     allDone ? "" : " (some entries still pending)");
+    // Keep returning 0 while records are outstanding so the worker keeps
+    // polling; chests already at their maximum count as handled.
+    return allDone ? (patched > 0 ? patched : done) : 0;
 }
 
-// Fires whenever the game opens an ItemDetailModal ("View Details" popup) —
-// hooked at FUN_140B4D310 (the "ItemDetailModalMessage" processor). The
-// counter is cleared by IsNewModalDialogVisible when handler+0x258 reports
-// the modal as gone (childCount==0 or pointer freed).
+// Fires whenever the game opens an ItemDetailModal ("View Details" popup);
+// the hook sits on the "ItemDetailModalMessage" processor. The flag is
+// cleared when ESC/B/Circle dismisses the popup or the warehouse closes.
 extern "C" void __fastcall CaptureOnItemDetailCtor(void* /*param_1*/, void* /*param_2*/) {
     InterlockedExchange(&g_itemDetailActiveCount, 1);
     Log("ItemDetailModal opened");
 }
 
-// Hook on FUN_140b80e00 — the filter-bar mode/submode setter.
-// Logs every invocation: which filter object + which mode arg was passed,
-// plus the object's current state. Compared against handler+0x1A8 in the
-// InitWarehousePanel log line, this reveals:
-//   - Whether natural NPC-open uses the same filter object as our F4 path
-//   - What sequence of mode values the game flows through during init
-//   - What parent-scope (filter+0x8) the game's filter object has
 // Resolve mainChar from the game manager singleton: *(*(globalPtr) + 0x48)
 static uintptr_t ResolveMainChar() {
     if (!g_mainCharGlobalPtr) return 0;
@@ -1692,163 +1612,6 @@ static uintptr_t ResolveMainChar() {
         if (mgr) return *(uintptr_t*)(mgr + 0x48);
     } __except(EXCEPTION_EXECUTE_HANDLER) {}
     return 0;
-}
-
-// Resolve the menu-layer manager (menuMgr) WITHOUT a hardcoded global.
-// The game update on 2026-06-19 (buildid 23816417) moved the absolute
-// globals: the old hardcoded menuMgr global base+0x6066F90 now reads null
-// ("ViewMount/ViewUnmount: lvl1 null"), which breaks the panel mount AND
-// the vendor-menu soft-lock fix. But STRUCT OFFSETS survived this update
-// (boot log shows BottomLabel 0x350, active flag 0x128, subtypes 0xCB8 etc.
-// unchanged), so derive menuMgr from the same game-manager singleton the
-// mainChar resolver already uses:
-//   mgr     = *(g_mainCharGlobalPtr)        (dynamically resolved each build)
-//   menuMgr = *(mgr + 0x90)                 (stable struct offset)
-// and VALIDATE against the menuMgr->mainChar back-reference the game's own
-// state tick relies on (menuMgr+0x11C0 == mainChar) plus a sane state byte
-// (+0x105E in 0..4). If validation fails (an offset shifted), return 0 so
-// the caller logs and bails instead of writing menu state to a wrong object.
-static uintptr_t ResolveMenuMgr() {
-    if (!g_mainCharGlobalPtr) return 0;
-    uintptr_t mc = (uintptr_t)InterlockedCompareExchange64(&g_mainChar, 0, 0);
-    __try {
-        uintptr_t mgr = *(uintptr_t*)g_mainCharGlobalPtr;
-        if (mgr <= 0x10000) return 0;
-        uintptr_t menuMgr = *(uintptr_t*)(mgr + 0x90);
-        if (menuMgr <= 0x10000) return 0;
-        uintptr_t back = *(uintptr_t*)(menuMgr + 0x11C0);
-        uint8_t   cur  = *(uint8_t*)(menuMgr + 0x105E);
-        if (mc && back == mc && cur <= 4) return menuMgr;
-        Log("  ResolveMenuMgr: validation FAILED (menuMgr=0x%llX back=0x%llX mc=0x%llX cur=0x%02X) "
-            "— +0x90/+0x11C0/+0x105E offset may have shifted, need Ghidra on new build",
-            (unsigned long long)menuMgr, (unsigned long long)back,
-            (unsigned long long)mc, cur);
-    } __except(EXCEPTION_EXECUTE_HANDLER) {
-        Log("  ResolveMenuMgr: EXCEPTION");
-    }
-    return 0;
-}
-
-// Mode-byte save/restore helpers. Both take the spinlock and wrap the
-// memory access in SEH — but SEH only catches access violations. A
-// resolved-wrong-but-mapped offset (e.g. resolver picks a neighbouring
-// struct field) would silently overwrite unrelated game state without
-// faulting. So we also gate on a plausibility check: the offsets must
-// live in the mainChar mode/sub-mode cluster (~0xC00..0xE00 on every
-// known build) AND maintain the expected relationship
-// g_offSubtypes == g_offModeFlags + 7. If either invariant fails, the
-// helper is a no-op + WARN — F-key open will silently get the wrong
-// mode bytes, but we won't corrupt mainChar.
-static bool ModeOffsetsPlausible() {
-    uint32_t f = g_offModeFlags, s = g_offSubtypes;
-    if (f < 0xC00 || f > 0xE00) return false;
-    if (s < 0xC00 || s > 0xE00) return false;
-    if (s != f + 7) return false;
-    return true;
-}
-
-static void SafeSetupModeForWarehouse(uint8_t* mc) {
-    if (!mc) return;
-    if (!ModeOffsetsPlausible()) {
-        Log("  SafeSetupModeForWarehouse SKIPPED — implausible resolved offsets (flags=0x%X subtypes=0x%X)",
-            g_offModeFlags, g_offSubtypes);
-        return;
-    }
-    while (InterlockedCompareExchange(&g_modeByteLock, 1, 0) != 0) { _mm_pause(); }
-    __try {
-        memcpy(g_savedModes,    mc + g_offModeFlags, 7);
-        memcpy(g_savedSubtypes, mc + g_offSubtypes, 15);
-        memset(mc + g_offModeFlags, 0, 7);
-        memset(mc + g_offSubtypes, 0, 15);
-        mc[g_offModeFlags + 4] = 1;
-        // ROOT-CAUSE FIX: the game tick's mode-resolver scans
-        // mc[g_offSubtypes+0..16] for the first non-zero entry and DERIVES
-        // mc[g_offSubByte] from that index. The (mode=4,sub)->view-tag mapper
-        // (ModeSwitcher FUN, 1.12.00 @ base+0x721BD0) then turns that sub
-        // value into the view-tag list; WareHouseView2 only mounts when the
-        // list contains "store". So we must set the subtype index whose
-        // derived sub-mode emits the "store" tag. THIS INDEX MOVES between
-        // game versions — Pearl Abyss has flipped it repeatedly:
-        //   1.09:    store = sub 5
-        //   1.10.xx: store = sub 6   (mod set index 6)
-        //   1.12.00: store = sub 5   (verified: ModeSwitcher case 5 emits
-        //                             "dialog"+"store"; case 6 = hud/minigame/qte)
-        // Forcing mc[g_offSubByte] directly doesn't work (the resolver
-        // overrides it back to the flag-derived value every tick), so the
-        // flag-INDEX is the lever. g_storeSubIndex holds it.
-        // RE-FIND after a game update: decompile the ModeSwitcher fn (the
-        // string-xref-resolved base+0x721BD0), read its inner switch(sub),
-        // and pick the case that appends the "store" string pointer.
-        mc[g_offSubtypes + g_storeSubIndex] = 1;
-    } __except(EXCEPTION_EXECUTE_HANDLER) {
-        Log("  SafeSetupModeForWarehouse EXCEPTION (offsets may be stale: flags=0x%X subtypes=0x%X)",
-            g_offModeFlags, g_offSubtypes);
-    }
-    InterlockedExchange(&g_modeByteLock, 0);
-}
-
-static void SafeRestoreMode(uint8_t* mc) {
-    if (!mc) return;
-    if (!ModeOffsetsPlausible()) {
-        Log("  SafeRestoreMode SKIPPED — implausible resolved offsets (flags=0x%X subtypes=0x%X)",
-            g_offModeFlags, g_offSubtypes);
-        return;
-    }
-    while (InterlockedCompareExchange(&g_modeByteLock, 1, 0) != 0) { _mm_pause(); }
-    __try {
-        memcpy(mc + g_offModeFlags, g_savedModes,    7);
-        memcpy(mc + g_offSubtypes,  g_savedSubtypes, 15);
-        // (sub byte is no longer forced on open — nothing to restore here)
-    } __except(EXCEPTION_EXECUTE_HANDLER) {
-        Log("  SafeRestoreMode EXCEPTION (offsets may be stale: flags=0x%X subtypes=0x%X)",
-            g_offModeFlags, g_offSubtypes);
-    }
-    InterlockedExchange(&g_modeByteLock, 0);
-}
-
-extern "C" void __fastcall CaptureModeSwitcher(void* rcx) {
-    if (!g_mainChar) {
-        uintptr_t mc = ResolveMainChar();
-        if (mc > 0x10000000000ULL) {
-            InterlockedExchange64(&g_mainChar, (LONG64)mc);
-            Log("CAPTURED mainChar: 0x%llX (via singleton)", (unsigned long long)mc);
-
-            // Capture cursorObj via pointer chain: mainChar+0x50 -> +0x60 -> deref -> +0x78
-            __try {
-                uintptr_t container = *(uintptr_t*)((uint8_t*)mc + 0x50);
-                if (container) {
-                    uintptr_t worldList = *(uintptr_t*)(container + 0x60);
-                    if (worldList) {
-                        uintptr_t world = *(uintptr_t*)worldList;
-                        if (world) {
-                            uintptr_t cursor = *(uintptr_t*)(world + 0x78);
-                            if (cursor > 0x10000000000ULL) {
-                                InterlockedExchange64(&g_cursorObj, (LONG64)cursor);
-                                Log("CAPTURED cursorObj: 0x%llX", (unsigned long long)cursor);
-                            }
-                        }
-                    }
-                }
-            } __except(EXCEPTION_EXECUTE_HANDLER) {}
-        }
-    }
-
-    // Game calls ModeSwitcher every frame. While warehouse is open,
-    // g_modeSwitchByMod stays 1 so this check is always skipped.
-    // Close detection is handled by CanShow (+0x118 flag) and explicit
-    // user actions (F6/ESC/Circle/B). This block only fires if
-    // g_modeSwitchByMod was unexpectedly 0 (should not happen).
-    if (InterlockedCompareExchange(&g_warehouseActive, 0, 0) &&
-        !InterlockedCompareExchange(&g_modeSwitchByMod, 0, 0)) {
-        Log("  ModeSwitcher: unexpected game close detected, releasing warehouse");
-        InterlockedExchange(&g_warehouseActive, 0);
-        InterlockedExchange(&g_canShowSeen118, 0);
-        InterlockedExchange(&g_modeSwitchByMod, 0);
-        uint8_t* mc = (uint8_t*)(uintptr_t)InterlockedCompareExchange64(&g_mainChar, 0, 0);
-        // Release the menu-layer too (idempotent if the game already did).
-        TriggerWarehouseViewUnmount();
-        SafeRestoreMode(mc);
-    }
 }
 
 // ============================================================
@@ -1860,177 +1623,38 @@ static PFN_CanShow g_origCanShow = nullptr;
 extern "C" char __fastcall HookedCanShow(void* thisPtr) {
     uintptr_t handler = (uintptr_t)InterlockedCompareExchange64(&g_handlerThis, 0, 0);
 
-    // Diagnostic: log first few entry calls + unique vtables seen, RESET on
-    // each F-press (TriggerWarehouse bumps g_diagEpoch). Helps triage when
-    // auto-capture is silently failing — after a session where the user did
-    // an NPC visit, the warehouse vtable SHOULD appear among the polled
-    // panels and trigger auto-capture. If it never appears even after NPC
-    // visit, the hooked CanShow function is wrong (different override).
-    static volatile LONG s_diagEpochSeen = -1;
-    static volatile LONG s_diagEntryCount = 0;
-    static volatile LONG s_diagMissCount  = 0;
-    static uintptr_t s_diagMissVts[20] = {};
-    LONG epoch = InterlockedCompareExchange(&g_diagEpoch, 0, 0);
-    if (InterlockedCompareExchange(&s_diagEpochSeen, 0, 0) != epoch) {
-        InterlockedExchange(&s_diagEpochSeen, epoch);
-        InterlockedExchange(&s_diagEntryCount, 0);
-        InterlockedExchange(&s_diagMissCount, 0);
-        for (int i = 0; i < 20; i++) s_diagMissVts[i] = 0;
-    }
-    if (g_traceMode && handler == 0 && InterlockedCompareExchange(&s_diagEntryCount, 0, 0) < 30) {
-        LONG n = InterlockedIncrement(&s_diagEntryCount);
-        __try {
-            uintptr_t vt = *(uintptr_t*)thisPtr;
-            Log("  CanShow ENTRY #%ld (epoch %ld): thisPtr=0x%llX vt=0x%llX (base+0x%llX) g_warehouseVtableStart=base+0x%llX warehouseActive=%ld",
-                (long)n, (long)epoch, (unsigned long long)thisPtr, (unsigned long long)vt,
-                vt > g_gameBase ? (unsigned long long)(vt - g_gameBase) : (unsigned long long)vt,
-                g_warehouseVtableStart > g_gameBase ? (unsigned long long)(g_warehouseVtableStart - g_gameBase) : 0ULL,
-                (long)InterlockedCompareExchange(&g_warehouseActive, 0, 0));
-        } __except(EXCEPTION_EXECUTE_HANDLER) {}
-    }
-
-    // POST-CAPTURE diagnostic — after handler is captured, log CanShow polls
-    // to verify whether the game ever calls our hook on the captured object.
-    // If no log entries appear with "thisPtr == handler" after capture, then
-    // the game polls a DIFFERENT CanShow override (likely via a different
-    // inherited vtable slot than the one we hooked) — that explains the
-    // "panel never renders even with handler captured" symptom.
-    static volatile LONG s_diagPostCaptureCount = 0;
-    if (g_traceMode && handler != 0 && InterlockedCompareExchange(&s_diagPostCaptureCount, 0, 0) < 30) {
-        LONG n = InterlockedIncrement(&s_diagPostCaptureCount);
-        __try {
-            uintptr_t vt = *(uintptr_t*)thisPtr;
-            const char* tag = ((uintptr_t)thisPtr == handler) ? "**HANDLER MATCH**" :
-                              (vt == g_warehouseVtableStart)  ? "warehouse-vtable" :
-                                                                "other-panel";
-            Log("  CanShow POST-CAPTURE #%ld (epoch %ld): %s thisPtr=0x%llX vt=base+0x%llX warehouseActive=%ld",
-                (long)n, (long)epoch, tag, (unsigned long long)thisPtr,
-                vt > g_gameBase ? (unsigned long long)(vt - g_gameBase) : (unsigned long long)vt,
-                (long)InterlockedCompareExchange(&g_warehouseActive, 0, 0));
-        } __except(EXCEPTION_EXECUTE_HANDLER) {}
-    }
-
-    // Auto-capture warehouse controller by exact vtable match. All 6 panels
-    // share this controller — the per-panel inventory binding happens via
-    // SetInventory with the panel's filter string during InitWarehousePanel.
+    // Auto-capture the warehouse controller by exact vtable match. All six
+    // storages share this controller — the per-panel inventory binding happens
+    // via SetInventory in InitWarehousePanel.
     if (g_warehouseVtableStart && (uintptr_t)thisPtr != handler) {
         __try {
-            uintptr_t objVtable = *(uintptr_t*)thisPtr;
-            if (objVtable == g_warehouseVtableStart) {
-                uintptr_t sub = *(uintptr_t*)((uint8_t*)thisPtr + g_offSubObject);
-                uint16_t panelId = sub ? *(uint16_t*)((uint8_t*)sub + g_offSubPanelId) : 0xFFFF;
+            if (*(uintptr_t*)thisPtr == g_warehouseVtableStart) {
                 InterlockedExchange64(&g_handlerThis, (LONG64)(uintptr_t)thisPtr);
                 handler = (uintptr_t)thisPtr;
-                Log("AUTO-CAPTURED warehouse controller: 0x%llX (panelId=0x%04X)",
-                    (unsigned long long)thisPtr, panelId);
-
-                // Fix for first-open-empty: when we just captured the handler
-                // AND a F6/F7 trigger is currently waiting on init, run
-                // InitWarehousePanel inline on the game thread NOW. This is
-                // the same thread that's about to render the panel, so when
-                // CanShow returns the panel renders WITH our SetInventory +
-                // PanelValue + Title already applied. The WM_INIT_WAREHOUSE
-                // posted by InputThread later still runs but is a no-op
-                // because g_initPending was cleared.
+                Log("AUTO-CAPTURED warehouse controller: 0x%llX", (unsigned long long)thisPtr);
+                // First-open fix: when a hotkey press is waiting on this capture,
+                // initialise the panel right now, on the game thread that is about
+                // to render it. The WM_INIT_WAREHOUSE posted by InputThread later
+                // becomes a no-op because g_initPending is cleared here.
                 if (InterlockedCompareExchange(&g_initPending, 0, 0)) {
                     InterlockedExchange(&g_initPending, 0);
                     Log("  CanShow: running InitWarehousePanel inline (first-open fix)");
                     InitWarehousePanel(handler, GetInitStringForActive());
-                }
-            } else if (g_traceMode && handler == 0 &&
-                       InterlockedCompareExchange(&s_diagMissCount, 0, 0) < 20) {
-                // Log first 20 distinct mismatched vtables — tells us whether
-                // the RTTI scan latched onto the wrong class or whether the
-                // warehouse object simply isn't being polled this epoch.
-                bool seen = false;
-                for (int i = 0; i < 20; i++) {
-                    if (s_diagMissVts[i] == objVtable) { seen = true; break; }
-                }
-                if (!seen) {
-                    LONG idx = InterlockedIncrement(&s_diagMissCount) - 1;
-                    if (idx >= 0 && idx < 20) s_diagMissVts[idx] = objVtable;
-                    Log("  CanShow vtable-mismatch #%ld (epoch %ld): thisPtr=0x%llX vt=0x%llX (base+0x%llX) expected=base+0x%llX",
-                        (long)(idx + 1), (long)epoch, (unsigned long long)thisPtr,
-                        (unsigned long long)objVtable,
-                        objVtable > g_gameBase ? (unsigned long long)(objVtable - g_gameBase) : (unsigned long long)objVtable,
-                        g_warehouseVtableStart > g_gameBase ? (unsigned long long)(g_warehouseVtableStart - g_gameBase) : 0ULL);
                 }
             }
         } __except(EXCEPTION_EXECUTE_HANDLER) {}
     }
 
     if (InterlockedCompareExchange(&g_warehouseActive, 0, 0)) {
-        // If we have not yet captured the handler (auto-capture above did
-        // not match — e.g. game uses a sub-object vtable that differs from
-        // the static RTTI vtable we resolved), we cannot tell warehouse
-        // from other panels. Fall through to the original CanShow so the
-        // game's own logic can render whichever panel is legitimately
-        // active. Without this, every CanShow poll was returning 0 →
-        // even the warehouse got suppressed → UI never appeared.
-        if (handler == 0) {
-            return g_origCanShow(thisPtr);
-        }
-        if ((uintptr_t)thisPtr == handler) {
-            __try {
-                uint8_t activeFlag = *(uint8_t*)((uint8_t*)thisPtr + g_offActiveFlag);
-                if (activeFlag == 1) {
-                    // Panel is alive — remember we've seen it active and reset
-                    // the close-detection counter.
-                    InterlockedExchange(&g_canShowSeen118, 1);
-                    InterlockedExchange(&g_canShowZeroCount, 0);
-                } else if (activeFlag == 0 && InterlockedCompareExchange(&g_canShowSeen118, 0, 0)) {
-                    // Housing chest panels (Gatherables, Refrigerator, …)
-                    // briefly write 0 to +0x118 during internal sub-state
-                    // transitions. The auto-close detection here was the
-                    // root cause of "second-time B doesn't close": a short
-                    // burst of zero polls during the second open would set
-                    // g_warehouseActive=0 prematurely, after which the
-                    // controller thread treated B presses as "warehouse not
-                    // open" and silently dropped them.
-                    //
-                    // Auto-close is only meaningful while the panel is NOT
-                    // mod-owned. While g_modeSwitchByMod==1 the mod itself
-                    // is driving the session — the only legitimate close in
-                    // that mode is via TriggerWarehouse, never an in-flight
-                    // game write to +0x118. So gate the detection on the
-                    // mod NOT owning the mode-switch, and require a long
-                    // 60-poll (~1 s) stability window even then.
-                    if (InterlockedCompareExchange(&g_modeSwitchByMod, 0, 0)) {
-                        return 1;  // mod-owned session — never auto-close
-                    }
-                    LONG zc = InterlockedIncrement(&g_canShowZeroCount);
-                    if (zc < 60) {
-                        return 1;  // keep showing, treat as transient
-                    }
-                    Log("  CanShow: game-initiated close detected (active flag 1→0, %ld stable zero polls)", zc);
-                    InterlockedExchange(&g_warehouseActive, 0);
-                    InterlockedExchange(&g_canShowSeen118, 0);
-                    InterlockedExchange(&g_canShowZeroCount, 0);
-                    InterlockedExchange(&g_modeSwitchByMod, 0);
-                    uintptr_t mc = (uintptr_t)InterlockedCompareExchange64(&g_mainChar, 0, 0);
-                    // Release the menu-layer too — if the game closed only the
-                    // panel (+0x118) without a layer close, +0x105E would stay
-                    // 1 and poison all later menu opens. Idempotent when the
-                    // game already closed the layer itself.
-                    TriggerWarehouseViewUnmount();
-                    SafeRestoreMode((uint8_t*)mc);
-                    return g_origCanShow(thisPtr);
-                }
-            } __except(EXCEPTION_EXECUTE_HANDLER) {}
-            return 1;   // WareHouseView: force show
-        }
-        // Blanket suppress ALL other panels while warehouse is active.
-        // Do NOT delegate to origCanShow here — it has internal side-effects
-        // that corrupt game state and cause the warehouse to reappear during
-        // subsequent NPC interactions.
-        __try {
-            uintptr_t sub = *(uintptr_t*)((uint8_t*)thisPtr + g_offSubObject);
-            uint16_t pid = sub ? *(uint16_t*)((uint8_t*)sub + g_offSubPanelId) : 0xFFFF;
-            uint8_t flag = *(uint8_t*)((uint8_t*)thisPtr + g_offActiveFlag);
-            if (flag)
-                Log("  CanShow: suppressed panel 0x%04X (active=%d, thisPtr=0x%llX)",
-                    pid, flag, (unsigned long long)thisPtr);
-        } __except(EXCEPTION_EXECUTE_HANDLER) {}
+        // Handler not captured yet: we cannot tell the warehouse from other
+        // panels, so let the game decide.
+        if (handler == 0) return g_origCanShow(thisPtr);
+        // The warehouse is force-shown for as long as the mod owns the session;
+        // the only close paths are TriggerWarehouse (hotkey / ESC / controller).
+        if ((uintptr_t)thisPtr == handler) return 1;
+        // Suppress every other panel while the warehouse is open. Do NOT
+        // delegate to the original here — its side effects make the warehouse
+        // reappear during later NPC interactions.
         return 0;
     }
     return g_origCanShow(thisPtr);
@@ -2141,8 +1765,7 @@ static int FindPrologBoundary(uint8_t* code, int minBytes) {
         // JMP [RIP+disp32] thunk: FF 25 xx xx xx xx + 8-byte inline address = 14 bytes
         if (b == 0xFF && code[pos+1] == 0x25) { pos += 14; continue; }
         // 66 89 modrm [sib] [disp] — operand-size override + MOV r/m16, r16
-        // Seen in 1.06.00 ItemDetail open handler @ 0xB4D250 which starts with
-        // `66 89 54 24 10` (MOV word ptr [RSP+0x10], DX) before the PUSH chain.
+        // (e.g. `66 89 54 24 10` = MOV word ptr [RSP+0x10], DX before a PUSH chain).
         if (b == 0x66 && code[pos+1] == 0x89) {
             uint8_t modrm = code[pos+2];
             uint8_t mod = modrm >> 6, rm = modrm & 0x07;
@@ -2220,12 +1843,9 @@ static bool InstallHook(uintptr_t func, uintptr_t capture, const char* name, int
 }
 
 static bool InstallCanShowHook(uintptr_t func) {
-    // Try to find a clean prolog boundary >= 14 bytes so the trampoline tail
-    // doesn't sit mid-instruction. If the decoder hits an opcode it doesn't
-    // know (REX variants other than 48/4C, exotic prologs, ...), fall back to
-    // the historical fixed 14-byte cut + NOP padding. That fallback has
-    // worked on every release from 1.06 to 1.09; the boundary search is a
-    // best-effort upgrade, not a hard requirement.
+    // Find a clean prolog boundary >= 14 bytes so the trampoline tail does not
+    // sit mid-instruction; if the decoder meets an opcode it does not know,
+    // fall back to a fixed 14-byte cut + NOP padding.
     int hookSize = FindPrologBoundary((uint8_t*)func, 14);
     if (hookSize < 14 || hookSize > 20) {
         Log("HOOK CanShow: prolog boundary not detected (got %d), falling back to fixed 14 bytes", hookSize);
@@ -2233,7 +1853,7 @@ static bool InstallCanShowHook(uintptr_t func) {
     }
     // Reserve the table slot BEFORE patching so an overflow can't leave a
     // live patch that DLL_PROCESS_DETACH can never restore. Mirrors
-    // InstallHook's contract (line 1504-1507).
+    // InstallHook's contract.
     if (hookSize > (int)sizeof(g_hookTable[0].orig) ||
         g_hookCount >= (int)(sizeof(g_hookTable)/sizeof(g_hookTable[0]))) {
         Log("HOOK CanShow: ABORT — hook-table full or hookSize %d exceeds slot capacity", hookSize);
@@ -2271,192 +1891,231 @@ static bool InstallCanShowHook(uintptr_t func) {
 }
 
 // ============================================================
-//  Scope-actor binding for the active panel
+//  Menu request — the CD 2.01.00 open/close path
 // ============================================================
-// In 1.05.0 SetInventory subscribes a channel and then fires the
-// vtable[+0x20] "subscribe" virtual on an "actor" obtained via:
-//   sub_controller[1]+0x8 → +0x60 = scope-root
-//   FUN_1435115C0(scope-root) walks +0xa8/+0x50 chain looking for a node
-//   with non-null +0x140 → returns *(node+0x140) as the actor
-// Items are pushed during that subscribe call. If the actor is the wrong
-// chest (e.g. previous panel's), wrong items render.
+// Locate MenuRequest + the menu object chain. Anchor: the game's own
+// "is this view open" test, which reads a byte, ANDs 0x60 and compares 0x40:
 //
-// This helper looks up the correct chest_object via the game's own
-// FUN_143511520 (chest-registry indexed by type-id), then writes it into
-// scope+0x140 so FUN_1435115C0 returns it on the very first iteration.
+//     movzx eax, byte [rax + STATE]     0F B6 80 <disp32>
+//     and   al, 0x60                    24 60
+//     cmp   al, 0x40                    3C 40
+//     ...
+//     mov   rcx, [rip + GLOBAL]         48 8B 0D <disp32>
+//     mov   rcx, [rcx + OBJOFF]         48 8B 89 <disp32>
+//     call  MENUREQUEST                 E8 <rel32>
 //
-// Limitation: FUN_143511520 returns 0 if the chest's type_id is not in
-// (scene+0xb0)+0xd8. That registry is filled by world-streaming, so for
-// housing chests the player must have been in the camp area at least
-// once. CampWareHouse (PRIVATE) is always loaded with the camp scene.
+// The global and the member offset must be unanimous across every match; the
+// function itself is taken by majority (build 25116796: 3 sites, all agreeing
+// on the global and +0x98, and 2 of 3 on the function).
+static bool ResolveMenuRequest() {
+    uint8_t* base = (uint8_t*)g_gameBase;
+    uintptr_t glob = 0; uint32_t objOff = 0;
+    bool globConflict = false;
+    uintptr_t fnCand[8] = {}; int fnVotes[8] = {}; int nFn = 0;
+    int matches = 0;
 
-// ============================================================
-//  Warehouse panel initialization (handler-dependent steps)
-//  Called from TriggerWarehouse when handler is available, or
-//  deferred via WM_INIT_WAREHOUSE when handler wasn't captured yet.
-// ============================================================
-// CD 1.10 context-free view-mount trigger (Ghidra-verified).
-// Replicates only the menu-layer STATE WRITES the game's tick FUN_140782EE0
-// performs on its open path (current/+0x105E=1, request/+0x105F=1). The
-// tick itself is never called: it dereferences the interaction target
-// (menuMgr+0x10C8) which faults on a cold remote open. subtypes[6]=1 (set
-// by SafeSetupModeForWarehouse) drives the actual panel mount via the
-// mode resolver; the state bytes keep the menu-layer machine consistent.
-//
-// menuMgr is resolved drift-proof via ResolveMenuMgr() — see that function.
-// (The original 1.10 hardcoded global base+0x6066F90 was moved by the
-// 2026-06-19 update; ResolveMenuMgr derives + validates it instead.)
-//   menuMgr fields: +0x105E current, +0x105F request, +0x11C0 mainChar.
-// All steps null-checked + SEH-guarded.
-// Returns false ONLY when the menu-layer is already flagged open
-// (+0x105E==1) — at TriggerWarehouse time that means a game menu session's
-// close is still in flight (fast re-open after shop/cooking/bank) and the
-// caller must abort instead of creating an invisible ghost session.
-//
-// NOTE on the event queue (append removed in v1.5.6): the game's writers
-// pass *(holder+0x878) — the channel queue POINTER stored in the slot — to
-// FUN_1403862B0; v1.5.5 passed the slot ADDRESS holder+0x878, so the
-// append misread slot bytes as queue fields and faulted on every open
-// (SEH-caught "EXCEPTION at step 'enqueue'"). No mod session ever delivered
-// an event, and panels demonstrably mount fine via the sub=6 path alone.
-// The append is deliberately OMITTED rather than fixed: a delivered open
-// event would fire the game's menu-layer listener (LAB_140AA8E30 ->
-// FUN_14A59D7D0 open transition), whose tick unconditionally dereferences
-// the interaction context *(menuMgr+0x10C8) — a path never exercised by
-// mod sessions and unsafe on a cold remote open. The queue is a one-way
-// state-changed broadcast; natural sessions emit their own events, missing
-// mod events are harmless (Ghidra-verified 2026-06-10).
-static bool TriggerWarehouseViewMount() {
-    const char* step = "start";
-    __try {
-        uintptr_t menuMgr = ResolveMenuMgr();
-        if (menuMgr <= 0x10000) { Log("  ViewMount: menuMgr unresolved"); return true; }
-        step = "read state";
-        uint8_t cur = *(uint8_t*)(menuMgr + 0x105E);  // current state
-        if (cur == 1) {
-            // Do NOT touch the state bytes here — if a game session owns the
-            // layer, overwriting +0x105F would interfere with its close.
-            Log("  ViewMount: layer busy (+0x105E=1)");
-            return false;
+    for (DWORD i = 0; (size_t)i + 0x80 < g_imageSize; i++) {
+        if (base[i] != 0x0F || base[i+1] != 0xB6 || base[i+2] != 0x80) continue;
+        if (base[i+7] != 0x24 || base[i+8] != 0x60)  continue;
+        if (base[i+9] != 0x3C || base[i+10] != 0x40) continue;
+
+        for (int f = 11; f < 0x60; f++) {
+            uint8_t* q = base + i + f;
+            if (q[0] != 0x48 || q[1] != 0x8B || q[2] != 0x89) continue;
+            uint32_t oo = *(uint32_t*)(q + 3);
+            if (oo < 0x10 || oo > 0x2000) break;
+
+            uintptr_t g = 0;
+            for (int back = 7; back <= 0x20; back++) {
+                uint8_t* r = q - back;
+                if (r[0] == 0x48 && r[1] == 0x8B && r[2] == 0x0D) {
+                    uintptr_t c = (uintptr_t)(r + 7) + *(int32_t*)(r + 3);
+                    if (c > g_gameBase && c < g_gameBase + g_imageSize) g = c;
+                }
+            }
+            uintptr_t tgt = 0;
+            for (int f2 = 7; f2 < 0x20; f2++) {
+                uint8_t* r = q + f2;
+                if (r[0] != 0xE8) continue;
+                uintptr_t t = (uintptr_t)(r + 5) + *(int32_t*)(r + 1);
+                if (t > g_gameBase && t < g_gameBase + g_imageSize) tgt = t;
+                break;
+            }
+            if (!g || !tgt) break;
+
+            matches++;
+            if (!glob) { glob = g; objOff = oo; }
+            else if (glob != g || objOff != oo) globConflict = true;
+
+            int k = 0;
+            for (; k < nFn; k++) if (fnCand[k] == tgt) { fnVotes[k]++; break; }
+            if (k == nFn && nFn < 8) { fnCand[nFn] = tgt; fnVotes[nFn] = 1; nFn++; }
+            break;
         }
-        step = "write state";
-        *(uint8_t*)(menuMgr + 0x105F) = 1;            // request open
-        *(uint8_t*)(menuMgr + 0x105E) = 1;            // mark current=open
-        Log("  ViewMount: state set (current=1, request=1)");
-    } __except(EXCEPTION_EXECUTE_HANDLER) {
-        Log("  ViewMount: EXCEPTION at step '%s' (open continues)", step);
     }
+
+    if (!glob || globConflict || !nFn) {
+        Log("MenuRequest: FAIL (%d match(es), conflict=%d)", matches, (int)globConflict);
+        return false;
+    }
+    uintptr_t best = 0; int bestVotes = 0;
+    for (int k = 0; k < nFn; k++)
+        if (fnVotes[k] > bestVotes) { bestVotes = fnVotes[k]; best = fnCand[k]; }
+
+    g_menuRequestFn  = best;
+    g_menuRootGlobal = glob;
+    g_menuObjOff     = objOff;
+    Log("MenuRequest: OK fn=base+0x%llX  menuObj=*(*(base+0x%llX)+0x%X)  (%d sites, %d votes)",
+        (unsigned long long)(best - g_gameBase),
+        (unsigned long long)(glob - g_gameBase), objOff, matches, bestVotes);
     return true;
 }
 
-// Close counterpart of TriggerWarehouseViewMount (Ghidra-verified against
-// CD 1.10). The menu-layer's NATURAL resting state is the pair
-//   current (+0x105E) = 4, request (+0x105F) = 3
-// — both the menuMgr constructor (FUN_14076F860: dword 0x03040000 written
-// to +0x105C) and a completed natural close (FUN_14A59D7D0 request=2 ->
-// tick sets current=4 + close event 4; fade end -> FUN_140AA8A10 sets
-// request=3) park there. The request byte MUST end at 3, not 1/2: the
-// state tick FUN_140782EE0 runs on every NPC-interaction edge and only
-// CLEARS the mainChar menu-ownership flags (+0xCBD = subtypes[5] = the
-// CINEMA sub-mode flag, +0xCC5 = subtypes[13] = mainmenu flag) when
-// request==3; for any other parked value it re-asserts subtypes[5]=1.
-// The mode resolver FUN_140709D60 derives the sub-mode from the FIRST
-// non-zero subtype index, so a stuck subtypes[5]=1 (index 5, cinema)
-// permanently shadows index 6 (store): merchant talks then zoom the
-// camera (cinema layer) but never show the vendor/provisions/bank UI.
-// A parked request=2 additionally lets the tick emit spurious close
-// events on interaction edges and freezes the HUD interaction prompt
-// (its re-show timer in FUN_140D90550 requires request in {1,3}).
-// History: v1.5.5 parked (current=1, request=1) — flag poison plus
-// current==1 swallowing every edge-triggered natural open. An interim
-// test build parked (4, 2) — the flag poison remained. (4, 3) is the
-// verified idle pair. No close event is appended — see the event-queue
-// note at TriggerWarehouseViewMount (the queue is a one-way broadcast,
-// missing/unpaired events are harmless).
+// Which screen id makes ModeSwitcher emit the "store" view tag. ModeSwitcher
+// dispatches through jump tables whose slots are image-base-relative; find the
+// table whose case block linearly contains the single LEA of "store".
+static int32_t ResolveStoreScreenId() {
+    if (!g_fnModeSwitcher) return -1;
+    const uint32_t WIN = 0x1200;
+    uint8_t* fn = (uint8_t*)g_fnModeSwitcher;
+
+    uintptr_t strStore = FindString("store");
+    if (!strStore) return -1;
+    uintptr_t storeLea = 0; int storeHits = 0;
+    for (uint32_t i = 0; i + 7 <= WIN; i++) {
+        uint8_t* p = fn + i;
+        if ((p[0] == 0x48 || p[0] == 0x4C) && p[1] == 0x8D && (p[2] & 0xC7) == 0x05) {
+            if ((uintptr_t)(p + 7) + *(int32_t*)(p + 3) == strStore) {
+                storeLea = (uintptr_t)p; storeHits++;
+            }
+        }
+    }
+    if (storeHits != 1) {
+        Log("StoreScreenId: 'store' LEA ambiguous inside ModeSwitcher (%d hits)", storeHits);
+        return -1;
+    }
+
+    // Every  MOV r32,[reg + reg*4 + disp32]  is a candidate dispatch. Collect
+    // ALL of their table addresses FIRST: ModeSwitcher has an outer switch (the
+    // mode) and an inner one (the screen), and the two tables sit back to back
+    // in memory. Reading a table until a slot falls outside the function body
+    // therefore runs straight through the boundary and merges both tables --
+    // which reports the store case at outer_count + inner_index (12 = 7 + 5 on
+    // build 25116796) instead of the index the game actually dispatches on.
+    // Bounding each table by the next table start fixes that.
+    uintptr_t bestTable = 0, bestWidth = (uintptr_t)-1;
+    int bestCase = -1, bestCount = 0;
+
+    uintptr_t tables[16]; int nTables = 0;
+    for (uint32_t i = 0; i + 7 <= WIN && nTables < 16; i++) {
+        uint8_t* p = fn + i;
+        if (p[0] != 0x8B || (p[1] & 0xC7) != 0x84) continue;
+        uintptr_t t = g_gameBase + *(uint32_t*)(p + 3);
+        bool dup = false;
+        for (int k = 0; k < nTables; k++) if (tables[k] == t) { dup = true; break; }
+        if (!dup) tables[nTables++] = t;
+    }
+
+    for (int ti = 0; ti < nTables; ti++) {
+        uintptr_t tableVA = tables[ti];
+        // Nearest other table that starts after this one bounds its length.
+        uintptr_t bound = tableVA + 0x40 * 4;
+        for (int k = 0; k < nTables; k++)
+            if (tables[k] > tableVA && tables[k] < bound) bound = tables[k];
+
+        uintptr_t lo = g_fnModeSwitcher, hi = g_fnModeSwitcher + WIN;
+        uintptr_t tgts[0x41]; int n = 0;
+        __try {
+            for (; n < 0x40 && tableVA + n * 4 < bound; n++) {
+                uintptr_t t = g_gameBase + *(uint32_t*)(tableVA + n * 4);
+                if (t < lo || t >= hi) break;
+                tgts[n] = t;
+            }
+        } __except(EXCEPTION_EXECUTE_HANDLER) { continue; }
+        if (n < 4) continue;
+
+        for (int k = 0; k < n; k++) {
+            uintptr_t nextB = hi;
+            for (int j = 0; j < n; j++)
+                if (tgts[j] > tgts[k] && tgts[j] < nextB) nextB = tgts[j];
+            if (tgts[k] <= storeLea && storeLea < nextB) {
+                // Keep the NARROWEST containing block. ModeSwitcher nests two
+                // switches: the outer one on the mode, the inner one on the
+                // screen. The outer case for "ingame-global" spans the whole
+                // inner switch, so it also contains the "store" LEA -- taking
+                // the first match returns the mode (4) instead of the screen
+                // (5), and the game then opens a different screen entirely.
+                // The innermost range is the specific case.
+                uintptr_t width = nextB - tgts[k];
+                if (width < bestWidth) {
+                    bestWidth = width;
+                    bestCase  = k;
+                    bestTable = tableVA;
+                    bestCount = n;
+                }
+            }
+        }
+    }
+
+    if (bestCase >= 0) {
+        Log("StoreScreenId: %d (table base+0x%llX, %d cases, narrowest block 0x%llX, "
+            "'store' at ModeSwitcher+0x%llX)",
+            bestCase, (unsigned long long)(bestTable - g_gameBase), bestCount,
+            (unsigned long long)bestWidth,
+            (unsigned long long)(storeLea - g_fnModeSwitcher));
+        return bestCase;
+    }
+    Log("StoreScreenId: no dispatch table covers the 'store' case");
+    return -1;
+}
+
+// Push a screen open/close request through the game's own queue.
+static bool MenuRequestScreen(int32_t screenId, bool open) {
+    if (!g_menuRequestFn || !g_menuRootGlobal || screenId < 0) return false;
+    typedef void (__fastcall* MenuRequestFn)(uintptr_t, uint8_t, uint8_t);
+    __try {
+        uintptr_t root = *(uintptr_t*)g_menuRootGlobal;
+        if (root <= 0x10000) { Log("  MenuRequest: root global null"); return false; }
+        uintptr_t obj = *(uintptr_t*)(root + g_menuObjOff);
+        if (obj <= 0x10000) { Log("  MenuRequest: menu object null"); return false; }
+        ((MenuRequestFn)g_menuRequestFn)(obj, (uint8_t)screenId, open ? 1 : 0);
+        Log("  MenuRequest(screen=%d, open=%d) sent", screenId, (int)open);
+        return true;
+    } __except(EXCEPTION_EXECUTE_HANDLER) {
+        Log("  MenuRequest: EXCEPTION (screen=%d open=%d)", screenId, (int)open);
+    }
+    return false;
+}
+
+static int32_t EffectiveStoreScreenId() {
+    return (g_storeScreenIdIni >= 0) ? g_storeScreenIdIni : g_storeScreenId;
+}
+
+// Mount / unmount the warehouse view through the game's own request queue.
+// Returns false when the request could not be sent, in which case the panel
+// cannot render and the caller must roll the open back.
+static bool TriggerWarehouseViewMount() {
+    if (MenuRequestScreen(EffectiveStoreScreenId(), true)) return true;
+    Log("  ViewMount: menu request unavailable (fn=%d screen=%d)",
+        g_menuRequestFn ? 1 : 0, EffectiveStoreScreenId());
+    return false;
+}
+
 static void TriggerWarehouseViewUnmount() {
-    const char* step = "start";
-    __try {
-        uintptr_t menuMgr = ResolveMenuMgr();
-        if (menuMgr <= 0x10000) { Log("  ViewUnmount: menuMgr unresolved"); return; }
-        step = "write state";
-        if (*(uint8_t*)(menuMgr + 0x105E) == 4) {
-            // Layer already closed — still park the request byte at its
-            // idle value so the tick's clear branch stays armed.
-            *(uint8_t*)(menuMgr + 0x105F) = 3;
-            Log("  ViewUnmount: already closed — request parked at 3 (idle)");
-            return;
-        }
-        *(uint8_t*)(menuMgr + 0x105F) = 3;            // request = idle (ctor + post-close value)
-        *(uint8_t*)(menuMgr + 0x105E) = 4;            // current = closed
-        Log("  ViewUnmount: parked at (current=4, request=3)");
-    } __except(EXCEPTION_EXECUTE_HANDLER) {
-        Log("  ViewUnmount: EXCEPTION at step '%s'", step);
-    }
+    if (!MenuRequestScreen(EffectiveStoreScreenId(), false))
+        Log("  ViewUnmount: menu request unavailable");
 }
 
 // ============================================================
-//  Filter sub-controller probe (read-only diagnostic).
-//
-//  HISTORY / WHY THIS DOES NOT RENDER ANYTHING (Ghidra audit 2026-06-10):
-//  The sub-controller at handler+0x1A8 with the 1.08 setter/render pair
-//  (1.10: setter base+0xB9B8C0, render base+0xB99620) is NOT the category
-//  tab bar (bag / armor / weapon / food / scroll / gem) shown in the
-//  screenshots — it is a YEAR/MONTH date selector: +0xC0 = calendar year,
-//  +0xC2 = month (1..12). The render scans a date-grouped document store
-//  for entries whose SYSTEMTIME matches (year,month) and rebuilds that
-//  date strip. Calling it on a remote/mod open faults for two independent
-//  reasons that guarding alone cannot fix:
-//    1. The render's tail unconditionally writes through *(filter+0x100)
-//       and vcalls *(*(filter+0x100))+0x518/+0x510. On remote opens +0x100
-//       holds an image/vtable pointer, not the heap list-control object a
-//       natural NPC open installs → access violation (confirmed live:
-//       "render EXCEPTION").
-//    2. The item refill FUN_140609350 dereferences a document-context
-//       chain *(*(DAT_146066F40+0x30)+0x50)+0x68+0x148 that only exists
-//       after a real warehouse interaction.
-//  Writing mode/sub directly is also wrong: (1,1) means "January, Year 1",
-//  which matches no items. So the render call was removed entirely. This
-//  helper now only LOGS the field values (useful if the category-tab work
-//  is ever revisited) and never writes or calls into the game.
+//  Warehouse panel initialisation (everything that needs the handler)
+//  Called from HookedCanShow / CaptureOnHandler right after the controller
+//  is captured, or via WM_INIT_WAREHOUSE when it was already known.
 // ============================================================
-static void ProbeFilterSubController(uintptr_t filterObj, const char* slotName) {
-    __try {
-        if (filterObj < 0x10000000000ULL) {
-            Log("  Filter[%s]: slot empty (0x%llX)", slotName, (unsigned long long)filterObj);
-            return;
-        }
-        uintptr_t scope   = *(uintptr_t*)(filterObj + 0x8);
-        uint16_t  curMode = *(uint16_t*)(filterObj + 0xC0);
-        uint16_t  curSub  = *(uint16_t*)(filterObj + 0xC2);
-        uint32_t  mapCnt  = *(uint32_t*) (filterObj + 0xD8);
-        uintptr_t ui100   = *(uintptr_t*)(filterObj + 0x100);
-        uintptr_t ui108   = *(uintptr_t*)(filterObj + 0x108);
-        Log("  Filter[%s]: obj=0x%llX scope=0x%llX mode=%u sub=%u mapCnt=%u "
-            "ui100=0x%llX ui108=0x%llX (probe only — no render)",
-            slotName, (unsigned long long)filterObj, (unsigned long long)scope,
-            curMode, curSub, mapCnt,
-            (unsigned long long)ui100, (unsigned long long)ui108);
-    } __except(EXCEPTION_EXECUTE_HANDLER) {
-        Log("  Filter[%s]: probe EXCEPTION", slotName);
-    }
-}
-
 static void InitWarehousePanel(uintptr_t handler, const char* initString) {
-    // InvSaveData heap scan removed: ran synchronously on the input thread
-    // and consistently produced 0 hits (~800ms stutter on first F6 open).
-    // If the scan ever becomes useful again, run it from a worker thread.
-
-    // Re-apply the 10 -> 1000 slot-count patch synchronously on every open.
-    // The background worker only re-checks every ~3s, and the game resets the
-    // InventoryInfo slot base back to 10 on a reload (save-load AND teleport /
-    // zone transition). Without this, opening a housing chest in the short
-    // window right after a teleport shows the vanilla capacity (10) until the
-    // worker catches up. Patching here guarantees the box always opens at 1000.
-    // Cheap + SEH-guarded; a no-op when the entries are already 1000.
-    if (g_addrInventoryInfoMgrPtr) {
-        int n = PatchInventoryInfoSlots();
-        if (n > 0) Log("  Slot patch (on open): %d entries default 10 -> 1000", n);
-    }
+    // Make sure the housing records are at their maximum before the panel reads
+    // them. A no-op once the boot-time worker has done its job; it only matters
+    // when the manager was re-created after that (e.g. a second save loaded).
+    PatchSlotsViaManager();
 
     // Clear stale modal dialog pointer from previous warehouse sessions.
     // Self-validate first: the slot must be 0 or a canonical heap pointer. If it
@@ -2479,56 +2138,15 @@ static void InitWarehousePanel(uintptr_t handler, const char* initString) {
         } __except(EXCEPTION_EXECUTE_HANDLER) {}
     }
 
-    // CD 1.10 NOTE (Ghidra-verified 2026-06-07): rendering is gated by the
-    // controller's render flag handler+0x2CD, which the Binder (FUN_140A9C820)
-    // only sets once the warehouse VIEW is mounted by the menu-manager. That
-    // mount path (FUN_14A59D7D0 / FUN_140782EE0 -> FUN_1403862B0) dereferences
-    // interaction context (DAT_146066F40 chain, menuMgr+0x10C8) that does NOT
-    // exist on a cold remote open, so calling those game functions directly
-    // faults. Instead we replicate ONLY the context-free menu-layer state
-    // writes of FUN_140782EE0's open path (see TriggerWarehouseViewMount;
-    // the event append was removed in v1.5.6 — see the note there). The
-    // actual mount is driven by subtypes[6]=1, set by
-    // SafeSetupModeForWarehouse. This re-call is idempotent (logs "layer
-    // busy" because the first call already set current=1).
+    // Ask for the view mount again now that the handler exists. TriggerWarehouse
+    // already sent one request before the capture; the second one is part of the
+    // sequence that was confirmed in-game and is kept as is.
     TriggerWarehouseViewMount();
 
-
-    // CD 1.10 SUB-MODE FIX — 2026-06-07
-    //
-    // The REAL fix: WareHouseView2.html in uigameconfig2.xml is tagged
-    // tag2="store ingamemenu" — the panel-manager only mounts this view
-    // when mainChar[+0xCA9] (sub byte) is 6 (store) or 0xE (ingamemenu).
-    // In all prior mod versions the sub byte was left at 0x10 (interaction)
-    // and the view never mounted, so the panel could never render no matter
-    // what the mod did to the warehouse instance / descriptor / queue.
-    //
-    // The fix is in SafeSetupModeForWarehouse, which now sets sub=6 on
-    // open and restores the original on close. Once sub=6 the panel-manager
-    // mounts WareHouseView2 on its next tick; the existing cmd 0x0E below
-    // then sets the active flag and the panel renders naturally.
-    //
-    // All earlier 1.10-era inline attempts (Init pre-check, vt[51] Show,
-    // multi-cmd 0x12/0x0D/0x15 sequence, descriptor +0x269 patch, direct
-    // queue-insert via thunk_FUN_156137720) have been removed — they were
-    // band-aids around the missing mount, and the queue-insert in
-    // particular crashed the game in 2026-06-07 testing because it
-    // bypassed engine state-machine guarantees.
-
-    // Send an empty 0x15 (prepare) BEFORE 0x0E — the natural-open order
-    // captured via Handler trace in 1.08. The 0x15 dispatcher makes three
-    // virtual "prepare" calls on the sub-objects at g_offPrepare1/2/3
-    // before iterating sub-commands; with count=0 only the prepares run.
-    // These virtuals are vtable-dispatched (no static xrefs — the
-    // "unanalyzed cold region" around 0x140ABBA10) and are the prime
-    // candidate for constructing the filter tab-bar helper at
-    // filter+0x100/+0x108 (in-place ctor FUN_14A668620), which natural
-    // opens bind and remote opens were missing. The send existed through
-    // v1.5.2 (tabs worked on mod opens in 1.08) and was lost in a later
-    // rework — the stale "now sent earlier" comment outlived the code.
-    // Guards unchanged from v1.5.1: all three sub-objects must be non-null
-    // or the dispatcher crashes (they can be unset before the first NPC
-    // interaction of a session).
+    // Empty 0x15 ("prepare") before 0x0E, the order of a natural open. The 0x15
+    // dispatcher makes three virtual calls on the sub-objects at g_offPrepare1/2/3
+    // before it iterates sub-commands; with count=0 only those calls run. All
+    // three sub-objects must be non-null or the dispatcher crashes.
     if (g_fnHandler) {
         __try {
             uintptr_t sub1 = *(uintptr_t*)(handler + g_offPrepare1);
@@ -2559,7 +2177,7 @@ static void InitWarehousePanel(uintptr_t handler, const char* initString) {
             showPacket[0] = 0x0E;
             typedef void (__fastcall *PFN_Handler)(void*, void*, void*, void*);
             ((PFN_Handler)g_fnHandler)((void*)handler, nullptr, nullptr, (void*)showPacket);
-            Log("  Cmd 0x0E sent (v1.5.1-style + 1.10 desc+0x269 patch above)");
+            Log("  Cmd 0x0E sent");
         } __except(EXCEPTION_EXECUTE_HANDLER) {
             Log("  Cmd 0x0E EXCEPTION — falling back to manual active-flag set");
             __try {
@@ -2581,12 +2199,9 @@ static void InitWarehousePanel(uintptr_t handler, const char* initString) {
         } __except(EXCEPTION_EXECUTE_HANDLER) {}
     }
 
-    // Save original handler+0x110 before any mod write. In 1.06 this was a
-    // PanelValue scalar (safe to write/clear). In 1.08 the handler struct
-    // shifted (BottomLabel +0x28, ActiveFlag +0x10), so +0x110 might now host
-    // a different field — possibly a pointer. Writing 0 on close would null a
-    // pointer the game later derefs during natural NPC-open. Save once per
-    // session; restore on close.
+    // Save the original PanelValue slot content before the first mod write; it
+    // is restored on close. A canonical pointer in this slot means the offset
+    // drifted to another field, and the override is disabled for the session.
     if (InterlockedCompareExchange64(&g_savedPanelValueSlot, 0, 0) == -1) {
         __try {
             uintptr_t orig = *(uintptr_t*)(handler + g_offPanelValue);
@@ -2600,35 +2215,22 @@ static void InitWarehousePanel(uintptr_t handler, const char* initString) {
         } __except(EXCEPTION_EXECUTE_HANDLER) {}
     }
 
-    // Override panelValue (handler+0x110) for the active panel. The 0x0e dispatcher
-    // reads this from a type-0x05 sub-command in the packet (parsed via strtoull),
-    // but our packet has no sub-commands so it defaults to 0. For Housing-Chests this
-    // is required so the container is bound — otherwise SetInventory loads items but
-    // the container metadata (max-slots etc.) stays at the Camp default.
-    //
-    // For Gatherables: prefer the runtime hash-map lookup (per-session ID), fall back
-    // to INI-configured static value if lookup fails.
+    // Write the PanelValue for the active panel (see g_panelValueCfg), then make
+    // sure the live capacity of the chest being opened is at its maximum.
     {
         LONG act = InterlockedCompareExchange(&g_activePanel, 0, 0);
         if (act < 0 || act >= PANEL_COUNT) act = PANEL_PRIVATE;
         LONG pv  = 0;
         const char* src = "none";
-        if (act == PANEL_PRIVATE) {
+        pv = InterlockedCompareExchange(&g_panelValueCfg[act], 0, 0);
+        if (pv) {
+            src = "INI per-panel";
+        } else if (act == PANEL_PRIVATE) {
             pv = InterlockedCompareExchange(&g_privatePanelValueCfg, 0, 0);
             src = "INI";
         } else {
-            // Per-panel lookup: each housing namespace (Gatherables, Dresser,
-            // Refrigerator, Symbol, Collecting) maps to its own 2-byte type-id
-            // via the same hash-map resolver. The id binds handler+0x110 to
-            // the right container metadata.
-            uint16_t resolved = GetPanelTypeId(act);
-            if (resolved != 0xFFFF && resolved != 0) {
-                pv = (LONG)resolved;
-                src = "per-panel hash-map";
-            } else {
-                pv = InterlockedCompareExchange(&g_gatherablesPanelValueCfg, 0, 0);
-                src = "INI fallback (Gatherables)";
-            }
+            pv = InterlockedCompareExchange(&g_gatherablesPanelValueCfg, 0, 0);
+            src = "default (GatherablesPanelValue)";
         }
         if (pv != 0 && g_panelValueSlotValid) {
             __try {
@@ -2643,324 +2245,27 @@ static void InitWarehousePanel(uintptr_t handler, const char* initString) {
             Log("  PanelValue override SKIPPED (slot +0x%X looks relocated)", g_offPanelValue);
         }
 
-        // Container at handler+0x170 is NULL without an NPC visit (the 0x0e
-        // panel-show command, which would normally bind Camp's container, throws
-        // an exception in our flow). So we can't patch a container that doesn't
-        // exist. Instead, patch the handler & sub fields directly — these match
-        // exactly the byte changes captured in the post-NPC memory diff.
-        //
-        // Per-panel field state from the diff (Camp default → GC after-NPC):
-        //   handler+0x1D8 (u32):   0x00000000 → 0xFFFFFFFF
-        //   handler+0x200 (u8 ):   0x01 → 0x00
-        //   handler+0x2A8 (u32):   0xFFFFFFFF → 0x00000000
-        //   sub+0x0B5     (u8 ):   0xD0 → 0xC0
-        //   sub+0x0B6     (u8 ):   0x02 → 0x00
-        //   sub+0x276     (u8 ):   0x02 → 0x00
-        //   sub+0x435     (u8 ):   0x14 → 0x10  ← possibly the "10" we see
-        //
-        // Save originals on first F7, restore on F6 to avoid Camp regression.
+        // Live capacity check for the chest being opened. PatchGroupCapacities
+        // only ever touches the five housing groups; the record was raised at
+        // boot and the game normally seeds the groups at 1000 itself, so this is
+        // the safety net for a save that loaded before the record patch ran.
         {
-            __try {
-                uintptr_t sub = *(uintptr_t*)(handler + 0x8);
-                if (act != PANEL_PRIVATE) {  // any housing panel (Gatherables/Dresser/...)
-                    if (!InterlockedCompareExchange(&g_campValuesSaved, 0, 0)) {
-                        InterlockedExchange(&g_savedCamp_84, (LONG)*(uint32_t*)(handler + 0x1D8));
-                        InterlockedExchange(&g_savedCamp_9C, (LONG)*(uint32_t*)(handler + 0x2A8));
-                        InterlockedExchange(&g_savedCamp_A0,
-                            sub ? (LONG)(uint32_t)(*(uint16_t*)(sub + 0xB5) | (*(uint8_t*)(sub + 0x276) << 16) | (*(uint8_t*)(sub + 0x435) << 24)) : 0);
-                        InterlockedExchange(&g_savedCamp_B8, (LONG)(*(uint8_t*)(handler + 0x200)));
-                        InterlockedExchange(&g_savedCamp_39C, (LONG)*(uint32_t*)(handler + 0x39C));
-                        InterlockedExchange(&g_campValuesSaved, 1);
-                        Log("  Saved Camp state: handler+0x1D8=0x%X +0x200=0x%X +0x2A8=0x%X "
-                            "+0x39C=%u sub+0xB5=0x%X +0xB6=0x%X +0x276=0x%X +0x435=0x%X",
-                            *(uint32_t*)(handler + 0x1D8),
-                            (unsigned)*(uint8_t*)(handler + 0x200),
-                            *(uint32_t*)(handler + 0x2A8),
-                            *(uint32_t*)(handler + 0x39C),
-                            sub ? (unsigned)*(uint8_t*)(sub + 0xB5) : 0,
-                            sub ? (unsigned)*(uint8_t*)(sub + 0xB6) : 0,
-                            sub ? (unsigned)*(uint8_t*)(sub + 0x276) : 0,
-                            sub ? (unsigned)*(uint8_t*)(sub + 0x435) : 0);
-                    }
-                    // 1.05.0: handler-field patches kept (cosmetic max-slots),
-                    // but sub-field patches DISABLED. The sub+0xB5/0xB6/0x276/
-                    // 0x435 writes were derived from a 1.0.4.x post-NPC memory
-                    // diff and may stomp 1.0.5.0 rendering state — e.g. block
-                    // the channel-bind from propagating into the visible grid.
-                    //
-                    // 2026-05: handler+0x200 patch DISABLED. The 0x01→0x00
-                    // transition was observed in the post-NPC memory diff,
-                    // but writing 0x00 puts the panel into a state where
-                    // the game's input pipeline consumes B-press events
-                    // before they reach XInput's per-process state. Result:
-                    // user presses B on Xbox controller, mod's InputThread
-                    // polls XInput and never sees 0x2000, B-close fails for
-                    // Gatherables / Refrigerator / Dresser / Symbol /
-                    // Collecting (works fine for Private/Camp because that
-                    // path doesn't enter this branch).
-                    // 1.06.00: handler+0x1D8/+0x2A8 patches DISABLED. These
-                    // offsets came from a 1.0.4.x post-NPC memory diff and
-                    // 1.06 has restructured the handler struct — writing
-                    // 0xFFFFFFFF / 0x00000000 to these slots corrupts state
-                    // that 1.06 uses for housing-panel rendering, leading
-                    // to a crash on first frame. The +0x39C max-slots patch
-                    // is also redundant in 1.06 because PatchInventoryInfoSlots
-                    // already bumped the per-info slot count to 1000 (see
-                    // boot log: "InventoryInfo slot patch: 5 entries default 10 -> 1000").
-                    // *(uint32_t*)(handler + 0x1D8) = 0xFFFFFFFF;  // 1.06: disabled
-                    // *(uint32_t*)(handler + 0x2A8) = 0x00000000;  // 1.06: disabled
-                    // *(uint32_t*)(handler + 0x39C) = 1000;        // 1.06: redundant (InventoryInfo patch covers it)
-
-                    Log("  Handler patches SKIPPED for housing panel in 1.06 (1.05 memory-diff offsets corrupt 1.06 state)");
-
-                } else {
-                    if (InterlockedCompareExchange(&g_campValuesSaved, 0, 0)) {
-                        *(uint32_t*)(handler + 0x1D8) = (uint32_t)InterlockedCompareExchange(&g_savedCamp_84, 0, 0);
-                        *(uint8_t* )(handler + 0x200) = (uint8_t )InterlockedCompareExchange(&g_savedCamp_B8, 0, 0);
-                        *(uint32_t*)(handler + 0x2A8) = (uint32_t)InterlockedCompareExchange(&g_savedCamp_9C, 0, 0);
-                        *(uint32_t*)(handler + 0x39C) = (uint32_t)InterlockedCompareExchange(&g_savedCamp_39C, 0, 0);
-                        if (sub) {
-                            uint32_t packed = (uint32_t)InterlockedCompareExchange(&g_savedCamp_A0, 0, 0);
-                            *(uint8_t*)(sub + 0xB5)  = (uint8_t)(packed       & 0xFF);
-                            *(uint8_t*)(sub + 0xB6)  = (uint8_t)((packed >> 8 ) & 0xFF);
-                            *(uint8_t*)(sub + 0x276) = (uint8_t)((packed >> 16) & 0xFF);
-                            *(uint8_t*)(sub + 0x435) = (uint8_t)((packed >> 24) & 0xFF);
-                        }
-                        Log("  Restored Camp handler+sub state");
-                    }
-                }
-            } __except(EXCEPTION_EXECUTE_HANDLER) {
-                Log("  Handler/sub patch EXCEPTION");
-            }
-        }
-
-        // Pre-clear stale bind: if handler+0x170 still holds the previous
-        // panel's container, clear it so our FUN_140a754e0 call below cleanly
-        // re-binds. Without this, FUN_140a754e0's pre-write check on +0x170
-        // can keep the wrong container if its sub-resolution path bails.
-        //
-        // The actual bind+refresh now happens AFTER SetInventory, by calling
-        // FUN_140a754e0(handler, sub) — the game's natural NPC-open routine.
-        // v1.4.2 strategy: pre-clear stale + per-panel sticky restore.
-        // SetInventory's unbind/rebind below does the actual refresh — no
-        // explicit BindRefresh call needed.
-        //
-        // Helper: invalidate the multi-field cache at grid+0x560..0x5F0 so the
-        // next FUN_140C55680(grid, source, _) call cannot short-circuit.
-        // Without this, switching between panels keeps the previous panel's
-        // grid content visible (cached source-key still matches old).
-        // Per RE: setting +0x568 = -1 forces bVar3=false in the cache check.
-        auto invalidateGridCache = [](uintptr_t handler) {
-            __try {
-                uintptr_t grid = *(uintptr_t*)(handler + 0x178);
-                if (grid >= 0x10000000000ULL) {
-                    *(short*)(grid + 0x568) = -1;
-                    Log("  Grid cache invalidate: grid=0x%llX +0x568=-1",
-                        (unsigned long long)grid);
-                }
-            } __except(EXCEPTION_EXECUTE_HANDLER) {
-                Log("  Grid cache invalidate EXCEPTION");
-            }
-        };
-        {
-                LONG ap = act;  // captured earlier in this block
-                uintptr_t existing = 0;
-                __try { existing = *(uintptr_t*)(handler + 0x170); } __except(EXCEPTION_EXECUTE_HANDLER) {}
-
-                LONG64 panelSticky = InterlockedCompareExchange64(&g_panelStickyContainer[ap], 0, 0);
-                LONG curBound = InterlockedCompareExchange(&g_currentBoundPanel, 0, 0);
-
-                // 1.08 finding from Ghidra: handler+0x170 is NOT a container slot
-                // in this version — it's one of 7 sub-controller pointers managed
-                // by the UIGamePlayControlRootMoveItem base class (FUN_140a84ab0
-                // dtor frees slots +0x150/+0x160/+0x170/+0x180/+0x1D8/+0x220/+0x2F0).
-                // Clearing it to NULL detaches a sub-controller the base class
-                // expects when rendering — next natural NPC-open then derefs NULL
-                // on the rendering path and crashes when items/UI pop up.
-                bool needClear = false;  // (existing >= 0x10000000000ULL) && (curBound != ap);
-                if (needClear) {
-                    __try {
-                        *(uintptr_t*)(handler + 0x170) = 0;
-                        Log("  Container bind: cleared stale 0x%llX (was %s, opening %s)",
-                            (unsigned long long)existing,
-                            (curBound >= 0 && curBound < PANEL_COUNT) ? g_panels[curBound].name : "?",
-                            g_panels[ap].name);
-                        existing = 0;
-                    } __except(EXCEPTION_EXECUTE_HANDLER) {
-                        Log("  Container bind: clear EXCEPTION");
-                    }
-                }
-
-                bool slotFinalized = false;
-                if (existing >= 0x10000000000ULL) {
-                    // Probe the existing pointer's vtable to catch the case
-                    // where a game update shifts handler+0x170 to a struct
-                    // field with random heap-looking content (false-positive
-                    // "valid"). A real bound sub-controller/container has its
-                    // vtable inside the game image; anything else is suspect.
-                    uintptr_t existingVt = 0;
-                    bool vtInImage = false;
-                    __try {
-                        existingVt = *(uintptr_t*)existing;
-                        vtInImage = (existingVt >= g_gameBase && existingVt < g_gameBase + g_imageSize);
-                    } __except(EXCEPTION_EXECUTE_HANDLER) {}
-                    // Diagnostic-only: log the vtable origin, but ALWAYS keep
-                    // the existing container. The "out-of-image" path is a
-                    // false-positive — sub-controllers managed by the base-
-                    // class dtor (see header comment for handler+0x170 above)
-                    // legitimately hold heap-allocated vtables on this build.
-                    // Earlier v1.5.4 cleared `existing` on OUT-of-image which
-                    // would route housing-panels into NULL-out — that's the
-                    // exact scenario the lines-1920 warning forbids.
-                    Log("  Container bind: handler+0x170=0x%llX for %s — keep (vt=0x%llX %s)",
-                        (unsigned long long)existing, g_panels[ap].name,
-                        (unsigned long long)existingVt,
-                        vtInImage ? "in-image" : "heap/relocated, normal for sub-controllers");
-                    slotFinalized = true;
-                }
-                if (!slotFinalized) {
-                  if (ap == PANEL_PRIVATE) {
-                    // Private container is auto-captured by the game on F6
-                    // (the AUTO-CAPTURED handler IS bound to its real Private
-                    // container with vtable base+0x4A4ACA0). Do NOT replace it
-                    // via the global array: array[0x59] returns a Housing-type
-                    // wrapper (vtable base+0x4FDC728) which crashes SetInventory.
-                    Log("  Container bind: Private — keeping game's auto-bound container (no array override)");
-                    // 1.06.00: grid cache invalidate disabled for Private.
-                    // The +0x568 cache-key offset is from 1.05; in 1.06 this
-                    // slot may belong to a different field whose modification
-                    // contributed to the first-frame crash.
-                    Log("  Grid cache invalidate SKIPPED for Private (1.06 crash workaround)");
-                  } else {
-                    // Housing panels (F7+): The global container array is
-                    // index-reachable per-panel, BUT the wrappers it returns
-                    // have vtable base+0x4FDC728 which is NOT layout-compatible
-                    // with what handler+0x170 expects (SetInventory crashes).
-                    // Fall back to v1.4.2 behavior: restore from sticky cache
-                    // if a real chest-NPC visit populated it earlier this
-                    // session; otherwise leave NULL and let SetInventory's
-                    // natural rebind populate handler+0x170.
-                    if (panelSticky) {
-                        bool stickyValid = false;
-                        __try {
-                            uintptr_t vt = *(uintptr_t*)(uintptr_t)panelSticky;
-                            stickyValid = (vt >= g_gameBase && vt < g_gameBase + g_imageSize);
-                        } __except(EXCEPTION_EXECUTE_HANDLER) { stickyValid = false; }
-                        if (stickyValid) {
-                        __try {
-                            *(uintptr_t*)(handler + 0x170) = (uintptr_t)panelSticky;
-                            // Mark sticky as mod-owned for this session so the
-                            // observer leaves it alone (cleared on panel close).
-                            InterlockedExchange(&g_panelStickyOwnedByMod[ap], 1);
-                            // NOTE: do NOT set g_currentBoundPanel here — that
-                            // breaks SetInventory's prevUnbind logic which
-                            // checks (curBound != ap) and would skip the
-                            // unbind of the previous panel's namespace.
-                            // g_currentBoundPanel is set after SetInventory.
-                            Log("  Container bind: restored %s sticky 0x%llX (mod-owned)",
-                                g_panels[ap].name, (unsigned long long)panelSticky);
-                        } __except(EXCEPTION_EXECUTE_HANDLER) {
-                            Log("  Container bind: sticky write EXCEPTION");
-                        }
-                        // 1.06.00: grid cache invalidate disabled here too — the
-                        // +0x568 cache slot referenced a 1.05 field that does
-                        // not exist at the same offset in 1.06; writing -1 to
-                        // whatever now lives there contributes to the post-open
-                        // render crash. The natural SetInventory unbind+rebind
-                        // performs the same cache flush via the game's own path.
-                        // invalidateGridCache(handler);
-                    } else {
-                        Log("  Container bind: %s sticky 0x%llX stale (vtable mismatch) — clear",
-                            g_panels[ap].name, (unsigned long long)panelSticky);
-                        InterlockedExchange64(&g_panelStickyContainer[ap], 0);
-                    }
-                } else {
-                    // 1.06.00 CRASH FIX (Dresser/Refrigerator/Symbol/Collecting
-                    // with stored items): the v1.05 "reuse Private's chest"
-                    // fallback worked because the 1.05 renderer treated the
-                    // container at handler+0x170 as a reference object and
-                    // pulled items via channel routing. In 1.06 the renderer
-                    // reads items directly from the container's per-slot
-                    // arrays — feeding it Private's chest with the housing
-                    // channel-id bound to sub[1] reads garbage out of bounds
-                    // and crashes on the first non-empty slot.
-                    //
-                    // We now NULL the container (handler+0x170 = 0) when no
-                    // per-panel sticky exists. The renderer's NULL guard
-                    // shows an empty grid instead of crashing. The trade-off
-                    // is that the user must visit each housing chest's NPC
-                    // at least once per session — then the sticky observer
-                    // saves the real chest container and the upper branch
-                    // (sticky-restore) takes over. Same behavior as v1.05
-                    // for non-empty chests.
-                    // CANONICAL GUARD (CD 1.13.00): handler+0x170 is only the
-                    // container slot on builds where it holds a heap pointer.
-                    // In 1.13 the handler reorganized and +0x170 now holds a
-                    // sub-controller COUNT (small integer); writing 0 there
-                    // corrupts the count -> wrong panels render / crash. Only
-                    // NULL it when it currently looks like a pointer.
-                    __try {
-                        uintptr_t curVal = *(uintptr_t*)(handler + 0x170);
-                        if (curVal >= 0x10000000000ULL && curVal < 0x7FFFFFFFFFFFULL) {
-                            *(uintptr_t*)(handler + 0x170) = 0;
-                            Log("  Container bind: %s no per-panel sticky — handler+0x170 cleared "
-                                "(visit the chest NPC at least once per session to enable item display)",
-                                g_panels[ap].name);
-                        } else {
-                            Log("  Container bind: %s — +0x170=0x%llX not a pointer (1.13+ layout), NOT cleared",
-                                g_panels[ap].name, (unsigned long long)curVal);
-                        }
-                    } __except(EXCEPTION_EXECUTE_HANDLER) {
-                        Log("  Container bind: NULL-out EXCEPTION");
-                    }
-
-                }
-                }
-                }  // close `if (!slotFinalized)`
+            static const uint16_t kFileId[PANEL_COUNT] = {
+                0x08, 0x13, 0x0F, 0x10, 0x11, 0x12   // Private, Gatherables, Dresser, Fridge, Symbol, Collecting
+            };
+            uint16_t rtId = RuntimeIndexForFileId(kFileId[act]);
+            Log("  record slots for %s (file id 0x%02X -> runtime 0x%02X) = %d",
+                g_panels[act].name, kFileId[act], rtId, ReadChestSlots(rtId));
+            int r = PatchGroupCapacities(rtId);
+            if (r) Log("  InvGroups: %d live group(s) raised", r);
         }
     }
 
-    // Note: 0x15 (prepare) is now sent earlier in the InitWarehousePanel
-    // command sequence (before 0x0E), matching the game's natural-open order
-    // captured via Handler trace. Old duplicate 0x15 send removed.
-
-    // 1.05 RE NOTE: Removed HideSubCtrl(+0x2E8) call — that offset holds the
-    // tab-selector sub-controller, NOT the donation widget. Hiding it caused the
-    // tabs/donation overlap visible in F6 screenshots. The real donation faction
-    // byte lives at handler+0x239 (per FUN_14ad777b0); the donation render path
-    // is gated by other handler fields, not by this sub-controller.
-
-    // Load inventory items.
-    //
-    // 1.05.00 ANALYSIS (real SetInventory @ base+0xA7AB30):
-    // The function tokenises with TWO delimiters — outer split on
-    // DAT_1449e9268 (";"), inner split on DAT_1449e9264 (","). It iterates
-    // *(handler + 0x140) sub-controller slots; for each piece it matches
-    // token[0] against the Focus-mode strings (PTR_s_Focus_14492c220) and
-    // binds the matching sub-controller via FUN_140c11530, writing the
-    // channel-id into sub+0x218 and the focus-index into sub+0x248.
-    //
-    // This is the SAME flow that v1.3.2 used successfully on game 1.0.4.x
-    // — a SINGLE call with the full multi-channel string. The earlier
-    // "split-on-;" workaround targeted the WRONG function (SetChannels
-    // @ base+0xA7B2A0, which has a 3-token-only reload branch); the
-    // resolver override above now points g_fnSetInventory at the real
-    // worker, so per-chunk splitting is no longer necessary — and is in
-    // fact harmful, because each chunk only matches one sub-controller
-    // index and leaves the others stale.
-    // v1.4.2 unbind+rebind: SetInventory is idempotent on already-bound
-    // namespaces (same namespace twice = no refresh). Force a true refresh
-    // by sending a ",False" version first, then the real ",True" string.
-    // This matches the natural chest-NPC flow: tear down previous binding,
-    // then build new one — and is the mechanism that makes housing chests
-    // load their own data instead of reusing whatever was bound last.
-    // 1.05 RE finding: SetInventory (FUN_140a7ab30) parses tokens by ';' and
-    // ',' and per token either subscribes (",True") or unsubscribes (",False")
-    // the channel on the matching sub-controller slot. Critically, subscribe
-    // does NOT replace prior subscriptions — they accumulate. So when we
-    // switch panels, the previous panel's channel must be EXPLICITLY unbound,
-    // otherwise the old binding stays active and items from the old chest
-    // keep showing under the new panel's title (= the bug user reported).
+    // Bind the inventory channels. SetInventory tokenises the string by ';' and
+    // ',' and per token subscribes (",True") or unsubscribes (",False") the
+    // channel on the matching sub-controller. Subscriptions accumulate, so the
+    // previously bound panel must be unbound explicitly, and the current one is
+    // unbound+rebound to force a refresh — the order a natural chest open uses.
     if (g_fnSetInventory && initString && *initString) {
         typedef void (__fastcall *PFN_SetInv)(void*, void*);
         auto buildUnbind = [](const char* src, char* dst, size_t dstSize) {
@@ -2984,17 +2289,13 @@ static void InitWarehousePanel(uintptr_t handler, const char* initString) {
             }
         };
 
-        // Append ",Default" (the warehouse's CategoryType attribute, verified
-        // as token[0] of the game's category-type table at base+0x4D2A788) to
-        // each ';'-separated bind segment. This makes SetInventory take its
-        // 4-field branch, which runs the game's own category populate+render
-        // pair (FUN_140C485D0 + FUN_140C48AF0) on each sub-widget — exactly
-        // what a natural NPC open does via the widget Init FUN_140C3F900. The
-        // item binding (channel id +0x218, focus index +0x248, show vtable+0x20)
-        // is identical in the 3- and 4-field branches, so this only ADDS the
-        // category tab bar and cannot affect item display. Only the BIND (True)
-        // string gets the 4th field; unbind (False) stays 3-field — no point
-        // populating tabs on a panel being hidden.
+        // Append ",Default" (the warehouse's CategoryType attribute, token[0] of
+        // the game's category-type table) to each ';'-separated bind segment.
+        // This makes SetInventory take its 4-field branch, which runs the game's
+        // own category populate+render pair on each sub-widget — what a natural
+        // NPC open does via the widget Init. The item binding is identical in
+        // the 3- and 4-field branches, so this only ADDS the category tab bar.
+        // Only the BIND (True) string gets the 4th field; unbind stays 3-field.
         auto buildBind = [](const char* src, char* dst, size_t dstSize) {
             dst[0] = 0;
             if (!src || !*src) return;
@@ -3022,67 +2323,6 @@ static void InitWarehousePanel(uintptr_t handler, const char* initString) {
         LONG ap = InterlockedCompareExchange(&g_activePanel, 0, 0);
         if (ap < 0 || ap >= PANEL_COUNT) ap = PANEL_PRIVATE;
 
-        // CHANNEL DIAGNOSTIC: dump sub-controller channel IDs + tab index. The
-        // slot-grid renderer (FUN_140A78690 @ base+0xA78690) reads
-        // sub[handler+0x1E0]+0x218 to pick which channel feeds items. If
-        // sub[1]+0x218 stays at CampWareHouse after a Gatherables rebind, we
-        // know thunk_FUN_14f07e700("Housing_*") silently failed and items come
-        // from the leftover Camp channel.
-        auto dumpChannelState = [handler](const char* tag) {
-            __try {
-                uint32_t  tabIdx  = *(uint32_t*)(handler + 0x1E0);
-                uintptr_t subArr  = *(uintptr_t*)(handler + 0x138);
-                uint32_t  subCnt  = *(uint32_t*)(handler + 0x140);
-                uintptr_t flagArr = *(uintptr_t*)(handler + 0x158);
-                if (subCnt > 16) subCnt = 16;
-                char buf[512] = {};
-                int  off = 0;
-                for (uint32_t i = 0; i < subCnt; i++) {
-                    uintptr_t sub = *(uintptr_t*)(subArr + i * 8);
-                    short ch = (sub >= 0x10000000000ULL)
-                                 ? *(short*)(sub + 0x218) : (short)0;
-                    char  fl = (flagArr >= 0x10000000000ULL)
-                                 ? *(char*)(flagArr + i) : (char)-1;
-                    int n = _snprintf_s(buf + off, sizeof(buf) - off, _TRUNCATE,
-                                        "[%u]ch=0x%04hX,fl=%d ", i, ch, (int)fl);
-                    if (n <= 0) break;
-                    off += n;
-                }
-                Log("  CHAN %s tab=%u %s", tag, tabIdx, buf);
-            } __except(EXCEPTION_EXECUTE_HANDLER) {
-                Log("  CHAN %s EXCEPTION", tag);
-            }
-        };
-        dumpChannelState("PRE ");
-
-        // Set tab index BEFORE bind so any vfunc-0x20-triggered render sees the
-        // correct slot. With a 2-token initString ("Character;ChannelX"),
-        // ChannelX always lands in sub[1] — tabIndex=1 makes the renderer pick
-        // sub[1]'s channel-id. Private is left at -1 (no write) because F6
-        // already works with the game's natural state.
-        if (g_panels[ap].tabIndex >= 0) {
-            __try {
-                uint32_t want = (uint32_t)g_panels[ap].tabIndex;
-                uint32_t prev = *(uint32_t*)(handler + 0x1E0);
-                // CANONICAL GUARD (CD 1.13.00): +0x1E0 is only the tab index
-                // where it currently holds a small value. In 1.13 the handler
-                // reorganized and +0x1E0 reads garbage (e.g. 0x5F400010);
-                // writing the tab index there corrupts an unrelated field and
-                // makes the close-path tab walk chase bad pointers -> crash.
-                // Only write when the field already looks like a tab index.
-                if (prev < 16) {
-                    *(uint32_t*)(handler + 0x1E0) = want;
-                    Log("  TabIdx write: handler+0x1E0 %u -> %u (panel=%s)",
-                        prev, want, g_panels[ap].name);
-                } else {
-                    Log("  TabIdx write SKIPPED: handler+0x1E0=0x%X not a tab index (1.13+ layout, panel=%s)",
-                        prev, g_panels[ap].name);
-                }
-            } __except(EXCEPTION_EXECUTE_HANDLER) {
-                Log("  TabIdx write EXCEPTION");
-            }
-        }
-
         // Step 1: unbind the previously bound panel (if different from current).
         if (curBound >= 0 && curBound < PANEL_COUNT && curBound != ap) {
             char prevUnbind[256] = {};
@@ -3098,12 +2338,7 @@ static void InitWarehousePanel(uintptr_t handler, const char* initString) {
             }
         }
 
-        // Step 2: standard unbind+rebind of the current panel (forces refresh).
-        // 1.06.00: SetInventory IS needed — without it the panel renders the
-        // previous NPC's inventory layout (donation widget, wrong slot count,
-        // wrong tabs). The earlier crash was likely caused by the Grid cache
-        // invalidate (handler+0x178->+0x568 = -1), not SetInventory. Grid
-        // invalidate is now skipped for Private; SetInventory re-enabled.
+        // Step 2: unbind+rebind of the current panel (forces a refresh).
         __try {
             if (curUnbind[0]) {
                 ((PFN_SetInv)g_fnSetInventory)((void*)handler, (void*)curUnbind);
@@ -3116,74 +2351,13 @@ static void InitWarehousePanel(uintptr_t handler, const char* initString) {
             Log("  SetInventory EXCEPTION (string=\"%s\")", initString);
         }
 
-        dumpChannelState("POST");
-
-        // Force-refresh: in 1.4.2 SetInventory subscribe alone refreshed the
-        // grid. In 1.05.0 the grid render-state caches the previous panel's
-        // items and SetInventory doesn't push new content. FUN_140A754E0
-        // (= base+0xA754E0, "WarehouseRefresh") is the canonical
-        // force-refresh: writes handler+0x170 from validated chest, calls
-        // FUN_140A78690 (slot grid rebuild). If +0x2A5 (construction-success
-        // flag) is 1 it also runs FUN_140A75F40 + FUN_140B8FB70 (full UI
-        // rebuild). Guarded: we skip when +0x2A5=0 to avoid the NULL-children
-        // crash a prior iteration hit.
-        // RE-confirmed call signature for FUN_140A754E0:
-        //   FUN_140A73920 calls it as FUN_140A754E0(handler, param_4)
-        //   where param_4 is then walked via:
-        //     param_4 -> +0xA8 -> +0x8  (or +0x140, or +0xA8+0x50 + walker)
-        //   to reach the chest object (vtable check via DAT_145E215B0).
-        //
-        // The chest at handler+0x170 is what the WALKER FINDS — passing it as
-        // param_2 makes the walk return NULL and crash on the vtable call.
-        //
-        // FUN_140A7AB30 (SetInventory) shows where the walker object lives
-        // for a given sub-controller:
-        //   walker = *(*(*(handler+0x138) + i*8) + 8) + 0x60
-        //          = sub[i] -> +0x8 -> deref -> +0x60 -> deref
-        // So the walker is one level above the chest, attached to each
-        // sub-controller's outer scope.
-        // Diagnostic probe: log the chest pointer at handler+0x170 plus the
-        // walker pointer derived from the sub-controller chain.  Useful when
-        // troubleshooting wrong-container symptoms.  The actual force-refresh
-        // call this used to gate is permanently disabled — its contract
-        // changed in 1.06 and the natural SetInventory rebind handles refresh
-        // anyway.
-        {
-            uint8_t  a5    = 0;
-            uintptr_t chest = 0;
-            uintptr_t walker = 0;
-            __try {
-                a5    = *(uint8_t*)(handler + 0x2A5);
-                chest = *(uintptr_t*)(handler + 0x170);
-                uint32_t  tabIdx = *(uint32_t*)(handler + 0x1E0);
-                uintptr_t subArr = *(uintptr_t*)(handler + 0x138);
-                if (subArr >= 0x10000000000ULL) {
-                    uintptr_t sub = *(uintptr_t*)(subArr + tabIdx * 8);
-                    if (sub >= 0x10000000000ULL) {
-                        uintptr_t scope = *(uintptr_t*)(sub + 0x8);
-                        if (scope >= 0x10000000000ULL) {
-                            walker = *(uintptr_t*)(scope + 0x60);
-                        }
-                    }
-                }
-            } __except(EXCEPTION_EXECUTE_HANDLER) {}
-            Log("  Refresh probe: +0x2A5=0x%02X chest=0x%llX walker=0x%llX",
-                a5, (unsigned long long)chest, (unsigned long long)walker);
-        }
     }
 
-    // v1.4.2 approach: NO explicit BindRefresh call. The SetInventory
-    // unbind+rebind above + the game's own sub-controller "prepare" hooks
-    // (triggered by the empty 0x15 packet) drive the actual data refresh.
-    // Earlier 1.05.00 attempts to call FUN_140a754e0 directly turned out to
-    // be the source of the cross-panel container leak (Step-3 iteration
-    // resolved Private's sub for housing panels). Removed.
     // Fix bottom inventory label + top title
     if (g_fnSetTitle) {
         typedef uint8_t (__fastcall *PFN_SetTitle)(uintptr_t, const char*);
         PFN_SetTitle setTitle = (PFN_SetTitle)g_fnSetTitle;
         const char* title = GetWarehouseTitle();
-        bool needUtf8Fix = !IsAscii(title);
         {
             LONG ap = InterlockedCompareExchange(&g_activePanel, 0, 0);
             if (ap < 0 || ap >= PANEL_COUNT) ap = PANEL_PRIVATE;
@@ -3194,12 +2368,7 @@ static void InitWarehousePanel(uintptr_t handler, const char* initString) {
             uintptr_t bottomLabel = *(uintptr_t*)(handler + g_offBottomLabel);
             if (bottomLabel > 0x10000 && bottomLabel < 0x7FFFFFFFFFFF) {
                 setTitle(bottomLabel, title);
-                Log("  Bottom label (+0x%X) set: lang=%d needFix=%d",
-                    g_offBottomLabel, GetGameLanguage(), needUtf8Fix);
-                if (needUtf8Fix) {
-                    bool fixed = SetTitleOnRenderer(bottomLabel, title, 0);
-                    Log("  Bottom label UTF-8 fix: %s", fixed ? "OK" : "no renderer found");
-                }
+                Log("  Bottom label (+0x%X) set: lang=%d", g_offBottomLabel, GetGameLanguage());
             } else {
                 Log("  Bottom label (+0x%X) invalid pointer", g_offBottomLabel);
             }
@@ -3209,50 +2378,28 @@ static void InitWarehousePanel(uintptr_t handler, const char* initString) {
 
         __try {
             uintptr_t topNode = g_offTopTitle ? *(uintptr_t*)(handler + g_offTopTitle) : 0;
-            if (topNode > 0x10000 && topNode < 0x7FFFFFFFFFFF) {
+            bool topPtrOk = topNode > 0x10000 && topNode < 0x7FFFFFFFFFFF;
+            // The slot must hold a UI node: its vtable has to live inside the
+            // game image. Anything else means the base-class layout moved.
+            uintptr_t topVt = topPtrOk ? *(uintptr_t*)topNode : 0;
+            bool topIsNode = topVt >= g_gameBase && topVt < g_gameBase + g_imageSize;
+            if (topPtrOk && !topIsNode) {
+                Log("  Top title (+0x%X) skipped: 0x%llX has no in-image vtable (0x%llX)",
+                    g_offTopTitle, (unsigned long long)topNode, (unsigned long long)topVt);
+            } else if (topPtrOk) {
                 uint8_t ret = setTitle(topNode, title);
-                Log("  Top title (+0x%X) set: lang=%d ret=%u",
-                    g_offTopTitle, GetGameLanguage(), (unsigned)ret);
-                if (needUtf8Fix) {
-                    bool fixed = SetTitleOnRenderer(topNode, title, 0);
-                    Log("  Top title UTF-8 fix: %s", fixed ? "OK" : "no renderer found");
-                }
+                Log("  Top title (+0x%X) set: lang=%d ret=%u (node vtable base+0x%llX)",
+                    g_offTopTitle, GetGameLanguage(), (unsigned)ret,
+                    (unsigned long long)(topVt - g_gameBase));
             } else if (!g_offTopTitle) {
                 Log("  Top title: no offset resolved this build — skipped");
             } else {
-                // 1.08: handler+0xE8 is only populated AFTER the player has
-                // visited a real warehouse NPC at least once this session
-                // (the panel's NpcInteractionTitle widget is initialised
-                // lazily via the natural NPC-open path).  Until then, the
-                // top title shows the static HTML default ("Camp Provision"
-                // / UI_WareHouse_Title localstring) and our override is
-                // skipped silently — that's expected.
-                Log("  Top title (+0x%X) not yet populated — visit any warehouse NPC once to enable per-panel override", g_offTopTitle);
+                Log("  Top title (+0x%X) slot empty — left at the game's default", g_offTopTitle);
             }
         } __except(EXCEPTION_EXECUTE_HANDLER) {
             Log("  Top title (+0x%X) EXCEPTION", g_offTopTitle);
         }
     }
-
-    // Filter sub-controller: probe-only (see ProbeFilterSubController for
-    // why nothing is rendered here). The slot at +0x1A8 is a year/month
-    // date selector, not the category tab bar, and its render cannot run
-    // safely on a remote open. Logged for diagnostics only.
-    {
-        uintptr_t f1 = 0, f2 = 0;
-        __try { f1 = *(uintptr_t*)(handler + 0x1A8); } __except(EXCEPTION_EXECUTE_HANDLER) {}
-        __try { f2 = *(uintptr_t*)(handler + 0x1C0); } __except(EXCEPTION_EXECUTE_HANDLER) {}
-        ProbeFilterSubController(f1, "+0x1A8");
-        if (f2 && f2 != f1) ProbeFilterSubController(f2, "+0x1C0");
-    }
-
-    // REVERTED 2026-06-07: the vtable[51] (FUN_140A9F4E0) ShowAndRegister
-    // call was a 1.10-era addition that depended on Init having populated
-    // +0x218/+0x2CD — which it never does on the captured shell. With the
-    // cmd-sequence revert above, we go back to the v1.5.1 model where the
-    // game's per-frame CanShow polling drives the open: our HookedCanShow
-    // returns 1 while warehouseActive is set, and the game renders the
-    // panel naturally. No explicit register-for-render call.
 
     LogModalState("  InitWarehousePanel done");
 }
@@ -3260,99 +2407,20 @@ static void InitWarehousePanel(uintptr_t handler, const char* initString) {
 // ============================================================
 //  F6 / Controller: Toggle Warehouse
 // ============================================================
-// ClearActivePanelState: hides a warehouse panel by replicating the game's 0x0f dispatcher
-// logic without its unsafe scene-object lookup. Used by the F6-close path AND by the
-// Switch-Key path — the latter reuses it to hide the current panel before re-initializing
-// the other one. Does NOT touch mode bytes / g_warehouseActive — caller decides.
+// ClearActivePanelState: clears the controller's active flag and restores the
+// PanelValue slot. Does NOT touch g_warehouseActive — the caller decides.
 static void ClearActivePanelState(uintptr_t handler) {
     if (!handler) return;
     LONG ap = InterlockedCompareExchange(&g_activePanel, 0, 0);
     const char* apName = (ap >= 0 && ap < PANEL_COUNT) ? g_panels[ap].name : "?";
     __try {
-        // Active-flag clear at g_offActiveFlag (=0x128 in 1.08) — dynamic, safe.
         *(uint8_t*)(handler + g_offActiveFlag) = 0;
-        // PanelValue restore from saved original at +0x110. If we captured an
-        // original value during the open, restore it; otherwise leave as-is
-        // (writing 0 would corrupt 1.08 layout where +0x110 may host a non-
-        // scalar field).
-        {
-            LONG64 saved = InterlockedCompareExchange64(&g_savedPanelValueSlot, 0, 0);
-            if (saved != -1 && g_panelValueSlotValid) {
-                *(uint64_t*)(handler + g_offPanelValue) = (uint64_t)saved;
-            }
-        }
-        // Part 3: try to clear the scene-object render bit (equivalent to the
-        // `*(uint8_t*)(scene+0x26A) &= 0xFE` step in 0x0f). Wrapped separately
-        // so a missing scene object doesn't abort the clear.
-        //
-        // Diagnostic: log the addresses walked at each step so a failed
-        // close on Gatherables/Refrigerator/etc. can be traced back to
-        // exactly which pointer in the chain went null.
-        bool sceneBitCleared = false;
-        uintptr_t subObj = 0, a8 = 0, scene = 0;
-        // BISECT: scene+0x26A render-bit clear also disabled for 1.08 diagnosis.
-        // __try {
-        //     subObj = *(uintptr_t*)(handler + 0x8);
-        //     if (subObj) {
-        //         a8 = *(uintptr_t*)(subObj + 0xA8);
-        //         if (a8) {
-        //             scene = *(uintptr_t*)(a8 + 0x10);
-        //             if (scene) {
-        //                 *(uint8_t*)(scene + 0x26A) &= 0xFE;
-        //                 sceneBitCleared = true;
-        //             }
-        //         }
-        //     }
-        // } __except(EXCEPTION_EXECUTE_HANDLER) {}
-        Log("  Panel [%s] hidden (direct state clear, scene bit %s) — subObj=0x%llX a8=0x%llX scene=0x%llX",
-            apName,
-            sceneBitCleared ? "cleared" : "skipped",
-            (unsigned long long)subObj,
-            (unsigned long long)a8,
-            (unsigned long long)scene);
-
-        // For housing chests (panel index != 0) the active sub-controller
-        // lives at handler+0x138[handler+0x1E0], NOT at handler+0x8. The
-        // Camp panel's sub at +0x8 has a different scene than the housing
-        // sub, so clearing the Camp scene bit doesn't hide the housing
-        // panel. Walk the active-tab chain and clear that scene bit too.
-        if (ap != PANEL_PRIVATE) {
-            __try {
-                // CANONICAL-POINTER GUARD (added for CD 1.13.00): the handler
-                // struct reorganized — the sub-controller array moved off
-                // +0x138 and +0x1E0/+0x170 changed meaning. With a wrong
-                // subArr this walk chased garbage-but-mapped pointers and the
-                // final `*(tabScn+0x26A) &= 0xFE` corrupted live game memory
-                // (no AV → SEH didn't catch it) → crash on the next frame.
-                // Every hop is now validated to be a canonical user-space
-                // heap pointer; a wrong offset makes the walk skip cleanly.
-                auto canon = [](uintptr_t p){ return p >= 0x10000000000ULL && p < 0x7FFFFFFFFFFFULL; };
-                uint32_t  tabIdx  = *(uint32_t*)(handler + 0x1E0);
-                uintptr_t subArr  = *(uintptr_t*)(handler + 0x138);
-                if (canon(subArr) && tabIdx < 16) {
-                    uintptr_t tabSub  = *(uintptr_t*)(subArr + tabIdx * 8);
-                    uintptr_t tabA8   = canon(tabSub) ? *(uintptr_t*)(tabSub + 0xA8) : 0;
-                    uintptr_t tabScn  = canon(tabA8)  ? *(uintptr_t*)(tabA8  + 0x10) : 0;
-                    if (canon(tabScn)) {
-                        *(uint8_t*)(tabScn + 0x26A) &= 0xFE;
-                        Log("  Panel [%s] tab-sub scene bit cleared — tabIdx=%u tabSub=0x%llX tabA8=0x%llX tabScn=0x%llX",
-                            apName, tabIdx,
-                            (unsigned long long)tabSub,
-                            (unsigned long long)tabA8,
-                            (unsigned long long)tabScn);
-                    } else {
-                        Log("  Panel [%s] tab-sub scene-bit walk: tabIdx=%u tabSub=0x%llX tabA8=0x%llX tabScn=0",
-                            apName, tabIdx,
-                            (unsigned long long)tabSub,
-                            (unsigned long long)tabA8);
-                    }
-                }
-            } __except(EXCEPTION_EXECUTE_HANDLER) {
-                Log("  Panel [%s] tab-sub scene-bit walk EXCEPTION", apName);
-            }
-        }
+        LONG64 saved = InterlockedCompareExchange64(&g_savedPanelValueSlot, 0, 0);
+        if (saved != -1 && g_panelValueSlotValid)
+            *(uint64_t*)(handler + g_offPanelValue) = (uint64_t)saved;
+        Log("  Panel [%s] hidden (active flag cleared, PanelValue restored)", apName);
     } __except(EXCEPTION_EXECUTE_HANDLER) {
-        Log("  Panel [%s] hide direct cleanup EXCEPTION", apName);
+        Log("  Panel [%s] hide EXCEPTION", apName);
     }
 }
 
@@ -3363,10 +2431,8 @@ static void ClearActivePanelState(uintptr_t handler) {
 //              and would otherwise block the close indefinitely).
 static void TriggerWarehouse(int triggerKind = 0) {
     bool forceClose = (triggerKind == 2);
-    uintptr_t mainChar = (uintptr_t)InterlockedCompareExchange64(&g_mainChar, 0, 0);
-    if (!mainChar) { Log("NOT READY: mainChar"); return; }
-
-    uint8_t* mc = (uint8_t*)mainChar;
+    // mainChar only serves as the "a session is loaded" gate here.
+    if (!InterlockedCompareExchange64(&g_mainChar, 0, 0)) { Log("NOT READY: mainChar"); return; }
 
     if (!InterlockedCompareExchange(&g_warehouseActive, 0, 0)) {
         // Re-open cooldown: when DualSense is mapped through Steam Input,
@@ -3384,95 +2450,33 @@ static void TriggerWarehouse(int triggerKind = 0) {
             return;
         }
 
-        uint8_t curMode = mc[g_offModeByte];
-        uint8_t curSub  = mc[g_offSubByte];
-        // 1.08 game-state enum (verified via Ghidra decompile of the debug
-        // state-name builder FUN_1406F1180):
-        //
-        // mode (mainChar+0xCA8):
-        //   0=loading, 1=title, 2=characterselect, 3=gamedataloading,
-        //   4=ingame-global, 5=logout, 6=clientgameplaytemp
-        //
-        // sub (mainChar+0xCA9) — only meaningful when mode==4 (ingame):
-        //   4=photomode  5=dialog/store  6=cinema/cutscene
-        //   7=minigame/qte  8/9/A=dialog/minigame/interaction
-        //   B=gimmick  C=worldobserver
-        //   D=mainmenu (inventory/map/quest journal overlay)
-        //   E=ingamemenu (full pause menu)
-        //   F=hud-info+hud-play+quickslot       (regular gameplay — SAFE)
-        //   10=hud-info+hud-play+interaction    (NPC dialog approach — SAFE)
-        //   0x11+ undefined in 1.08 (the old 1.06 "transient" assumption was
-        //                            wrong; removed from the whitelist).
-        //
-        // Both bytes must be checked. Earlier mod versions only checked sub,
-        // which let the loading screen through (mode=0 but sub still holds
-        // a stale 0x0F from the previous gameplay frame).
-        bool inGameplay = (curMode == 4) && (curSub == 0x0F || curSub == 0x10);
-        if (!inGameplay) {
-            Log("BLOCKED: unsafe state (mode=0x%02X sub=0x%02X)", curMode, curSub);
-            return;
-        }
-
         LONG targetPanel = InterlockedExchange(&g_nextOpenPanel, PANEL_PRIVATE);
         {
             LONG tp = targetPanel;
             if (tp < 0 || tp >= PANEL_COUNT) tp = PANEL_PRIVATE;
             Log("=== OPENING WAREHOUSE (%s) ===", g_panels[tp].name);
         }
-        // Bump diagnostic epoch so HookedCanShow's per-press loggers reset.
-        InterlockedIncrement(&g_diagEpoch);
         InterlockedExchange(&g_activePanel, targetPanel);
-        SafeSetupModeForWarehouse(mc);
-
-        InterlockedExchange(&g_canShowSeen118, 0);
-        InterlockedExchange(&g_canShowZeroCount, 0);
         InterlockedExchange64(&g_lastModalPassed, 0);
         InterlockedExchange(&g_warehouseActive, 1);
-        g_openTimestamp = GetTickCount64();
 
-        InterlockedExchange(&g_modeSwitchByMod, 1);
-
-        // Try to initialize the panel immediately if handler is already captured.
-        // On first F6 after loading a save, the handler is typically NULL here because
-        // auto-capture happens in HookedCanShow which runs on the same (game) thread.
-        // A blocking Sleep loop would prevent the game from processing frames and
-        // calling CanShow, so the handler would never be captured.
-        // Instead, we defer initialization via WM_INIT_WAREHOUSE — the game gets to
-        // process a frame, CanShow fires, the handler is captured, and our deferred
-        // message picks it up.
-        // CD 1.10: ALWAYS defer InitWarehousePanel (even when handler is
-        // captured) so the game gets at least one tick to react to the
-        // sub=6 mode change above. Without that delay, cmd 0x0E and Show
-        // run before the panel-manager has rebuilt its mount list — and
-        // the renderer ignores the warehouse because WareHouseView2 isn't
-        // mounted yet (uigameconfig2.xml tag2="store" needs sub=6).
+        // The panel is initialised once the controller is known. On the first
+        // open of a session the handler is usually still NULL here — the game
+        // creates it after the view mounts and HookedCanShow captures it on the
+        // game thread — so the init is always deferred: InputThread posts
+        // WM_INIT_WAREHOUSE once g_handlerThis is set, and the capture paths run
+        // InitWarehousePanel inline when a press is pending.
         InterlockedExchange(&g_initRetryCount, 0);
         InterlockedExchange(&g_initPending, 1);
-        Log("  Init deferred 1+ frame so game can react to sub=6");
 
-        // CD 1.10: trigger the view-mount NOW, independent of handler capture.
-        // The mount works purely on the global menu-manager (not the warehouse
-        // controller), so it must run even when the controller hasn't been
-        // captured yet this session (cold F-key open with no prior world-object
-        // open). InitWarehousePanel calls it again once the handler is captured;
-        // the helper is idempotent (skips if already in the open state).
+        // Mount the view now, independent of the handler capture.
         if (!TriggerWarehouseViewMount()) {
-            // Menu-layer still flagged open (+0x105E==1): a game menu
-            // session's close is still in flight (fast re-open after shop /
-            // cooking / bank). Proceeding would create a ghost session — the
-            // warehouse can't take over the layer, but g_warehouseActive=1
-            // would make HookedCanShow suppress every other panel. Roll back
-            // cleanly; the user can simply press the hotkey again.
-            Log("  OPEN ABORTED: menu-layer busy — rolled back (press hotkey again)");
+            Log("  OPEN ABORTED: view mount failed — rolled back");
             InterlockedExchange(&g_initPending, 0);
             InterlockedExchange(&g_warehouseActive, 0);
-            InterlockedExchange(&g_modeSwitchByMod, 0);
-            SafeRestoreMode(mc);
             InterlockedExchange(&g_activePanel, PANEL_PRIVATE);
             return;
         }
-
-        Log("  Warehouse opened (mode=0x%02X sub=0x%02X)", mc[g_offModeByte], mc[g_offSubByte]);
 
     } else {
         // Block close while modal dialog is active — but only for non-forced
@@ -3501,54 +2505,13 @@ static void TriggerWarehouse(int triggerKind = 0) {
         // Stamp close time for the re-open cooldown (see open branch).
         g_closeTimestamp = GetTickCount64();
 
-        // Restore Camp handler state if a housing panel was active. The housing
-        // open path patches handler+0x1D8/+0x200/+0x2A8/+0x39C — leaving them
-        // dirty after close confuses subsequent F7 toggles (close-trigger fires
-        // but the dirty state suppresses the visible close). Always undo here.
-        {
-            uintptr_t h = (uintptr_t)InterlockedCompareExchange64(&g_handlerThis, 0, 0);
-            if (h && InterlockedCompareExchange(&g_campValuesSaved, 0, 0)) {
-                __try {
-                    *(uint32_t*)(h + 0x1D8) = (uint32_t)InterlockedCompareExchange(&g_savedCamp_84, 0, 0);
-                    *(uint8_t* )(h + 0x200) = (uint8_t )InterlockedCompareExchange(&g_savedCamp_B8, 0, 0);
-                    *(uint32_t*)(h + 0x2A8) = (uint32_t)InterlockedCompareExchange(&g_savedCamp_9C, 0, 0);
-                    *(uint32_t*)(h + 0x39C) = (uint32_t)InterlockedCompareExchange(&g_savedCamp_39C, 0, 0);
-                    InterlockedExchange(&g_campValuesSaved, 0);
-                    Log("  Restored Camp handler state on close");
-                } __except(EXCEPTION_EXECUTE_HANDLER) {
-                    Log("  Restore on close EXCEPTION");
-                }
-            }
-        }
-
-        // Close only the currently-active panel. The other slot (if captured) keeps its
-        // pointer for the next session — its +0x118 flag is already 0 because CanShow
-        // suppressed it while inactive. See ClearActivePanelState for the 0x0f-replay logic.
+        // Clear the controller's own state.
         ClearActivePanelState((uintptr_t)InterlockedCompareExchange64(&g_handlerThis, 0, 0));
 
-        // Hand the menu-layer back to the game BEFORE restoring the mode
-        // bytes — mirrors the natural close order (close-init runs while
-        // still in store mode, mode cleanup follows). Without this, +0x105E
-        // stays 1 and every later vendor/provisions/bank/dispatch menu open
-        // is silently swallowed (see TriggerWarehouseViewUnmount).
+        // Hand the menu layer back to the game.
         TriggerWarehouseViewUnmount();
 
-        SafeRestoreMode(mc);
-
-        // QOL: Hide cursor immediately when closing warehouse
-        if (g_fnSetCursorVisible) {
-            uintptr_t cursor = (uintptr_t)InterlockedCompareExchange64(&g_cursorObj, 0, 0);
-            if (cursor) {
-                __try {
-                    typedef void (__fastcall *PFN_SetCursorVisible)(void*, char, char);
-                    ((PFN_SetCursorVisible)g_fnSetCursorVisible)((void*)cursor, 0, 1);
-                    Log("  Cursor hidden via SetCursorVisible");
-                } __except(EXCEPTION_EXECUTE_HANDLER) {}
-            }
-        }
-
-        InterlockedExchange(&g_modeSwitchByMod, 0);
-        // Reset to Private so the next F6 opens Private (not whichever panel was last active).
+        // Reset so the next legacy single-hotkey press opens Private.
         InterlockedExchange(&g_activePanel, PANEL_PRIVATE);
         // NOTE: do NOT reset g_currentBoundPanel here. SetInventory subscribes
         // accumulate on the sub-controllers (sub+0x218 = channelId) until an
@@ -3558,14 +2521,7 @@ static void TriggerWarehouse(int triggerKind = 0) {
         // skips that unbind and leaves the previous panel's channels active —
         // which is why F7+ after F6-Private kept showing Private's items.
 
-        Log("  Warehouse closed (mode=0x%02X sub=0x%02X)", mc[g_offModeByte], mc[g_offSubByte]);
-
-        // Release mod-ownership of all per-panel stickies. After close, the
-        // observer is allowed to re-attribute containers it sees at +0x170
-        // (e.g. from a real NPC visit later in the session).
-        for (int i = 0; i < PANEL_COUNT; i++) {
-            InterlockedExchange(&g_panelStickyOwnedByMod[i], 0);
-        }
+        Log("  Warehouse closed");
 
         // Modal popup state belongs to the closed warehouse — clear so a
         // stuck flag doesn't survive into the next session.
@@ -3590,391 +2546,6 @@ static void TriggerWarehouse(int triggerKind = 0) {
                                 WM_KEYUP,   VK_ESCAPE, 0xC0010001);
             } __except(EXCEPTION_EXECUTE_HANDLER) {}
         }
-    }
-}
-
-// ============================================================
-//  Memory-Diff: capture handler-object snapshots before/after a regular chest-open
-//  at the NPC, log which fields changed. Used to identify the container-bind writes
-//  that the VM-protected dispatcher performs (since static decompilation is blocked).
-// ============================================================
-// Helper: log diff between two byte buffers, prefixing offset with the given label.
-static void LogDiffRegion(const char* label, const uint8_t* before, const uint8_t* after, int size) {
-    int totalChanged = 0;
-    int runs = 0;
-    for (int i = 0; i < size; ) {
-        if (before[i] != after[i]) {
-            int start = i;
-            while (i < size && before[i] != after[i]) i++;
-            int len = i - start;
-            totalChanged += len;
-            runs++;
-            if (len == 1) {
-                Log("  %s+0x%03X: u8  0x%02X -> 0x%02X",
-                    label, start, before[start], after[start]);
-            } else if (len == 2 && (start & 1) == 0) {
-                Log("  %s+0x%03X: u16 0x%04X -> 0x%04X",
-                    label, start, *(uint16_t*)&before[start], *(uint16_t*)&after[start]);
-            } else if (len == 4 && (start & 3) == 0) {
-                Log("  %s+0x%03X: u32 0x%08X -> 0x%08X",
-                    label, start, *(uint32_t*)&before[start], *(uint32_t*)&after[start]);
-            } else if (len == 8 && (start & 7) == 0) {
-                Log("  %s+0x%03X: u64 0x%016llX -> 0x%016llX",
-                    label, start,
-                    (unsigned long long)*(uint64_t*)&before[start],
-                    (unsigned long long)*(uint64_t*)&after[start]);
-            } else {
-                Log("  %s+0x%03X: run of %d bytes changed:", label, start, len);
-                for (int j = 0; j < len; j++) {
-                    Log("    %s+0x%03X: 0x%02X -> 0x%02X",
-                        label, start + j, before[start + j], after[start + j]);
-                }
-            }
-        } else {
-            i++;
-        }
-    }
-    Log("  %s total %d bytes changed in %d runs", label, totalChanged, runs);
-}
-
-// LookupInventoryTypeId: walk the global Inventory-Type hash-map (DAT_145f0da18)
-// to resolve a 16-bit panel-ID for a given type-info pointer. Replicates the per-slot
-// lookup logic from FUN_1415c1ae0 (which does this for all registered namespaces).
-// Returns the resolved panel-ID, or 0xFFFF on failure.
-//
-// Layout of the hash-map at g_pInvTypeMap (offsets observed in FUN_1415c1ae0):
-//   +0x60: u32 bucket count
-//   +0x64: u32 total count (0 = empty)
-//   +0x70: u8** buckets (each bucket is 0x100 bytes; first u32 = key count)
-//   +0x78: u8** entries array (entry size = 8, target struct has hash@+4 and id@+6)
-//
-// The hash key for the lookup is the 16-bit truncation of the value at the type-info
-// hash slot (e.g. *DAT_145e8f768 for Housing_GatheredMaterials).
-
-// ResolveContainerForPanelId: walk sub->0x50->0xb0->0xd8 to get the global container
-// array, then index it by panelId. Returns the container pointer at that slot,
-// or 0 on failure / out-of-range.
-static uintptr_t ResolveContainerForPanelId(uintptr_t handler, uint16_t panelId) {
-    if (!handler) return 0;
-    __try {
-        uintptr_t sub = *(uintptr_t*)(handler + 0x8);
-        if (!sub) return 0;
-        uintptr_t lvl1 = *(uintptr_t*)(sub + 0x50);
-        if (!lvl1) return 0;
-        uintptr_t lvl2 = *(uintptr_t*)(lvl1 + 0xb0);
-        if (!lvl2) return 0;
-        uintptr_t arrStruct = *(uintptr_t*)(lvl2 + 0xd8);
-        if (!arrStruct) return 0;
-        uintptr_t arrPtr = *(uintptr_t*)arrStruct;
-        uint32_t arrCnt = *(uint32_t*)(arrStruct + 8);
-        if (!arrPtr || (uint32_t)panelId >= arrCnt) return 0;
-        return *(uintptr_t*)(arrPtr + (uintptr_t)panelId * 8);
-    } __except(EXCEPTION_EXECUTE_HANDLER) {
-        return 0;
-    }
-}
-
-// LookupInventoryTypeId: call the game's own type-name → 16-bit ID resolver.
-// pStringSlot is the address of an 8-byte slot that holds a pointer to the canonical
-// game string (e.g. "Housing_GatheredMaterials" stored by the namespace setup function).
-static uint16_t LookupInventoryTypeId(uintptr_t pStringSlot) {
-    if (!pStringSlot || !g_fnTypeNameLookup) {
-        Log("  Lookup: pStringSlot=0x%llX fn=0x%llX",
-            (unsigned long long)pStringSlot, (unsigned long long)g_fnTypeNameLookup);
-        return 0xFFFF;
-    }
-    __try {
-        // FUN_1402ffe80 returns a pointer to a String-wrapper struct: { char* data; ... }
-        // So pStringSlot → wrapper-ptr → wrapper[0] → actual string.
-        char** wrapper = *(char***)pStringSlot;
-        if (!wrapper) {
-            Log("  Lookup: wrapper pointer is NULL — setup not yet run?");
-            return 0xFFFF;
-        }
-        char* str = wrapper[0];
-        if (!str) {
-            Log("  Lookup: string pointer (wrapper[0]) is NULL");
-            return 0xFFFF;
-        }
-        char preview[40] = {};
-        for (int i = 0; i < 39 && str[i]; i++) preview[i] = str[i];
-        Log("  Lookup: calling resolver with str=\"%s\"", preview);
-
-        short outId = (short)0xFF;  // sentinel
-        typedef int (__fastcall *PFN_Resolver)(char*, short*);
-        int rc = ((PFN_Resolver)g_fnTypeNameLookup)(str, &outId);
-        Log("  Lookup: resolver returned rc=%d, outId=0x%04X", rc, (unsigned)(uint16_t)outId);
-
-        if (rc == 0 || outId == (short)0xFF) return 0xFFFF;
-        return (uint16_t)outId;
-    } __except(EXCEPTION_EXECUTE_HANDLER) {
-        Log("  Lookup: EXCEPTION");
-        return 0xFFFF;
-    }
-}
-
-// Resolve the cached Gatherables panel-ID via the Inventory-Type hash-map lookup.
-// Idempotent — caches the result; returns 0xFFFF on failure.
-static uint16_t GetGatherablesPanelId() {
-    LONG cached = InterlockedCompareExchange(&g_resolvedGatherablesId, 0, 0);
-    if (cached > 0) return (uint16_t)cached;
-    if (cached < 0) return 0xFFFF;  // previous lookup failed, don't retry
-
-    uint16_t id = LookupInventoryTypeId(g_pHGMStringSlot);
-    if (id == 0xFFFF || id == 0) {
-        InterlockedExchange(&g_resolvedGatherablesId, -1);
-        Log("Gatherables panel-id lookup FAILED (hash-map not yet populated?)");
-        return 0xFFFF;
-    }
-    InterlockedExchange(&g_resolvedGatherablesId, (LONG)id);
-    Log("Gatherables panel-id resolved via hash-map: 0x%04X", id);
-    return id;
-}
-
-// Per-panel resolved type-id cache. Filled lazily on first lookup. 0 = not
-// yet resolved, -1 = resolution failed (don't retry every open).
-static volatile LONG g_resolvedPanelId[PANEL_COUNT] = {};
-
-// Extract the second token of a panel's InitString — that's the namespace
-// name the game's hash-map maps to a 2-byte type-id (e.g. "Housing_Dresser"
-// from "Character,Focus,True;Housing_Dresser,Focus,True"). Writes up to
-// dstSize-1 chars + NUL into dst. Returns false if the string can't be parsed.
-static bool ExtractPanelNamespace(const char* initString, char* dst, size_t dstSize) {
-    if (!initString || !dst || dstSize < 2) return false;
-    // Skip the first token ("Character,Focus,True") up to the first ';'.
-    const char* p = strchr(initString, ';');
-    if (!p) return false;
-    p++;
-    // Copy until ',' or end-of-string.
-    size_t i = 0;
-    while (*p && *p != ',' && i + 1 < dstSize) dst[i++] = *p++;
-    dst[i] = '\0';
-    return i > 0;
-}
-
-// Resolve a panel's type-id by feeding the namespace string from its
-// InitString into the same resolver used for Gatherables. Idempotent —
-// caches per-panel; returns 0xFFFF on failure.
-static uint16_t GetPanelTypeId(int panelIdx) {
-    if (panelIdx < 0 || panelIdx >= PANEL_COUNT) return 0xFFFF;
-    if (panelIdx == PANEL_GATHERABLES) return GetGatherablesPanelId();
-
-    LONG cached = InterlockedCompareExchange(&g_resolvedPanelId[panelIdx], 0, 0);
-    if (cached > 0) return (uint16_t)cached;
-    if (cached < 0) return 0xFFFF;
-
-    if (!g_fnTypeNameLookup) return 0xFFFF;
-
-    char ns[64] = {};
-    if (!ExtractPanelNamespace(g_panels[panelIdx].initString, ns, sizeof(ns))) {
-        Log("  Lookup: can't extract namespace from InitString for panel %s",
-            g_panels[panelIdx].name);
-        InterlockedExchange(&g_resolvedPanelId[panelIdx], -1);
-        return 0xFFFF;
-    }
-
-    __try {
-        Log("  Lookup: calling resolver with str=\"%s\" (panel %s)",
-            ns, g_panels[panelIdx].name);
-        short outId = (short)0xFF;
-        typedef int (__fastcall *PFN_Resolver)(char*, short*);
-        int rc = ((PFN_Resolver)g_fnTypeNameLookup)(ns, &outId);
-        Log("  Lookup: resolver returned rc=%d, outId=0x%04X", rc, (unsigned)(uint16_t)outId);
-        if (rc == 0 || outId == (short)0xFF) {
-            InterlockedExchange(&g_resolvedPanelId[panelIdx], -1);
-            Log("Panel %s type-id lookup FAILED", g_panels[panelIdx].name);
-            return 0xFFFF;
-        }
-        InterlockedExchange(&g_resolvedPanelId[panelIdx], (LONG)(uint16_t)outId);
-        Log("Panel %s type-id resolved: 0x%04X", g_panels[panelIdx].name, (uint16_t)outId);
-        return (uint16_t)outId;
-    } __except(EXCEPTION_EXECUTE_HANDLER) {
-        Log("  Lookup: EXCEPTION for panel %s", g_panels[panelIdx].name);
-        InterlockedExchange(&g_resolvedPanelId[panelIdx], -1);
-        return 0xFFFF;
-    }
-}
-
-static void WalkAndLogChain(uintptr_t handler, const char* label) {
-    __try {
-        uintptr_t sub = *(uintptr_t*)(handler + 0x8);
-        Log("  [%s] handler=0x%llX sub=0x%llX", label,
-            (unsigned long long)handler, (unsigned long long)sub);
-        if (!sub) { Log("  [%s] sub is NULL", label); return; }
-
-        uintptr_t cur = sub;
-        int hops = 0;
-        while (hops < 8) {
-            uintptr_t a8 = *(uintptr_t*)(cur + 0xa8);
-            uintptr_t a8_p8 = a8 ? *(uintptr_t*)(a8 + 0x8) : 0;
-            uint16_t pid = *(uint16_t*)(cur + 0x92);
-            Log("  [%s] hop=%d cur=0x%llX panelId=0x%04X sub+0xa8=0x%llX sub+0xa8+8=0x%llX",
-                label, hops, (unsigned long long)cur, pid,
-                (unsigned long long)a8, (unsigned long long)a8_p8);
-            if (a8 == 0 || a8_p8 == 0) {
-                // Terminal — do container lookup
-                uintptr_t lvl1 = *(uintptr_t*)(cur + 0x50);
-                if (!lvl1) { Log("  [%s] terminal: cur+0x50 is NULL", label); return; }
-                uintptr_t lvl2 = *(uintptr_t*)(lvl1 + 0xb0);
-                if (!lvl2) { Log("  [%s] terminal: cur+0x50+0xb0 is NULL", label); return; }
-                uintptr_t arr = *(uintptr_t*)(lvl2 + 0xd8);
-                if (!arr) { Log("  [%s] terminal: cur+0x50+0xb0+0xd8 is NULL", label); return; }
-                uintptr_t arrPtr = *(uintptr_t*)arr;
-                uint32_t arrCnt = *(uint32_t*)(arr + 8);
-                Log("  [%s] container array @ 0x%llX (count=%u)",
-                    label, (unsigned long long)arr, arrCnt);
-                if (pid != 0xFFFF && pid < arrCnt) {
-                    uintptr_t containerPtr = *(uintptr_t*)(arrPtr + (uintptr_t)pid * 8);
-                    Log("  [%s] CONTAINER for panelId 0x%04X = 0x%llX",
-                        label, pid, (unsigned long long)containerPtr);
-                } else {
-                    Log("  [%s] panelId 0x%04X out of range (count=%u)", label, pid, arrCnt);
-                }
-                return;
-            }
-            cur = *(uintptr_t*)(cur + 0x60);
-            if (!cur) { Log("  [%s] sub+0x60 chain ended at hop %d (NULL)", label, hops); return; }
-            hops++;
-        }
-        Log("  [%s] chain too deep (>8 hops), aborting", label);
-    } __except(EXCEPTION_EXECUTE_HANDLER) {
-        Log("  [%s] EXCEPTION during chain walk", label);
-    }
-}
-
-static void DoDiffSnapshot() {
-    uintptr_t handler = (uintptr_t)InterlockedCompareExchange64(&g_handlerThis, 0, 0);
-    if (!handler) {
-        Log("DIFF: no handler captured yet — open the warehouse once with F6 first");
-        return;
-    }
-    LONG state = InterlockedCompareExchange(&g_snapshotState, 0, 0);
-    if (state == 0) {
-        Log("DIFF: BEFORE — chain walk:");
-        WalkAndLogChain(handler, "BEFORE");
-        __try {
-            memcpy(g_snapshotBefore, (void*)handler, HANDLER_SNAPSHOT_SIZE);
-            // Snapshot the container object pointed to by handler+0x170 (if non-NULL).
-            uintptr_t contBefore = *(uintptr_t*)(handler + 0x170);
-            InterlockedExchange64(&g_contBeforeAddr, (LONG64)contBefore);
-            if (contBefore > 0x10000 && contBefore < 0x7FFFFFFFFFFFULL) {
-                memcpy(g_contSnapshotBefore, (void*)contBefore, CONT_SNAPSHOT_SIZE);
-                Log("DIFF: container ptr at handler+0x170 = 0x%llX (snapshotted)",
-                    (unsigned long long)contBefore);
-            } else {
-                memset(g_contSnapshotBefore, 0, CONT_SNAPSHOT_SIZE);
-                Log("DIFF: handler+0x170 = 0x%llX (NULL or invalid, skipped)",
-                    (unsigned long long)contBefore);
-            }
-            uintptr_t sub = *(uintptr_t*)(handler + 0x8);
-            if (sub > 0x10000 && sub < 0x7FFFFFFFFFFFULL) {
-                memcpy(g_subSnapshotBefore, (void*)sub, SUB_SNAPSHOT_SIZE);
-                InterlockedExchange64(&g_subSnapshotAddr, (LONG64)sub);
-                Log("DIFF: BEFORE snapshot captured (handler=0x%llX, sub=0x%llX). Now go open the chest regularly, then press the hotkey again.",
-                    (unsigned long long)handler, (unsigned long long)sub);
-            } else {
-                InterlockedExchange64(&g_subSnapshotAddr, 0);
-                Log("DIFF: BEFORE snapshot captured (handler=0x%llX, sub-object missing/invalid). Go open the chest, press the hotkey again.",
-                    (unsigned long long)handler);
-            }
-            InterlockedExchange(&g_snapshotState, 1);
-        } __except(EXCEPTION_EXECUTE_HANDLER) {
-            Log("DIFF: BEFORE snapshot read EXCEPTION");
-        }
-        return;
-    }
-    // state == 1 → capture after + diff
-    Log("DIFF: AFTER — chain walk:");
-    WalkAndLogChain(handler, "AFTER");
-    __try {
-        memcpy(g_snapshotAfter, (void*)handler, HANDLER_SNAPSHOT_SIZE);
-        Log("DIFF: AFTER snapshot captured (handler=0x%llX). Computing changes:",
-            (unsigned long long)handler);
-        LogDiffRegion("handler", g_snapshotBefore, g_snapshotAfter, HANDLER_SNAPSHOT_SIZE);
-
-        // Container-object diff
-        uintptr_t contBefore = (uintptr_t)InterlockedCompareExchange64(&g_contBeforeAddr, 0, 0);
-        uintptr_t contAfter  = *(uintptr_t*)(handler + 0x170);
-        Log("  container: before=0x%llX after=0x%llX",
-            (unsigned long long)contBefore, (unsigned long long)contAfter);
-        if (contAfter > 0x10000 && contAfter < 0x7FFFFFFFFFFFULL) {
-            memcpy(g_contSnapshotAfter, (void*)contAfter, CONT_SNAPSHOT_SIZE);
-
-            // Scan the global container array for this pointer to find its index.
-            __try {
-                uintptr_t sub = *(uintptr_t*)(handler + 0x8);
-                uintptr_t lvl1 = sub ? *(uintptr_t*)(sub + 0x50) : 0;
-                uintptr_t lvl2 = lvl1 ? *(uintptr_t*)(lvl1 + 0xb0) : 0;
-                uintptr_t arrStruct = lvl2 ? *(uintptr_t*)(lvl2 + 0xd8) : 0;
-                if (arrStruct) {
-                    uintptr_t arrPtr = *(uintptr_t*)arrStruct;
-                    uint32_t arrCnt = *(uint32_t*)(arrStruct + 8);
-                    int found = -1;
-                    for (uint32_t i = 0; i < arrCnt; i++) {
-                        if (*(uintptr_t*)(arrPtr + (uintptr_t)i * 8) == contAfter) {
-                            found = (int)i;
-                            break;
-                        }
-                    }
-                    if (found >= 0) {
-                        Log("  container: NPC container 0x%llX is at array index 0x%04X (=%d)",
-                            (unsigned long long)contAfter, found, found);
-                    } else {
-                        Log("  container: NPC container 0x%llX NOT in global array (count=%u) — different lookup mechanism",
-                            (unsigned long long)contAfter, arrCnt);
-                    }
-                }
-            } __except(EXCEPTION_EXECUTE_HANDLER) {}
-
-            if (contBefore == contAfter) {
-                Log("  container: same pointer, comparing contents:");
-                LogDiffRegion("container", g_contSnapshotBefore, g_contSnapshotAfter, CONT_SNAPSHOT_SIZE);
-            } else {
-                Log("  container: POINTER CHANGED — dumping new container's first 0x100 bytes:");
-                for (int i = 0; i < 0x100; i += 0x10) {
-                    Log("    cont+0x%03X: %02X %02X %02X %02X %02X %02X %02X %02X  %02X %02X %02X %02X %02X %02X %02X %02X",
-                        i,
-                        g_contSnapshotAfter[i+0], g_contSnapshotAfter[i+1],
-                        g_contSnapshotAfter[i+2], g_contSnapshotAfter[i+3],
-                        g_contSnapshotAfter[i+4], g_contSnapshotAfter[i+5],
-                        g_contSnapshotAfter[i+6], g_contSnapshotAfter[i+7],
-                        g_contSnapshotAfter[i+8], g_contSnapshotAfter[i+9],
-                        g_contSnapshotAfter[i+10], g_contSnapshotAfter[i+11],
-                        g_contSnapshotAfter[i+12], g_contSnapshotAfter[i+13],
-                        g_contSnapshotAfter[i+14], g_contSnapshotAfter[i+15]);
-                }
-            }
-        } else {
-            Log("  container: handler+0x170 = 0x%llX (NULL or invalid)",
-                (unsigned long long)contAfter);
-        }
-
-        // Sub-object diff — read the current sub pointer and compare against the one
-        // we captured before. If the pointer changed, the sub-object itself was
-        // re-bound, which is a strong signal in itself.
-        uintptr_t subBefore = (uintptr_t)InterlockedCompareExchange64(&g_subSnapshotAddr, 0, 0);
-        uintptr_t subAfter = *(uintptr_t*)(handler + 0x8);
-        if (subBefore == 0 || subAfter == 0) {
-            Log("  sub: skipped (before=0x%llX, after=0x%llX — one or both invalid)",
-                (unsigned long long)subBefore, (unsigned long long)subAfter);
-        } else if (subBefore != subAfter) {
-            Log("  sub: POINTER CHANGED before=0x%llX after=0x%llX (re-bound)",
-                (unsigned long long)subBefore, (unsigned long long)subAfter);
-            memcpy(g_subSnapshotAfter, (void*)subAfter, SUB_SNAPSHOT_SIZE);
-            // Diff the *new* sub-object against zero baseline (since pointer changed,
-            // before/after of the same address would be meaningless)
-            for (int i = 0; i < SUB_SNAPSHOT_SIZE; i++) g_subSnapshotBefore[i] = 0;
-            LogDiffRegion("sub(NEW)", g_subSnapshotBefore, g_subSnapshotAfter, SUB_SNAPSHOT_SIZE);
-        } else {
-            memcpy(g_subSnapshotAfter, (void*)subAfter, SUB_SNAPSHOT_SIZE);
-            Log("  sub: same pointer 0x%llX, comparing contents:", (unsigned long long)subAfter);
-            LogDiffRegion("sub", g_subSnapshotBefore, g_subSnapshotAfter, SUB_SNAPSHOT_SIZE);
-        }
-
-        InterlockedExchange(&g_snapshotState, 0);
-    } __except(EXCEPTION_EXECUTE_HANDLER) {
-        Log("DIFF: AFTER snapshot read EXCEPTION");
-        InterlockedExchange(&g_snapshotState, 0);
     }
 }
 
@@ -4171,20 +2742,18 @@ static DWORD WINAPI InputThread(LPVOID) {
             } else if (!rd) reloadDown = false;
         }
 
-        // DiffSnapshotKey — must be available regardless of safe-state, because the
-        // chest UI puts the player into a non-safe sub-mode and would skip otherwise.
-        static bool diffKeyDownGlobal = false;
-        if (g_diffSnapshotKey) {
-            bool d = (GetAsyncKeyState(g_diffSnapshotKey) & 0x8000) != 0;
-            bool modOk = (g_diffSnapshotModifier == 0) || (GetAsyncKeyState(g_diffSnapshotModifier) & 0x8000) != 0;
-            if (d && modOk && !diffKeyDownGlobal) {
-                diffKeyDownGlobal = true;
+        // InvDumpKey: log the live inventory groups (read-only debug aid).
+        static bool dumpKeyDown = false;
+        if (g_invDumpKey) {
+            bool d = (GetAsyncKeyState(g_invDumpKey) & 0x8000) != 0;
+            if (d && !dumpKeyDown) {
+                dumpKeyDown = true;
                 DWORD now = GetTickCount();
                 if (now - g_lastAct >= 400) {
                     g_lastAct = now;
-                    DoDiffSnapshot();
+                    DumpInvGroups();
                 }
-            } else if (!d) diffKeyDownGlobal = false;
+            } else if (!d) dumpKeyDown = false;
         }
 
         // Lazy-resolve mainChar from singleton if not yet captured
@@ -4193,185 +2762,6 @@ static DWORD WINAPI InputThread(LPVOID) {
             if (resolved > 0x10000000000ULL) {
                 InterlockedExchange64(&g_mainChar, (LONG64)resolved);
                 Log("mainChar: 0x%llX (singleton, deferred)", (unsigned long long)resolved);
-            }
-        }
-
-        // Sticky-binding poller for handler+0x170. Captures the
-        // chest_object pointer the game writes at +0x170 — both during
-        // mod-warehouse-active sessions AND during natural NPC-visits in
-        // the world. The latter is the only way to get the *correct*
-        // chest_object for housing chests (Gatherables/Dresser/etc) —
-        // factory-create produces Camp-clones with wrong items.
-        //
-        // Cross-panel mis-attribution is prevented by:
-        //  1. tab-state-based ap resolution (handler+0x138[handler+0x1e0])
-        //  2. dupOtherPanel guard (skip if cont already in another panel)
-        //  3. mod-owned flag (skip if mod set this sticky in current session)
-        {
-            uintptr_t handler = (uintptr_t)InterlockedCompareExchange64(&g_handlerThis, 0, 0);
-            if (handler) {
-                __try {
-                    uintptr_t cont = *(uintptr_t*)(handler + 0x170);
-                    if (cont >= 0x10000000000ULL) {
-                        uintptr_t vt = *(uintptr_t*)cont;
-                        // Self-healing across game updates: the hardcoded
-                        // g_addrContainerVtable can drift between game versions
-                        // (1.05.00 moved it). If the observed vtable is in the
-                        // game module range and stable, adopt it. This restores
-                        // sticky-binding on the very first warehouse open after
-                        // an update — same UX as pre-update.
-                        //
-                        // SAFETY: require the SAME unknown vtable to be seen
-                        // multiple consecutive times before adopting. A single
-                        // observation could be a stale frame where a different
-                        // UI controller was briefly bound — adopting it would
-                        // cause every later sticky-restore to write the wrong
-                        // type into handler+0x170 and crash on SetInventory.
-                        bool vtInModule = (g_gameBase != 0) &&
-                                          (vt >= g_gameBase) &&
-                                          (vt <  g_gameBase + g_imageSize);
-                        if (vtInModule && g_addrContainerVtable != vt) {
-                            static uintptr_t s_relearnCandidate = 0;
-                            static int       s_relearnSightings = 0;
-                            if (vt == s_relearnCandidate) {
-                                s_relearnSightings++;
-                            } else {
-                                s_relearnCandidate = vt;
-                                s_relearnSightings = 1;
-                            }
-                            // Require 5 consecutive sightings of the same
-                            // candidate before adopting it. At ~30Hz polling
-                            // that's ~150ms of stable observation — far longer
-                            // than a transient stale-frame artefact.
-                            if (s_relearnSightings >= 5) {
-                                Log("Container vtable: auto-relearned base+0x%llX (was base+0x%llX, stable for %d sightings)",
-                                    (unsigned long long)(vt - g_gameBase),
-                                    (unsigned long long)(g_addrContainerVtable - g_gameBase),
-                                    s_relearnSightings);
-                                g_addrContainerVtable = vt;
-                                s_relearnCandidate = 0;
-                                s_relearnSightings = 0;
-                            }
-                        }
-                        if (g_addrContainerVtable && vt == g_addrContainerVtable) {
-                            // Derive the panel index from the ACTIVE TAB SUB
-                            // (handler+0x138[handler+0x1e0] -> +0x92 = panelId).
-                            // This is the truthful source: it changes whenever
-                            // the user opens any chest, including via NPC where
-                            // our hotkey path was NOT involved (so g_activePanel
-                            // would be stale and misattribute the container to
-                            // the wrong panel slot, corrupting other stickies).
-                            LONG ap = -1;
-                            __try {
-                                uintptr_t tabArr = *(uintptr_t*)(handler + 0x138);
-                                uint32_t  tabIdx = *(uint32_t*)(handler + 0x1e0);
-                                if (tabArr >= 0x10000000000ULL && tabIdx < 32) {
-                                    uintptr_t tabSub = *(uintptr_t*)(tabArr + (uintptr_t)tabIdx * 8);
-                                    if (tabSub >= 0x10000000000ULL) {
-                                        uint16_t pid = *(uint16_t*)(tabSub + g_offSubPanelId);
-                                        // Match against our cached per-panel type-ids.
-                                        // PANEL_PRIVATE uses configured panelValueCfg
-                                        // (typically 0x59 = CampWareHouse).
-                                        for (int i = 0; i < PANEL_COUNT; i++) {
-                                            uint16_t mine;
-                                            if (i == PANEL_PRIVATE) {
-                                                LONG pv = InterlockedCompareExchange(&g_privatePanelValueCfg, 0, 0);
-                                                mine = (pv > 0 && pv < 0x10000) ? (uint16_t)pv : 0x59;
-                                            } else {
-                                                // Lazy-resolve via the game's own
-                                                // type lookup — caches per panel,
-                                                // returns 0xFFFF on failure.
-                                                mine = GetPanelTypeId(i);
-                                                if (mine == 0xFFFF) continue;
-                                            }
-                                            if (mine == pid) { ap = i; break; }
-                                        }
-                                    }
-                                }
-                            } __except(EXCEPTION_EXECUTE_HANDLER) { ap = -1; }
-                            // Fall back to g_activePanel only if we couldn't
-                            // resolve from the tab — last-resort heuristic.
-                            if (ap < 0 || ap >= PANEL_COUNT) {
-                                ap = InterlockedCompareExchange(&g_activePanel, 0, 0);
-                                if (ap < 0 || ap >= PANEL_COUNT) ap = PANEL_PRIVATE;
-                            }
-                            // GUARD: skip if mod owns this panel's sticky for
-                            // the current session. The game's natural-bind
-                            // a few ms after our explicit write puts a
-                            // different (recycled) container into +0x170;
-                            // without this guard we'd overwrite mod's good
-                            // container.
-                            //
-                            // BUG fix: the original `continue` here jumped
-                            // ALL the way to the InputThread's while-loop
-                            // top, skipping XInput polling and B-button
-                            // detection on every iteration where the mod
-                            // owned the sticky — i.e. the entire duration
-                            // of any Gatherables/Dresser/etc. session. The
-                            // user could press B but it was never seen.
-                            // Now we skip only the sticky-save logic by
-                            // wrapping the rest of this branch in an else.
-                            if (InterlockedCompareExchange(&g_panelStickyOwnedByMod[ap], 0, 0)) {
-                                static volatile LONG64 lastSkipLogged = 0;
-                                if (InterlockedExchange64(&lastSkipLogged, (LONG64)cont)
-                                        != (LONG64)cont) {
-                                    Log("Sticky bind: skip [%s] save 0x%llX (mod-owned this session)",
-                                        g_panels[ap].name, (unsigned long long)cont);
-                                }
-                            } else {
-                            LONG64 prev = InterlockedCompareExchange64(&g_panelStickyContainer[ap], 0, 0);
-                            // GUARD: containers are unique per panel. If `cont`
-                            // is already cached for a *different* panel, our
-                            // tab-based ap-resolver was racing against the
-                            // game's tab-state update (e.g. re-open Private
-                            // while the previous tabSub still pointed at
-                            // Gatherables). Skip the save instead of silently
-                            // overwriting another panel's good sticky.
-                            bool dupOtherPanel = false;
-                            for (int j = 0; j < PANEL_COUNT; j++) {
-                                if (j == ap) continue;
-                                LONG64 other = InterlockedCompareExchange64(&g_panelStickyContainer[j], 0, 0);
-                                if (other == (LONG64)cont) { dupOtherPanel = true; break; }
-                            }
-                            if (dupOtherPanel) {
-                                // First time we notice this collision per cont — log once.
-                                static volatile LONG64 g_lastDupLogged = 0;
-                                if (InterlockedExchange64(&g_lastDupLogged, (LONG64)cont) != (LONG64)cont) {
-                                    Log("Sticky bind: skip [%s] save 0x%llX (already owned by another panel — tab-state race)",
-                                        g_panels[ap].name, (unsigned long long)cont);
-                                }
-                            } else if (prev != (LONG64)cont) {
-                                InterlockedExchange64(&g_panelStickyContainer[ap], (LONG64)cont);
-                                InterlockedExchange(&g_currentBoundPanel, ap);
-                                // Log only the FIRST sticky save per panel — once we have
-                                // a valid container the user can re-open that panel later.
-                                // Subsequent updates within a session are diagnostic noise.
-                                if (prev == 0) {
-                                    Log("Sticky bind [%s]: saved 0x%llX",
-                                        g_panels[ap].name, (unsigned long long)cont);
-
-                                    // Compact key-fields snapshot per panel. Useful after a
-                                    // game update for sanity-checking that the chest layout
-                                    // (cont+0x7E0/0x7E8/0x7F0/0x810) and handler+0x39C max-slots
-                                    // field are still where we expect them. Verbose dump removed.
-                                    __try {
-                                        Log("  Sticky[%s] cont=0x%llX +0x7E0=0x%llX +0x7E8=%d +0x7F0=%lld +0x810=%llu  handler+0x39C=%u",
-                                            g_panels[ap].name,
-                                            (unsigned long long)cont,
-                                            (unsigned long long)*(uint64_t*)(cont + 0x7E0),
-                                            (int)*(int16_t*)(cont + 0x7E8),
-                                            (long long)*(int64_t*)(cont + 0x7F0),
-                                            (unsigned long long)*(uint64_t*)(cont + 0x810),
-                                            *(uint32_t*)(handler + 0x39C));
-                                    } __except(EXCEPTION_EXECUTE_HANDLER) {
-                                        Log("  Sticky[%s] field-snapshot EXCEPTION", g_panels[ap].name);
-                                    }
-                                }
-                            }
-                            } // end else (sticky not mod-owned)
-                        }
-                    }
-                } __except(EXCEPTION_EXECUTE_HANDLER) {}
             }
         }
 
@@ -4398,11 +2788,7 @@ static DWORD WINAPI InputThread(LPVOID) {
             }
         }
 
-        // (Polling-thread safe-state check removed — TriggerWarehouse does
-        // the authoritative mode+sub check using the verified 1.08 enum.
-        // See the comment block in TriggerWarehouse for the mapping.)
-
-        // Keyboard hotkeys (F6 + per-panel) are dispatched from HookedWndProc
+        // Keyboard hotkeys are dispatched from HookedWndProc
         // via WM_KEYDOWN — see panel-hotkey block there. Polling here was
         // unreliable: the game's input system left GetAsyncKeyState reporting
         // "still down" after a tap, so subsequent presses missed the rising
@@ -4413,8 +2799,7 @@ static DWORD WINAPI InputThread(LPVOID) {
         // structurally — same per-panel rising-edge detection with
         // per-panel last-down trackers, same modifier check at press time,
         // same direct-PostMessage pattern, same B/Circle press-pending →
-        // release-close sequence. No inSafeState gate (TriggerWarehouse
-        // rejects unsafe modes itself, matching DirectInput behaviour).
+        // release-close sequence.
         if (g_pXInputGetState) {
             // Aggregate buttons across ALL XInput slots (0–3). Steam Input
             // remaps PS5 controllers to one slot, while a physical Xbox
@@ -4570,21 +2955,9 @@ static bool ResolveAddresses() {
     Log("Handler:      %s base+0x%llX (string-xref)", g_fnHandler?"OK":"FAIL",
         g_fnHandler?(unsigned long long)(g_fnHandler-g_gameBase):0);
 
-    // Step 2: Find SetInventory via "SetInventory" string → CALL target in Handler.
-    //
-    // 1.06.00 RE: the real SetInventory @ 0xA82F70 (1898 bytes) starts with
-    // `48 89 4C 24 08; 55; 53; 56; 57; 41 54; 41 55; 41 56; 41 57` — NOT
-    // `40 55` like in 1.05. The previous resolver rejected it and picked
-    // the NEXT 40-55 CALL which is SetChannels @ 0xA836E0 (452 bytes, only
-    // writes handler+0x350/+0x352/+0x354). Calling SetChannels with our
-    // 2-token filter string skipped the inventory bind entirely and the
-    // game crashed on first frame of rendering with a NULL container.
-    //
-    // Fix: accept any "big function" prolog. SetInventory candidates are
-    // expected to be substantially larger than SetChannels (>=600 bytes),
-    // so we additionally check that the CALL target body extends through
-    // at least 0x200 bytes of plausible code (not a 0xC3 RET in first
-    // 0x40 bytes — SetChannels is the only short candidate here).
+    // Step 2: SetInventory = the CALL after the "SetInventory" strcmp in the
+    // Handler. The neighbouring SetChannels helper is rejected by size: it is a
+    // small function with a RET in its first 0x40 bytes, SetInventory is not.
     if (g_fnHandler) {
         uintptr_t strSetInv = FindString("SetInventory");
         if (strSetInv) {
@@ -4594,20 +2967,17 @@ static bool ResolveAddresses() {
                 int n = FindAllCALLsAfter(leaAddr, 60, targets, 16);
                 for (int i = 0; i < n; i++) {
                     uint8_t* p = (uint8_t*)targets[i];
-                    // Accept any of the known SetInventory prologs:
-                    //   1.05: 40 55                             (REX PUSH RBP)
-                    //   1.06: 48 89 4C 24 08                    (MOV [RSP+8], RCX)
-                    //   alt:  48 89 5C 24 ??                    (MOV [RSP+disp8], RBX)
-                    //   alt:  48 83 EC ??                       (SUB RSP, imm8)
+                    // Accept the usual large-function prologs:
+                    //   40 55            (REX PUSH RBP)
+                    //   48 89 4C 24 08   (MOV [RSP+8], RCX)
+                    //   48 89 5C 24 ??   (MOV [RSP+disp8], RBX)
                     bool prologOk = false;
                     if (p[0] == 0x40 && p[1] == 0x55) prologOk = true;
                     else if (p[0] == 0x48 && p[1] == 0x89 && p[2] == 0x4C && p[3] == 0x24 && p[4] == 0x08) prologOk = true;
                     else if (p[0] == 0x48 && p[1] == 0x89 && p[2] == 0x5C && p[3] == 0x24) prologOk = true;
                     if (!prologOk) continue;
-                    // Size guard: SetInventory is large (~1900 bytes in 1.05/1.06).
-                    // SetChannels is small (~450 bytes) and contains a RET within
-                    // the first 0x40 bytes; SetInventory does not. Use this to
-                    // reject the small wrong-target.
+                    // Size guard: SetChannels has a RET within its first 0x40
+                    // bytes, SetInventory does not.
                     bool earlyRet = false;
                     for (int k = 1; k < 0x40; k++) {
                         if (p[k] == 0xC3) { earlyRet = true; break; }
@@ -4622,12 +2992,6 @@ static bool ResolveAddresses() {
     Log("SetInventory: %s base+0x%llX (string-xref)", g_fnSetInventory?"OK":"FAIL",
         g_fnSetInventory?(unsigned long long)(g_fnSetInventory-g_gameBase):0);
 
-    // 1.06-era hardcoded SetInventory override removed in 1.5.4: the wrong-target
-    // compare against 0xA836E0 could spuriously match in 1.09+ and redirect the
-    // correct dynamic resolution to a stale 1.06 RVA, and the bare fallback to
-    // 0xA82F70 would install on garbage bytes. The dynamic prolog+earlyRet
-    // filter above already rejects SetChannels by size, so the override is
-    // redundant on every supported build. Failure now logs and aborts cleanly.
     if (!g_fnSetInventory) {
         Log("SetInventory: WARN dynamic resolver failed — panel binding will not work this session");
     }
@@ -4638,7 +3002,7 @@ static bool ResolveAddresses() {
         if (strSetName) {
             uintptr_t leaAddr = FindLEA(strSetName, g_fnHandler);
             if (leaAddr && leaAddr < g_fnHandler + 0x1000) {
-                // 1.13+: the branch loads the title node, then hands it to the setter:
+                // The branch loads the title node, then hands it to the setter:
                 //     MOV r64, [handlerReg+disp32]    ; node (this is BottomLabel's load)
                 //     ...
                 //     MOV RCX, r64                    ; same register
@@ -4664,18 +3028,6 @@ static bool ResolveAddresses() {
                         if (target > g_gameBase && target < g_gameBase + g_imageSize)
                             g_fnSetTitle = target;
                         break;
-                    }
-                }
-                if (!g_fnSetTitle) {
-                    // pre-1.13 layout: SetTitle (prolog 40 55) called ~150 bytes below the LEA
-                    uintptr_t targets[16];
-                    int n = FindAllCALLsAfter(leaAddr, 200, targets, 16);
-                    for (int i = 0; i < n; i++) {
-                        uint8_t* p = (uint8_t*)targets[i];
-                        if (p[0] == 0x40 && p[1] == 0x55 && targets[i] != g_fnSetInventory) {
-                            g_fnSetTitle = targets[i];
-                            break;
-                        }
                     }
                 }
             }
@@ -4729,7 +3081,7 @@ static bool ResolveAddresses() {
     Log("BottomLabel:  %s offset=0x%X (handler → SetTitle callsite)",
         g_offBottomLabel ? "OK" : "FAIL", g_offBottomLabel);
 
-    // Step 3b: TopTitle offset via the UI selector-attribute binding chain (1.13+).
+    // Step 3b: TopTitle offset via the UI selector-attribute binding chain.
     // The top header title is the NpcInteractionTitle widget's text node
     // (#NpcInteractionTitleText); the warehouse body attribute
     // "selector-title-subtext-stage" is bound to a member of the control.
@@ -4737,8 +3089,7 @@ static bool ResolveAddresses() {
     // the same way must reproduce the BottomLabel offset that Step 3a
     // extracted from the SetWareHouseInventoryName branch. If anything
     // disagrees, DISABLE the top-title write instead of falling back to the
-    // pre-1.13 default 0xE8 — since the 1.13 re-layout that slot holds a
-    // DIFFERENT bound node, so a stale-default write would hit a wrong node.
+    // compiled-in default, which may point at a different bound node.
     {
         uint32_t prevDefault = g_offTopTitle;
         uint32_t offTop   = ResolveSelectorMemberOffset("selector-title-subtext-stage");
@@ -4808,38 +3159,11 @@ static bool ResolveAddresses() {
     Log("DonationOff:  %s offset=0x%X (SetDonationFaction → MOV [reg+N],BX)",
         g_fnSetDonationFaction ? "OK" : "FALLBACK", g_offDonationState);
 
-    // Step 3b: Find SetTitleDirect (FUN_1434159c0) from inside SetTitle.
-    // SetTitle checks node+0xA8 (bridge). If bridge+8 (renderer) exists,
-    // it calls SetTitleDirect(renderer, text) — which does proper UTF-8→wchar.
-    // In the assembly: 1st E8 CALL = __chkstk, 2nd E8 CALL = SetTitleDirect.
-    if (g_fnSetTitle) {
-        uint8_t* p = (uint8_t*)g_fnSetTitle;
-        int callNum = 0;
-        for (int i = 0; i < 120; i++) {
-            if (p[i] == 0xE8) {
-                int32_t rel = *(int32_t*)(p + i + 1);
-                uintptr_t target = (uintptr_t)(p + i + 5) + rel;
-                if (target > g_gameBase && target < g_gameBase + g_imageSize) {
-                    callNum++;
-                    if (callNum == 2) {
-                        g_fnSetTitleDirect = target;
-                        break;
-                    }
-                }
-                i += 4; // skip rel32
-            }
-        }
-    }
-    Log("SetTitleDir:  %s base+0x%llX (SetTitle internal)",
-        g_fnSetTitleDirect?"OK":"FAIL",
-        g_fnSetTitleDirect?(unsigned long long)(g_fnSetTitleDirect-g_gameBase):0);
-
     // Step 3d: Extract 0x15 "prepare" sub-object offsets directly from the Handler body.
     // The Handler's 0x15 path does three back-to-back virtual calls of the form:
     //     MOV RCX, [param_1+disp32]   ; REX 8B ModRM(mod=10, reg=001 RCX, r/m != SIB) disp32
     //     MOV RAX, [RCX]              ; 48 8B 01
     //     CALL [RAX+imm]              ; FF 50 disp8  OR  FF 90 disp32
-    // Apr-11 layout: 0x2c8/0x2d8/0x300.  Apr-23 layout: 0x2e8/0x2f8/0x320.
     if (g_fnHandler) {
         uint8_t* fn = (uint8_t*)g_fnHandler;
         uint32_t offs[3] = {};
@@ -4967,6 +3291,29 @@ static bool ResolveAddresses() {
     Log("CanShow:      %s base+0x%llX (vtable)", g_fnCanShow?"OK":"FAIL",
         g_fnCanShow?(unsigned long long)(g_fnCanShow-g_gameBase):0);
 
+    // PanelValue sits in the same struct as the active flag and moves with it.
+    // The flag is derived from CanShow's body, so it gives the struct delta for
+    // free: 0x110 was correct while the flag sat at 0x118; on 2.01.00 the flag
+    // is 0x130, i.e. PanelValue is 0x128.
+    if (g_offActiveFlag) {
+        const uint32_t kFlagRef = 0x118;   // build where the 0x110 default held
+        int32_t delta = (int32_t)g_offActiveFlag - (int32_t)kFlagRef;
+        if (delta != 0) {
+            int32_t shifted = (int32_t)g_offPanelValue + delta;
+            if (shifted > 0x10 && shifted < 0x2000) {
+                Log("PanelValue:   0x%X -> 0x%X (panel struct moved %+d, from active flag 0x%X)",
+                    g_offPanelValue, shifted, delta, g_offActiveFlag);
+                g_offPanelValue = (uint32_t)shifted;
+            } else {
+                Log("PanelValue:   struct delta %+d would give an implausible 0x%X — keeping 0x%X",
+                    delta, shifted, g_offPanelValue);
+            }
+        } else {
+            Log("PanelValue:   0x%X (active flag at the reference offset, no shift)",
+                g_offPanelValue);
+        }
+    }
+
     // Step 4a: Find vtable start via RTTI Complete Object Locator (vtable[-1])
     // In MSVC x64, vtable[-1] is a pointer to the RTTICompleteObjectLocator.
     // The COL has signature=1 (DWORD at offset 0) and pTypeDescriptor (RVA at offset 12)
@@ -4996,250 +3343,89 @@ static bool ResolveAddresses() {
             Log("  Vtable start: FAIL (RTTI scan)");
     }
 
-    // Step 4b: Modal dialog offset (update-proof modal detection)
-    // Observed live (Apr-23 build, user-confirmed via field dump): the current-modal
-    // pointer lives at handler + 0x258 — NOT in the 0x300-0x400 sub-controller slot
-    // range where earlier builds kept it. All previous scan heuristics (store-pattern,
-    // load-pattern, LEA-out-param) found false positives in 0x3XX because there are
-    // unrelated struct fields there that match similar byte patterns. 0x258 sits in a
-    // different part of the struct that the heuristics can't reach without producing
-    // many false hits. Until we have a uniquely-identifying pattern, hardcode.
+    // Step 4b: Modal dialog slot. No code anchor identifies it uniquely, so it
+    // is fixed at +0x258 and validated at every open: the slot must hold 0 or a
+    // canonical heap pointer, otherwise modal tracking is disabled for the
+    // session (see InitWarehousePanel). Still correct on 2.01.00.
     g_modalDialogOff = 0x258;
-    Log("ModalDlgOff:  OK offset=0x%X (hardcoded for Apr-23 1.0.4.1)", g_modalDialogOff);
+    Log("ModalDlgOff:  fixed offset=0x%X (validated on open)", g_modalDialogOff);
 
-    // Step 5a: Find mainChar singleton global
-    // The game loads the manager singleton and reads the mode byte via:
-    //   48 8B 05 <disp32>        MOV RAX, [RIP+global]      (singleton slot)
-    //   48 8B <mm> 48            MOV reg, [RAX+0x48]        (mainChar = mgr+0x48)
-    //   80 <cc> <off32>          CMP byte [reg+modeOff], i8 (mode byte in 0xC00-0xD00)
-    // DRIFT NOTE (1.13.00 / build 24048742): the intermediate register is no
-    // longer fixed to RCX (now RDX/RBX/... seen) and the mode-byte offset
-    // moved 0xCA8 -> 0xCA0. The old hardcoded tail "48 8B 48 48 80 B9 A8 0C..."
-    // stopped matching -> MainCharGlobal FAIL -> ResolveAddresses returned
-    // false -> FATAL (mod didn't load at all). This scan is now
-    // register-flexible (reg encoded by mm/cc) and offset-flexible (any
-    // 0xC?? mode byte). mgr+0x48 == mainChar is unchanged across builds and
-    // is verified at runtime by ResolveMainChar's downstream use. Also note:
-    // this repacked binary has no ".text" section — code lives in ".shared";
-    // the scan runs over the whole in-memory image (g_imageSize) so it covers
-    // it regardless of section names. All 3 observed call sites resolve to the
-    // same global (build 24048742: base+0x617FBC0), confirming uniqueness.
+    // Step 5a: game-manager singleton (mainChar = *(*(global) + 0x48)). The
+    // load pair
+    //     MOV rX, [rip+global]     ; manager singleton slot
+    //     MOV rY, [rX + 0x48]      ; mainChar
+    // is ambiguous on its own, so accept it only when ONE global clearly
+    // dominates — the game manager is referenced far more often than any other
+    // object with a +0x48 member. Build 25116796: 14 candidates, winner 247
+    // sites vs 22 for the runner-up. ResolveMainChar reads through it under SEH
+    // and nothing is ever written through it.
     {
-        uint8_t* base = (uint8_t*)g_gameBase;
-        for (DWORD i = 0; (size_t)i + 17 < g_imageSize; i++) {
-            if (base[i] != 0x48 || base[i+1] != 0x8B || base[i+2] != 0x05) continue;   // MOV RAX,[rip+d]
-            if (base[i+7] != 0x48 || base[i+8] != 0x8B) continue;                        // MOV reg,[RAX+..]
-            uint8_t mm = base[i+9];
-            if ((mm & 0xC7) != 0x40) continue;   // mod=01, rm=000 (base RAX)
-            if (base[i+10] != 0x48) continue;    // disp8 == +0x48
-            int destReg = (mm >> 3) & 7;
-            if (base[i+11] != 0x80) continue;                 // CMP r/m8, imm8 (group)
-            if (base[i+12] != (0xB8 | destReg)) continue;     // mod=10, /7=CMP, rm==destReg
-            uint32_t off = *(uint32_t*)(base + i + 13);
-            if (off < 0xC00 || off >= 0xD00) continue;        // mode byte in mainChar cluster
-            int32_t disp = *(int32_t*)(base + i + 3);
-            g_mainCharGlobalPtr = (uintptr_t)(base + i + 7) + disp;  // RIP after MOV RAX = base+i+7
-            Log("MainCharGlobal: OK base+0x%llX (singleton scan, r%d, modeOff=0x%X)",
-                (unsigned long long)(g_mainCharGlobalPtr - g_gameBase), destReg, off);
-            break;
+        if (!g_mainCharGlobalPtr) {
+            struct Cand { uintptr_t g; int n; };
+            Cand cand[64] = {};
+            int nc = 0, overflow = 0;
+            uint8_t* base = (uint8_t*)g_gameBase;
+            for (DWORD i = 0; (size_t)i + 11 < g_imageSize; i++) {
+                if (base[i] != 0x48 && base[i] != 0x4C) continue;
+                if (base[i+1] != 0x8B || (base[i+2] & 0xC7) != 0x05) continue;
+                int dst = (((base[i] >> 2) & 1) << 3) | ((base[i+2] >> 3) & 7);
+                uint8_t* q = base + i + 7;
+                if (q[0] != 0x48 && q[0] != 0x49 && q[0] != 0x4C && q[0] != 0x4D) continue;
+                if (q[1] != 0x8B) continue;
+                uint8_t m = q[2];
+                if ((m & 0xC0) != 0x40 || (m & 0x07) == 0x04) continue;
+                if (q[3] != 0x48) continue;                       // member +0x48
+                int src = ((q[0] & 1) << 3) | (m & 0x07);
+                if (src != dst) continue;                         // same register
+                int32_t disp = *(int32_t*)(base + i + 3);
+                uintptr_t g = (uintptr_t)(base + i + 7) + disp;
+                if (g <= g_gameBase || g >= g_gameBase + g_imageSize) continue;
+                int k = 0;
+                for (; k < nc; k++) if (cand[k].g == g) { cand[k].n++; break; }
+                if (k == nc) {
+                    if (nc < 64) { cand[nc].g = g; cand[nc].n = 1; nc++; }
+                    else overflow++;
+                }
+            }
+            uintptr_t best = 0;
+            int bestN = 0, secondN = 0;
+            for (int k = 0; k < nc; k++) {
+                if (cand[k].n > bestN) { secondN = bestN; bestN = cand[k].n; best = cand[k].g; }
+                else if (cand[k].n > secondN) secondN = cand[k].n;
+            }
+            if (best && bestN >= 20 && bestN >= secondN * 4) {
+                g_mainCharGlobalPtr = best;
+                Log("MainCharGlobal: OK base+0x%llX (dominant +0x48 global: %d sites vs %d runner-up, %d candidates)",
+                    (unsigned long long)(g_mainCharGlobalPtr - g_gameBase), bestN, secondN, nc);
+            } else {
+                Log("MainCharGlobal: fallback inconclusive (best=%d runner-up=%d candidates=%d overflow=%d)",
+                    bestN, secondN, nc, overflow);
+            }
         }
         if (!g_mainCharGlobalPtr) Log("MainCharGlobal: FAIL (singleton pattern not found)");
     }
 
-    // Step 5b: ModeSwitcher — string-xref + dynamic offset extraction
-    // The ModeSwitcher function references 4 mainChar offsets in the 0x0C00-0x0D00 range:
-    //   mode byte (u8), sub byte (u8), mode flags array (7 bytes), subtypes array (15 bytes)
-    // Find any disp32 in that range — take min and max, derive the other offsets.
-
-    // Helper lambda: scan function body for disp32 values in mainChar mode-byte range.
-    // Strategy: collect all disp32 in 0xC00-0xD00, find the consecutive pair (X, X+1)
-    // which identifies mode byte + sub byte. Then find the max disp for subtypes/flags.
-    // Returns true and populates g_fnModeSwitcher + offsets on success.
-    auto tryValidateModeSwitcher = [](uintptr_t candidate, int scanWindow, const char* method) -> bool {
-        uint8_t* fn = (uint8_t*)candidate;
-        // Collect all unique disp32 values in range
-        uint32_t found[64];
-        int nFound = 0;
-        for (int k = 2; k < scanWindow - 4; k++) {
-            uint8_t modrmA = fn[k - 1];
-            uint8_t modrmB = fn[k - 2];
-            bool caseA = ((modrmA & 0xC0) == 0x80) && ((modrmA & 0x07) != 0x04);
-            bool caseB = ((modrmB & 0xC0) == 0x80) && ((modrmB & 0x07) == 0x04);
-            if (!caseA && !caseB) continue;
-            uint32_t disp = *(uint32_t*)(fn + k);
-            if (disp < 0xC00 || disp >= 0xD00) continue;
-            // Add if not already seen
-            bool dup = false;
-            for (int j = 0; j < nFound; j++) if (found[j] == disp) { dup = true; break; }
-            if (!dup && nFound < 64) found[nFound++] = disp;
-        }
-        // Find the consecutive pair (X, X+1) — this is mode byte + sub byte
-        uint32_t modeByte = 0;
-        for (int i = 0; i < nFound; i++) {
-            for (int j = 0; j < nFound; j++) {
-                if (found[j] == found[i] + 1) { modeByte = found[i]; break; }
-            }
-            if (modeByte) break;
-        }
-        if (!modeByte) return false;
-        // Find the max disp within modeByte+0x20 range (mode/sub/flags/subtypes are
-        // clustered within ~0x20 bytes of each other in the mainChar struct)
-        uint32_t maxDisp = 0;
-        for (int i = 0; i < nFound; i++) {
-            if (found[i] > modeByte + 1 && found[i] <= modeByte + 0x20 && found[i] > maxDisp)
-                maxDisp = found[i];
-        }
-        // Need at least mode, sub, and one more offset for flags/subtypes
-        if (!maxDisp) return false;
-        g_fnModeSwitcher = candidate;
-        g_offModeByte  = modeByte;
-        g_offSubByte   = modeByte + 1;
-        g_offSubtypes  = maxDisp;
-        g_offModeFlags = maxDisp - 7;
-        Log("ModeSwitcher: OK base+0x%llX (mode=0x%X sub=0x%X flags=0x%X subtypes=0x%X) [%s]",
-            (unsigned long long)(candidate - g_gameBase),
-            g_offModeByte, g_offSubByte, g_offModeFlags, g_offSubtypes, method);
-        return true;
-    };
-
-    // PRIMARY: String-xref via "ingame-global" (unique string, update-resistant)
+    // Step 5b: ModeSwitcher (the view-tag configurator) via the unique
+    // "ingame-global" string xref. Only its location is needed: the screen id
+    // that mounts the warehouse view is read out of its jump tables below.
     {
         uintptr_t strIG = FindString("ingame-global");
-        if (strIG) {
-            uintptr_t leaAddr = FindLEA(strIG);
-            if (leaAddr) {
-                uintptr_t fnStart = FindFunctionStart(leaAddr);
-                if (fnStart) {
-                    tryValidateModeSwitcher(fnStart, 0xA00, "string-xref");
-                }
-            }
-        }
+        uintptr_t leaAddr = strIG ? FindLEA(strIG) : 0;
+        g_fnModeSwitcher = leaAddr ? FindFunctionStart(leaAddr) : 0;
+        Log("ModeSwitcher: %s base+0x%llX (string-xref)", g_fnModeSwitcher ? "OK" : "FAIL",
+            g_fnModeSwitcher ? (unsigned long long)(g_fnModeSwitcher - g_gameBase) : 0ULL);
     }
 
-    // FALLBACK: Pattern scan with old + new prologs, extended scan window
-    if (!g_fnModeSwitcher) {
-        static const uint8_t pMS_old[] = {
-            0x48,0x89,0x5C,0x24,0x08, 0x48,0x89,0x6C,0x24,0x10,
-            0x48,0x89,0x74,0x24,0x18, 0x57, 0x48,0x81,0xEC,0xA0,0x00,0x00,0x00
-        };
-        static const uint8_t pMS_new[] = {
-            0x48,0x89,0x5C,0x24,0x08, 0x48,0x89,0x74,0x24,0x18,
-            0x55, 0x57, 0x41,0x56, 0x48,0x8B,0xEC
-        };
-        struct { const uint8_t* pat; int len; const char* tag; } patterns[] = {
-            { pMS_new, sizeof(pMS_new), "pattern-new" },
-            { pMS_old, sizeof(pMS_old), "pattern-old" },
-        };
-        uint8_t* base = (uint8_t*)g_gameBase;
-        for (auto& p : patterns) {
-            if (g_fnModeSwitcher) break;
-            for (DWORD i = 0; (DWORD)(i + p.len) <= g_imageSize; i++) {
-                if (memcmp(base + i, p.pat, p.len) != 0) continue;
-                if (tryValidateModeSwitcher(g_gameBase + i, 0xA00, p.tag))
-                    break;
-            }
-        }
-    }
-    if (!g_fnModeSwitcher) Log("ModeSwitcher: FAIL (no validated match)");
-
-    // Auto-derive g_storeSubIndex (the subtype index whose ModeSwitcher case emits
-    // the "store" view-tag). It flips almost every game update; deriving it makes
-    // the mod self-correct instead of needing a manual Ghidra re-find. The hardcoded
-    // default stays as a cross-checked fallback, so this is never worse than before.
-    if (g_fnModeSwitcher) {
-        int32_t derived = ResolveStoreSubIndex();
-        if (derived >= 0) {
-            if ((uint32_t)derived != g_storeSubIndex)
-                Log("StoreSubIndex: DRIFT default=%u derived=%d (using derived)",
-                    g_storeSubIndex, derived);
-            else
-                Log("StoreSubIndex: OK %d (auto-derived, matches default)", derived);
-            g_storeSubIndex = (uint32_t)derived;
-        } else {
-            Log("StoreSubIndex: derive failed, keeping default %u", g_storeSubIndex);
-        }
-    }
-
-    // Step 6: SetCursorVisible — removed.
-    // The ModeSwitcher function (FUN_1406CE4A0) is a pure mode-string configurator
-    // with no cursor-related callees.  The game handles cursor visibility natively
-    // when entering/leaving storage mode via the mode byte system.
-    g_fnSetCursorVisible = 0;
-
-    // ================================================================
-    //  FALLBACK: Old pattern scans if string-xref chain failed
-    // ================================================================
-
-    if (!g_fnSetInventory) {
-        static const uint8_t pSI[] = {
-            0x40,0x55, 0x53, 0x56, 0x57, 0x41,0x54, 0x41,0x55, 0x41,0x56, 0x41,0x57,
-            0x48,0x8D,0xAC,0x24,0x18,0xFE,0xFF,0xFF,
-            0x48,0x81,0xEC,0xE8,0x02,0x00,0x00
-        };
-        g_fnSetInventory = ScanPattern(pSI, sizeof(pSI));
-        Log("SetInventory: %s base+0x%llX (FALLBACK pattern)", g_fnSetInventory?"OK":"FAIL",
-            g_fnSetInventory?(unsigned long long)(g_fnSetInventory-g_gameBase):0);
-    }
-
-    // SetInventory final-check log is handled at the resolver site above (Step 2).
-
-    if (!g_fnHandler && g_fnSetInventory) {
-        // Old handler scan: CMP [RBX],0x15 + SetInventory CALL verify + backward search
-        uintptr_t searchStart = g_gameBase;
-        while (searchStart < g_gameBase + g_imageSize - 3) {
-            uint8_t* s = (uint8_t*)searchStart;
-            uintptr_t remaining = g_gameBase + g_imageSize - searchStart;
-            uintptr_t cmpAddr = 0;
-            for (uintptr_t k = 0; k + 3 <= remaining; k++) {
-                if (s[k]==0x80 && s[k+1]==0x3B && s[k+2]==0x15) { cmpAddr = searchStart + k; break; }
-            }
-            if (!cmpAddr) break;
-            bool verified = false;
-            for (int i = 0; i < 0x500; i++) {
-                uint8_t* p = (uint8_t*)(cmpAddr + i);
-                if (p[0] == 0xE8) {
-                    int32_t rel = *(int32_t*)(p + 1);
-                    uintptr_t target = cmpAddr + i + 5 + rel;
-                    if (target == g_fnSetInventory) { verified = true; break; }
-                }
-            }
-            if (verified) {
-                g_fnHandler = FindFunctionStart(cmpAddr);
-                if (g_fnHandler) break;
-            }
-            searchStart = cmpAddr + 1;
-        }
-        Log("Handler:      %s base+0x%llX (FALLBACK pattern)", g_fnHandler?"OK":"FAIL",
-            g_fnHandler?(unsigned long long)(g_fnHandler-g_gameBase):0);
-    }
-
-    if (!g_fnCanShow) {
-        static const uint8_t pCSEnd[] = {
-            0x41,0x0F,0xB6,0x81,0x18,0x01,0x00,0x00, 0x48,0x83,0xC4,0x28, 0xC3
-        };
-        uintptr_t csEnd = ScanPattern(pCSEnd, sizeof(pCSEnd));
-        if (csEnd) {
-            for (int i = 0; i < 0x100; i++) {
-                uint8_t* p = (uint8_t*)(csEnd - i);
-                if (p[0]==0x48 && p[1]==0x83 && p[2]==0xEC && p[3]==0x28 &&
-                    p[4]==0x48 && p[5]==0x8B && p[6]==0x41 && p[7]==0x08) {
-                    g_fnCanShow = csEnd - i; break;
-                }
-            }
-        }
-        Log("CanShow:      %s base+0x%llX (FALLBACK pattern)", g_fnCanShow?"OK":"FAIL",
-            g_fnCanShow?(unsigned long long)(g_fnCanShow-g_gameBase):0);
-    }
-
-    if (!g_fnSetTitle) {
-        static const uint8_t pST[] = {
-            0x40, 0x55, 0x53, 0x56, 0x57, 0x41, 0x56,
-            0x48, 0x8D, 0xAC, 0x24, 0x70, 0xF0, 0xFF, 0xFF,
-            0xB8, 0x90, 0x10, 0x00, 0x00
-        };
-        g_fnSetTitle = ScanPattern(pST, sizeof(pST));
-        Log("SetTitle:     %s base+0x%llX (FALLBACK pattern)", g_fnSetTitle?"OK":"FAIL",
-            g_fnSetTitle?(unsigned long long)(g_fnSetTitle-g_gameBase):0);
+    // Step 5c: the game's own menu request queue and the screen id whose
+    // ModeSwitcher case emits the "store" view tag (WareHouseView is declared
+    // tag2="store ingamemenu" in uigameconfig2.xml).
+    if (ResolveMenuRequest()) {
+        g_storeScreenId = ResolveStoreScreenId();
+        if (g_storeScreenIdIni >= 0)
+            Log("StoreScreenId: INI override %d in use (derived was %d)",
+                g_storeScreenIdIni, g_storeScreenId);
+        if (EffectiveStoreScreenId() < 0)
+            Log("StoreScreenId: unresolved — set StoreScreenId in the INI");
     }
 
     // Step 7: Find language byte dynamically
@@ -5298,126 +3484,55 @@ static bool ResolveAddresses() {
             g_langByteAddr?(unsigned long long)(g_langByteAddr-g_gameBase):0);
     }
 
-    // HGM string slot — dynamic resolution via string-xref.
-    //
-    // The game has a global slot that holds a pointer-to-wrapper-struct where
-    // the wrapper's first field is char* "Housing_GatheredMaterials".  Setup
-    // pattern in the binary (init function called once at startup):
-    //     LEA  RCX, ["Housing_GatheredMaterials"]
-    //     CALL FUN_140302e70     ; wrapper allocator, returns wrapper* in RAX
-    //     MOV  [rip+global], RAX ; the global IS our HGM string slot
-    //
-    // We find the LEA, then scan forward for the post-call MOV that writes RAX
-    // into a RIP-relative global.  Falls back to the 1.06 hardcoded slot if
-    // the dynamic scan fails (so existing INI behavior is preserved either way).
-    g_pHGMStringSlot   = 0;
-    g_fnTypeNameLookup = 0;
+    // InventoryInfo manager (RTTI, see ResolveInventoryMgrViaRtti); the records
+    // are patched by the worker thread once the instance exists.
+    ResolveInventoryMgrViaRtti();
+
+    // Session global for the live inventory container (see ActorViaSessionGlobal):
+    // the global that is by far most often loaded and then dereferenced at +0x30.
+    // Build 25116796: base+0x6C29760 with 1353 sites vs 500 for the runner-up.
+    // ResolveInvContainer() validates whatever this yields before using it.
     {
-        uintptr_t strAddr = FindString("Housing_GatheredMaterials");
-        uintptr_t leaAddr = strAddr ? FindLEA(strAddr, 0) : 0;
-        if (leaAddr) {
-            // Walk forward from LEA looking for MOV [rip+disp32], RAX.
-            // Encoding: 48 89 05 disp32  (REX.W=1, opcode 89, ModRM=05).
-            // Limit scan to 0x80 bytes — the wrapper alloc CALL is right after
-            // the LEA and the MOV is right after the CALL.
-            for (int i = 0; i < 0x80; i++) {
-                uint8_t* p = (uint8_t*)(leaAddr + i);
-                if (p[0] == 0x48 && p[1] == 0x89 && p[2] == 0x05) {
-                    int32_t disp = *(int32_t*)(p + 3);
-                    uintptr_t slot = (uintptr_t)(p + 7) + disp;
-                    if (slot >= g_gameBase && slot < g_gameBase + g_imageSize) {
-                        g_pHGMStringSlot = slot;
-                        break;
-                    }
-                }
-            }
+        struct Cand { uintptr_t g; int n; };
+        Cand cand[64] = {};
+        int nc = 0;
+        uint8_t* base = (uint8_t*)g_gameBase;
+        for (DWORD i = 0; (size_t)i + 11 < g_imageSize; i++) {
+            if (base[i] != 0x48 && base[i] != 0x4C) continue;
+            if (base[i+1] != 0x8B || (base[i+2] & 0xC7) != 0x05) continue;
+            int dst = (((base[i] >> 2) & 1) << 3) | ((base[i+2] >> 3) & 7);
+            uint8_t* q = base + i + 7;
+            if (q[0] != 0x48 && q[0] != 0x49 && q[0] != 0x4C && q[0] != 0x4D) continue;
+            if (q[1] != 0x8B) continue;
+            uint8_t m = q[2];
+            if ((m & 0xC0) != 0x40 || (m & 0x07) == 0x04) continue;
+            if (q[3] != 0x30) continue;                       // member +0x30
+            int src = ((q[0] & 1) << 3) | (m & 0x07);
+            if (src != dst) continue;                         // same register
+            int32_t disp = *(int32_t*)(base + i + 3);
+            uintptr_t g = (uintptr_t)(base + i + 7) + disp;
+            if (g <= g_gameBase || g >= g_gameBase + g_imageSize) continue;
+            int k = 0;
+            for (; k < nc; k++) if (cand[k].g == g) { cand[k].n++; break; }
+            if (k == nc && nc < 64) { cand[nc].g = g; cand[nc].n = 1; nc++; }
         }
-        if (g_pHGMStringSlot) {
-            Log("HGM string slot: OK base+0x%llX (string-xref \"Housing_GatheredMaterials\")",
-                (unsigned long long)(g_pHGMStringSlot - g_gameBase));
+        uintptr_t best = 0; int bestN = 0, secondN = 0;
+        for (int k = 0; k < nc; k++) {
+            if (cand[k].n > bestN) { secondN = bestN; bestN = cand[k].n; best = cand[k].g; }
+            else if (cand[k].n > secondN) secondN = cand[k].n;
+        }
+        if (best && bestN >= 20 && bestN >= secondN * 2) {
+            g_sessionGlobal = best;
+            Log("SessionGlobal: OK base+0x%llX (dominant +0x30 global: %d sites vs %d runner-up, %d candidates)",
+                (unsigned long long)(best - g_gameBase), bestN, secondN, nc);
         } else {
-            Log("HGM string slot: WARN string-xref scan failed — Gatherables type-id lookup disabled (INI fallback only)");
+            Log("SessionGlobal: inconclusive (best=%d runner-up=%d) — cluster scan fallback only",
+                bestN, secondN);
         }
     }
-    Log("Type resolver:   DISABLED (function not re-resolved; INI fallback used for housing chests)");
 
-    // Container vtable: NOT hardcoded — auto-relearned at runtime when the
-    // first chest is opened (5 consecutive sightings of the same vtable
-    // pointer at handler+0x170 → adopted as canonical). Starting at 0 means
-    // the very first warehouse open skips the sticky-restore path for one
-    // frame, then sticky-binding kicks in normally.
-    g_addrContainerVtable = 0;
-
-    // Dynamic resolver for the InventoryInfoMgr singleton slot — scan
-    // SetInventory's body for the canonical load+deref pattern:
-    //   [48|4C] 8B Y disp32        mov regX, [rip+disp32]   ← singleton slot
-    //                              (Y encodes dest reg: 05=rax, 0D=rcx,
-    //                               15=rdx, 1D=rbx, 25=rsp(no), 2D=rbp,
-    //                               35=rsi, 3D=rdi; 4C prefix extends to r8-r15)
-    //   ...                        (null-check / setup) ...
-    //   [48..4D] 8B Z [0x60|0x70|0x78]
-    //                              mov reg, [regX+0x60/+0x70/+0x78]
-    //                              (Z's rm bits must match regX's encoding,
-    //                               i.e. base reg of the deref is the same
-    //                               reg the singleton was loaded into)
-    // The +0x60/+0x70/+0x78 fields are the channel-id hash table on the
-    // manager struct (per the original RE notes). Hardcoded RVAs drift
-    // every game update (1.05=0x5EF1DC0, 1.06=0x5F28400, ...); this scan
-    // re-locates the slot from SetInventory itself, which is already
-    // resolved via the "ShowPackageCampMoneyList" string-xref.
-    // Compiler may target any of rax/rcx/rdx/rbx/rbp/rsi/rdi (1.06 used
-    // rax, post-1.06 update used rcx — hardcoded `48 8B 05` matcher missed it).
-    g_addrInventoryInfoMgrPtr = 0;
-    if (g_fnSetInventory) {
-        uint8_t* fn = (uint8_t*)g_fnSetInventory;
-        const int SCAN = 0x1000;   // SetInventory body is ~3 KB; cover full prologue + first half
-        for (int i = 0; i + 7 < SCAN && !g_addrInventoryInfoMgrPtr; i++) {
-            uint8_t rex = fn[i];
-            if (rex != 0x48 && rex != 0x4C) continue;
-            if (fn[i+1] != 0x8B) continue;
-            uint8_t mrmLoad = fn[i+2];
-            // RIP-relative: mod=00, rm=101 → (mrm & 0xC7) == 0x05
-            if ((mrmLoad & 0xC7) != 0x05) continue;
-            int loadDest = ((mrmLoad >> 3) & 0x07) | ((rex == 0x4C) ? 8 : 0);
-            int32_t disp = *(int32_t*)(fn + i + 3);
-            uintptr_t target = (uintptr_t)(fn + i + 7) + disp;
-            if (target < g_gameBase || target >= g_gameBase + g_imageSize) continue;
-            // Skip targets in the .text-style executable range; we want data slots.
-            // Heuristic: data slots are well past the typical code region (>0x3000000).
-            if (target - g_gameBase < 0x3000000) continue;
-            // Look ahead within next 96 bytes for a deref `[REX] 8B [mod=01,rm=loadDest] [0x60|0x70|0x78]`.
-            // REX prefix variants 48/49/4C/4D — bit 0 (REX.B) extends rm to r8-r15.
-            bool hasMatchingDeref = false;
-            for (int j = i + 7; j + 3 < i + 96 && j + 3 < SCAN; j++) {
-                uint8_t rd = fn[j];
-                bool isRex = (rd == 0x48 || rd == 0x49 || rd == 0x4C || rd == 0x4D);
-                if (!isRex || fn[j+1] != 0x8B) continue;
-                uint8_t mrm = fn[j+2];
-                if ((mrm & 0xC0) != 0x40) continue;
-                int rm = (mrm & 0x07) | ((rd & 0x01) ? 8 : 0);
-                if (rm != loadDest) continue;
-                uint8_t d8 = fn[j+3];
-                if (d8 == 0x60 || d8 == 0x70 || d8 == 0x78) {
-                    hasMatchingDeref = true;
-                    break;
-                }
-            }
-            if (hasMatchingDeref) {
-                g_addrInventoryInfoMgrPtr = target;
-                Log("Inventory mgr ptr:   OK base+0x%llX (SetInventory scan @ +0x%X, dest=r%d)",
-                    (unsigned long long)(target - g_gameBase), i, loadDest);
-            }
-        }
-    }
-    if (!g_addrInventoryInfoMgrPtr) {
-        Log("Inventory mgr ptr:   WARN dynamic scan failed — inventory slot expansion disabled this session");
-    }
-
-    // ItemDetailModal open handler — resolved dynamically via "ItemDetailModalMessage"
-    // string LEA xref. The string is referenced inside the ctor function body; we walk
-    // back from the LEA to the function prologue. Eliminates the 1.06 hardcoded
-    // 0xB55860 which drifted on subsequent updates (silent ABORT in hook installer
-    // → "View Details" popup never detected → ESC closes warehouse instead of popup).
+    // ItemDetailModal open handler — resolved via the "ItemDetailModalMessage"
+    // string LEA xref (walk back from the LEA to the function prolog).
     g_addrItemDetailCtor = 0;
     {
         uintptr_t strModal = FindString("ItemDetailModalMessage");
@@ -5437,9 +3552,8 @@ static bool ResolveAddresses() {
         }
     }
 
-    Log("Container vtable:    auto-relearn (5 consecutive sightings at handler+0x170)");
-
-    return g_fnHandler && g_fnModeSwitcher && g_fnCanShow && g_fnSetInventory && g_mainCharGlobalPtr;
+    return g_fnHandler && g_fnCanShow && g_fnSetInventory && g_mainCharGlobalPtr &&
+           g_menuRequestFn && EffectiveStoreScreenId() >= 0;
 }
 
 static DWORD WINAPI ModThread(LPVOID) {
@@ -5454,7 +3568,7 @@ static DWORD WINAPI ModThread(LPVOID) {
     if(!g_enabled)return 0;
     if(g_debugLog){std::string lp=ip.substr(0,ip.rfind('.'))+".log";g_logFile=fopen(lp.c_str(),"w");}
 
-    Log("=== Private Storage Anywhere v1.5.10 (CD 1.13.01) ===");
+    Log("=== Private Storage Anywhere v1.6.0 (CD 2.02.00) ===");
     {char cls[256]={};char ttl[256]={};GetClassNameA(g_gameWindow,cls,256);GetWindowTextA(g_gameWindow,ttl,256);
     Log("Game window: class='%s' title='%s'",cls,ttl);}
     g_gameBase=(uintptr_t)GetModuleHandleA("CrimsonDesert.exe");
@@ -5504,63 +3618,15 @@ static DWORD WINAPI ModThread(LPVOID) {
     if (hookSizeHandler < 14) hookSizeHandler = 15;
 
     if(!InstallHook(g_fnHandler,(uintptr_t)&CaptureOnHandler,"Handler",hookSizeHandler)) return 0;
-    // ModeSwitcher hook removed: mainChar is now resolved via singleton global,
-    // and the dispatcher function has a different signature (4 args, not 1).
     if(!InstallCanShowHook(g_fnCanShow)) return 0;
 
-    // ItemDetailOpen hook — 1.06 target is FUN_140b55860 (verified via the
-    // "ItemDetailModalMessage" string LEA xref at +0xb55946). The hook
-    // increments g_itemDetailActiveCount so ESC/B/Circle close the popup
-    // first instead of closing the warehouse.
+    // ItemDetailOpen hook: raises g_itemDetailActiveCount so ESC/B/Circle close
+    // the popup first instead of the warehouse.
     if (g_addrItemDetailCtor) {
         if (!InstallHook(g_addrItemDetailCtor, (uintptr_t)&CaptureOnItemDetailCtor,
                          "ItemDetailOpen")) {
             Log("ItemDetailOpen hook FAILED — popup won't be detected");
         }
-    }
-
-    // -------- TraceMode: install diagnostic hooks on the natural NPC-open
-    // pipeline so we can see the exact sequence Pearl Abyss runs in CD 1.10
-    // when a player opens the warehouse the official way. Addresses are
-    // hard-coded from Ghidra analysis of the 1.10 binary; if the user moves
-    // to a different build we should re-verify these (the symptom would be
-    // either a HOOK ABORT log line or a crash on the first natural open).
-    if (g_traceMode) {
-        Log("TraceMode ENABLED — installing 8 diagnostic hooks (Init/Show/ShowFocus/ShowSimple/PanelDescShow/Dtor/Binder/RegGet)");
-        uintptr_t addrInit       = g_gameBase + 0xAA39E0;   // FUN_140AA39E0 — vtable[1]  Init
-        uintptr_t addrShow       = g_gameBase + 0xA9F4E0;   // FUN_140A9F4E0 — vtable[51] Show (sink)
-        uintptr_t addrShowFocus  = g_gameBase + 0xAA3BF0;   // FUN_140AA3BF0 — Show + focus + SetInventoryName wrapper
-        uintptr_t addrShowSimple = g_gameBase + 0xA9D4A0;   // FUN_140A9D4A0 — Show + focus only wrapper
-        uintptr_t addrDesc       = g_gameBase + 0x346A3E0;  // FUN_14346A3E0 — panel-desc show primitive
-        uintptr_t addrDtor       = g_gameBase + 0xAA3910;   // FUN_140AA3910 — Warehouse2 deleting destructor
-        uintptr_t addrBinder     = g_gameBase + 0xA9C820;   // FUN_140A9C820 — master widget binder (sets +0x2CD=1)
-        uintptr_t addrRegGet     = g_gameBase + 0x1004DE0;  // FUN_141004DE0 — panel-descriptor registry getter
-        if (!InstallHook(addrInit,       (uintptr_t)&TraceOnWarehouseInit,       "Trace.WhInit"))
-            Log("Trace.WhInit hook FAILED — Init calls will not be logged");
-        if (!InstallHook(addrShow,       (uintptr_t)&TraceOnWarehouseShow,       "Trace.WhShow"))
-            Log("Trace.WhShow hook FAILED — Show-sink calls will not be logged");
-        if (!InstallHook(addrShowFocus,  (uintptr_t)&TraceOnWarehouseShowFocus,  "Trace.WhShowFocus"))
-            Log("Trace.WhShowFocus hook FAILED — ShowFocus wrapper calls will not be logged");
-        if (!InstallHook(addrShowSimple, (uintptr_t)&TraceOnWarehouseShowSimple, "Trace.WhShowSimple"))
-            Log("Trace.WhShowSimple hook FAILED — ShowSimple wrapper calls will not be logged");
-        if (!InstallHook(addrDesc,       (uintptr_t)&TraceOnPanelDescShow,       "Trace.PanelDescShow"))
-            Log("Trace.PanelDescShow hook FAILED — descriptor show calls will not be logged");
-        if (!InstallHook(addrDtor,       (uintptr_t)&TraceOnWarehouseDtor,       "Trace.WhDtor"))
-            Log("Trace.WhDtor hook FAILED — instance destruction will not be logged");
-        if (!InstallHook(addrBinder,     (uintptr_t)&TraceOnWarehouseBinder,     "Trace.WhBinder"))
-            Log("Trace.WhBinder hook FAILED — master widget binder calls will not be logged");
-        // FUN_141004DE0 is tiny (likely just MOV+RET); InstallHook may abort
-        // on prolog-too-short. Log the failure but keep going.
-        if (!InstallHook(addrRegGet,     (uintptr_t)&TraceOnPanelRegistryGet,    "Trace.RegGet"))
-            Log("Trace.RegGet hook FAILED (likely prolog < 14 bytes) — registry-getter callers will not be logged");
-
-        // Read-only: dump 8 slots of the panel-descriptor vtable shared by
-        // WareHouse and CampWareHouse (base+0x4BC1028). One of these slots is
-        // the spawn-instance method natural NPC-open uses. Knowing its RVA
-        // lets a future iteration call it directly from F-key. The SEH-
-        // wrapped read lives in TraceDumpDescriptorVtable() because MSVC
-        // forbids __try in ModThread (it has C++ unwind objects).
-        TraceDumpDescriptorVtable();
     }
 
     // Resolve mainChar immediately from singleton (no need to wait for hook callback)
@@ -5607,227 +3673,30 @@ static DWORD WINAPI ModThread(LPVOID) {
     g_ready=true;
     CreateThread(nullptr,0,InputThread,nullptr,0,nullptr);
 
-    // ------- TraceMode diagnostic: PollerThread -------
-    // 1.10 broke the mod because the natural NPC-open path doesn't go
-    // through the Warehouse2 vtable functions we hook (Init/Show/...).
-    // The captured warehouse stays in shell state forever even when
-    // the player opens a chest at the NPC and the UI clearly renders.
-    // Hypothesis: either NPC-open uses a DIFFERENT instance, or it sets
-    // fields we don't watch. This poller answers both questions:
-    //   (A) every 1s, snapshot the captured warehouse's key fields, log
-    //       only when something changes. A natural NPC-open will produce
-    //       a CHANGED log line if it touches the captured instance.
-    //   (B) every 5s, HeapWalk all process heaps and find every other
-    //       allocation whose first 8 bytes match g_warehouseVtableStart.
-    //       Log every new instance + state changes. A natural NPC-open
-    //       that uses a different instance will produce a NEW INSTANCE
-    //       log line. Bounded to keep frame-time low.
-    if (g_traceMode) {
+    // Slot-capacity worker: raise the five housing records to their maximum as
+    // soon as the InventoryInfo manager instance exists, then exit. The records
+    // are not re-created during a session, and every open re-checks them
+    // synchronously (InitWarehousePanel), so no periodic background writes
+    // are needed.
+    if (g_invMgrGlobal) {
         CreateThread(nullptr, 0, [](LPVOID) -> DWORD {
-            Sleep(15000);
-            Log("[POLL] PollerThread started (1s captured-diff, 5s heap-scan)");
-
-            struct Snap {
-                uintptr_t s120=0xCAFE, s128=0xCAFE, s218=0xCAFE, s270=0xCAFE,
-                          s290=0xCAFE, s300=0xCAFE;
-                uint8_t   s2CD=0xCD;
-                bool      init=false;
-            };
-            auto readSnap = [](uintptr_t inst, Snap& out) -> bool {
-                if (!inst) return false;
-                __try {
-                    out.s120 = *(uintptr_t*)(inst + 0x120);
-                    out.s128 = *(uintptr_t*)(inst + 0x128);
-                    out.s218 = *(uintptr_t*)(inst + 0x218);
-                    out.s270 = *(uintptr_t*)(inst + 0x270);
-                    out.s290 = *(uintptr_t*)(inst + 0x290);
-                    out.s300 = *(uintptr_t*)(inst + 0x300);
-                    out.s2CD = *(uint8_t*)(inst + 0x2CD);
-                    return true;
-                } __except(EXCEPTION_EXECUTE_HANDLER) { return false; }
-            };
-            auto differs = [](const Snap& a, const Snap& b) -> bool {
-                return a.s120!=b.s120 || a.s128!=b.s128 || a.s218!=b.s218 ||
-                       a.s270!=b.s270 || a.s290!=b.s290 || a.s300!=b.s300 ||
-                       a.s2CD!=b.s2CD;
-            };
-            auto logSnap = [](uintptr_t inst, const char* tag, const Snap& s) {
-                Log("[POLL] %s this=0x%llX +0x120=0x%llX +0x128=0x%llX "
-                    "+0x218=0x%llX +0x270=0x%llX +0x290=0x%llX +0x2CD=%u +0x300=0x%llX",
-                    tag, (unsigned long long)inst,
-                    (unsigned long long)s.s120, (unsigned long long)s.s128,
-                    (unsigned long long)s.s218, (unsigned long long)s.s270,
-                    (unsigned long long)s.s290, (unsigned)s.s2CD,
-                    (unsigned long long)s.s300);
-            };
-
-            Snap capturedPrev;
-            struct Tracked { uintptr_t addr; Snap snap; };
-            constexpr size_t MAX_TRACKED = 32;
-            Tracked tracked[MAX_TRACKED] = {};
-            size_t trackedCount = 0;
-
-            int cycle = 0;
-            while (!InterlockedCompareExchange(&g_shutdown, 0, 0)) {
-                Sleep(1000);
-                cycle++;
-
-                // (A) Captured-warehouse state diff
-                uintptr_t captured = (uintptr_t)InterlockedCompareExchange64(&g_handlerThis, 0, 0);
-                if (captured) {
-                    Snap now;
-                    if (readSnap(captured, now)) {
-                        if (!capturedPrev.init) {
-                            capturedPrev = now; capturedPrev.init = true;
-                            logSnap(captured, "captured INITIAL", now);
-                        } else if (differs(capturedPrev, now)) {
-                            logSnap(captured, "captured CHANGED", now);
-                            capturedPrev = now;
-                        }
-                    }
-                }
-
-                // (B) Heap-scan every 5 cycles
-                if (cycle % 5 != 0) continue;
-                if (!g_warehouseVtableStart) continue;
-
-                DWORD numHeaps = GetProcessHeaps(0, nullptr);
-                if (numHeaps == 0 || numHeaps > 64) continue;
-                HANDLE heaps[64] = {};
-                DWORD got = GetProcessHeaps(numHeaps, heaps);
-                if (got == 0 || got > 64) continue;
-
-                size_t foundThisScan = 0;
-                bool newInstanceLogged = false;
-                for (DWORD i = 0; i < got; i++) {
-                    if (!heaps[i]) continue;
-                    if (!HeapLock(heaps[i])) continue;
-                    PROCESS_HEAP_ENTRY entry = {};
-                    int walks = 0;
-                    while (walks < 200000) {
-                        BOOL ok = FALSE;
-                        __try { ok = HeapWalk(heaps[i], &entry); }
-                        __except(EXCEPTION_EXECUTE_HANDLER) { ok = FALSE; }
-                        if (!ok) break;
-                        walks++;
-                        if (!(entry.wFlags & PROCESS_HEAP_ENTRY_BUSY)) continue;
-                        if (entry.cbData < 0x400) continue;
-                        uintptr_t obj = 0, vt = 0;
-                        __try {
-                            obj = (uintptr_t)entry.lpData;
-                            vt  = *(uintptr_t*)obj;
-                        } __except(EXCEPTION_EXECUTE_HANDLER) { continue; }
-                        if (vt != g_warehouseVtableStart) continue;
-
-                        foundThisScan++;
-                        // Find or insert
-                        size_t slot = trackedCount;
-                        for (size_t j = 0; j < trackedCount; j++) {
-                            if (tracked[j].addr == obj) { slot = j; break; }
-                        }
-                        if (slot == trackedCount) {
-                            if (trackedCount >= MAX_TRACKED) continue;
-                            tracked[trackedCount].addr = obj;
-                            readSnap(obj, tracked[trackedCount].snap);
-                            tracked[trackedCount].snap.init = true;
-                            logSnap(obj, "NEW INSTANCE", tracked[trackedCount].snap);
-                            trackedCount++;
-                            newInstanceLogged = true;
-                        } else {
-                            Snap now;
-                            if (readSnap(obj, now) && differs(tracked[slot].snap, now)) {
-                                logSnap(obj, "INSTANCE CHANGED", now);
-                                tracked[slot].snap = now;
-                                newInstanceLogged = true;
-                            }
-                        }
-                    }
-                    HeapUnlock(heaps[i]);
-                }
-                if (newInstanceLogged || (cycle % 60 == 0)) {
-                    Log("[POLL] Heap-scan cycle %d: %zu Warehouse2 instances live (tracked %zu)",
-                        cycle, foundThisScan, trackedCount);
-                }
-            }
-            return 0;
-        }, nullptr, 0, nullptr);
-    }
-
-    // ------- CD 1.10 capture-only: render-gate (+0x2CD) watcher -------
-    // Read-only. The warehouse panel renders only when controller+0x2CD == 1
-    // (the Binder sets it once the view is mounted; Show is a no-op while 0).
-    // The mod captures the real controller into g_handlerThis when the game
-    // calls its Handler (a real world-object open does this). We poll that
-    // controller's render gate + the fields that gate the mount, and log ONE
-    // line whenever +0x2CD changes. Opening the warehouse via the WORLD OBJECT
-    // (which DOES render) will flip +0x2CD 0->1 and reveal exactly which
-    // companion fields the mount sets — the precursor we must reproduce.
-    // No writes, SEH-guarded. Runs only when DebugLog is on.
-    if (g_debugLog) {
-        CreateThread(nullptr, 0, [](LPVOID) -> DWORD {
-            uint8_t lastGate = 0xFF;
-            while (!InterlockedCompareExchange(&g_shutdown, 0, 0)) {
-                Sleep(250);
-                uintptr_t ctrl = (uintptr_t)InterlockedCompareExchange64(&g_handlerThis, 0, 0);
-                if (!ctrl) continue;
-                __try {
-                    uint8_t   gate = *(uint8_t*)(ctrl + 0x2CD);
-                    if (gate != lastGate) {
-                        uintptr_t s218 = *(uintptr_t*)(ctrl + 0x218);
-                        uintptr_t s120 = *(uintptr_t*)(ctrl + 0x120);
-                        uint8_t   s128 = *(uint8_t*)(ctrl + 0x128);
-                        uint8_t   s2cc = *(uint8_t*)(ctrl + 0x2CC);
-                        uint8_t   s2ca = *(uint8_t*)(ctrl + 0x2CA);
-                        uintptr_t s1b0 = *(uintptr_t*)(ctrl + 0x1B0);
-                        Log("[CAP] +0x2CD %u->%u  +0x218=0x%llX +0x120=0x%llX "
-                            "+0x128=%u +0x2CC=%u +0x2CA=%u +0x1B0=0x%llX active=%ld",
-                            (unsigned)lastGate, (unsigned)gate,
-                            (unsigned long long)s218, (unsigned long long)s120,
-                            (unsigned)s128, (unsigned)s2cc, (unsigned)s2ca,
-                            (unsigned long long)s1b0,
-                            (long)InterlockedCompareExchange(&g_warehouseActive, 0, 0));
-                        lastGate = gate;
-                    }
-                } __except(EXCEPTION_EXECUTE_HANDLER) {}
-            }
-            return 0;
-        }, nullptr, 0, nullptr);
-    }
-
-
-    // scan, see g_addrInventoryInfoMgrPtr resolver above) and rewrites every
-    // InventoryInfo+0x48 with value 10 to 1000 — this is the *real* slot-
-    // count field consumed by the UI. Manager loads some time after the
-    // binary maps; poll once per second until we see a non-zero patch count,
-    // then keep checking every 3s in case a save-load / teleport reset reverts
-    // the values (the open path re-patches synchronously too — this worker is
-    // the safety net for boxes opened at their real in-game chest). If the
-    // singleton resolver failed at boot, the patch is
-    // permanently unavailable this session — don't spawn the worker at all
-    // instead of busy-spinning at 1 Hz forever.
-    if (g_addrInventoryInfoMgrPtr) {
-        CreateThread(nullptr, 0, [](LPVOID) -> DWORD {
-            bool firstApplied = false;
-            for (;;) {
+            for (int tick = 0; tick < 1800; tick++) {          // give up after ~30 min
                 if (InterlockedCompareExchange(&g_shutdown, 0, 0)) return 0;
-                int n = PatchInventoryInfoSlots();
+                int n = PatchSlotsViaManager();
                 if (n > 0) {
-                    if (!firstApplied) {
-                        Log("InventoryInfo slot patch: %d entries default 10 -> 1000", n);
-                        firstApplied = true;
-                    } else {
-                        Log("InventoryInfo slot patch: re-applied to %d entries (post-reload)", n);
-                    }
+                    Log("Slot capacity: %d housing chest(s) at maximum — worker done", n);
+                    return 0;
                 }
-                Sleep(firstApplied ? 3000 : 1000);
+                Sleep(1000);
             }
+            Log("Slot capacity: worker gave up — inventory records never appeared");
             return 0;
         }, nullptr, 0, nullptr);
     } else {
-        Log("InventoryInfo worker: NOT STARTED (resolver failed at boot — slot expansion disabled)");
+        Log("Slot capacity: InventoryInfo manager unresolved — housing chests keep their vanilla capacity");
     }
 
-    Log("=== READY! Press F6 to open Private Storage from anywhere ===");
+    Log("=== READY ===");
     return 0;
 }
 

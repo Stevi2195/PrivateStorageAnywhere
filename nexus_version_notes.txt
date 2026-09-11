@@ -2,6 +2,9 @@ Short per-version notes for the Nexus "Version notes" field (max 255 characters 
 Copy the line(s) below the version number when uploading that file version.
 =======================================================================
 
+v1.6.0
+Updated for game 2.02.00. Fixes the mod not loading after the update, the wrong chest or title opening, and the Dresser stuck at 10 slots. Capacity is now set once at startup instead of on a background timer; camp warehouse untouched.
+
 v1.5.10
 Fixes housing-chest capacity briefly showing 10 slots instead of 1000 right after a teleport or load (now re-applied the instant you open a box). Also hardens the mod against future game updates so storage hotkeys are less likely to break on a patch.
 
