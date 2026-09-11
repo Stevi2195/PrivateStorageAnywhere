@@ -41,12 +41,15 @@ static uintptr_t g_warehouseVtableEntry = 0;  // vtable address containing handl
 static uintptr_t g_warehouseVtableStart = 0;  // vtable start of warehouse class — set on first successful capture
 static uintptr_t g_langByteAddr = 0;      // address of language byte (resolved dynamically from Steam API init function)
 
-// ItemDetailModal ("View Details" popup) tracking, used only when the game's
-// own modal-view test (IsViewOpen("ModalMessageView")) is unavailable: the
-// popup's open handler is found via the "ItemDetailModalMessage" string xref
-// and hooked to raise this flag; ESC/B/Circle clear it again.
+// Dialog open events. The openers of the "View Details" popup and of the
+// quantity dialog are found via the "ItemDetailModalMessage" /
+// "CountingModalMessage" string xrefs and hooked read-only; each open resets
+// the modal state machine (g_modalDismissed, see IsNewModalDialogVisible).
+// g_itemDetailActiveCount is the fallback flag, used only while the game's
+// modal-layer test (IsViewOpen("ModalMessageView")) is unavailable.
 static volatile LONG g_itemDetailActiveCount = 0;
 static uintptr_t g_addrItemDetailCtor = 0;
+static uintptr_t g_addrCountingModal  = 0;   // "CountingModalMessage" opener (quantity dialog)
 
 // Struct offsets. Everything below is resolved from the game code at startup;
 // the initial values are only the layout of the build each one was first seen
@@ -183,7 +186,7 @@ static bool g_xiBWasDown = false;
 // keys exist only as an override should a future build change the value space.
 static volatile LONG g_panelValueCfg[PANEL_COUNT] = {};
 static volatile LONG g_privatePanelValueCfg     = 0;       // 0 = no override
-static volatile LONG g_gatherablesPanelValueCfg = 0;       // 0 = use runtime lookup
+static volatile LONG g_gatherablesPanelValueCfg = 0;       // 0 = no override
 
 // Which panel's SetInventory channels are currently subscribed. Subscriptions
 // accumulate on the controller until an explicit ",False" unbind, so the next
@@ -215,7 +218,7 @@ static bool IsViewOpen(const char* name, uint8_t* stOut);
 static volatile LONG g_pendingCircleClose = 0;  // PS5/PS4 Circle (HID)
 static volatile LONG g_pendingBClose      = 0;  // XInput B
 
-// DLL hot-reload signal. Worker threads (InputThread, InventoryInfo poller)
+// DLL hot-reload signal. Worker threads (InputThread, slot-capacity worker)
 // poll this and exit the loop when set. On normal process exit the OS
 // terminates threads before DllMain runs so this is irrelevant; on
 // FreeLibrary hot-reload the flag gives workers a chance to bail before
@@ -609,25 +612,31 @@ static const char* GetWarehouseTitle() {
 // Is a modal dialog (quantity / confirm / "View Details") up over the
 // warehouse? The warehouse code itself asks the panel manager for
 // "ModalMessageView" (uigameconfig.xml: the modal layer, layer 100) and reads
-// its view state — so do we. Only when that test is unavailable do we fall
-// back to the ItemDetailOpen hook flag.
-// After an ESC has been passed through to dismiss a modal, the modal layer
-// keeps reporting "open" for the fade-out (seen on 2.02: two to four extra
-// ESC presses did nothing). Within this window the layer counts as closed.
-static volatile ULONGLONG g_modalDismissTick = 0;
-static const ULONGLONG MODAL_DISMISS_GRACE_MS = 1500;
+// its view state — so do we; the ItemDetailOpen hook flag is the fallback
+// while that test is unavailable (panel manager not captured yet).
+//
+// Modal state machine. The layer object (ModalMessageView) reports "open" from
+// the moment a dialog opens until a few seconds after it was dismissed — its
+// first 0x100 bytes are byte-identical with the dialog open, just dismissed
+// and seconds later (2.02 dump), so it carries no "dialog gone" field. The
+// dialog state is therefore tracked by events:
+//   open      -> the game's own dialog openers (ItemDetailModalMessage and
+//                CountingModalMessage hooks) clear g_modalDismissed
+//   dismissed -> an ESC / B / Circle press passed on to the game sets
+//                g_modalDismissed (the game dismisses the dialog with it)
+//   closed    -> the layer reading "closed" clears g_modalDismissed
+// A dialog is up when the layer is open and no dismissing press has been
+// passed on since the last open event. No timers.
+static volatile LONG g_modalDismissed = 0;
 
 static bool IsNewModalDialogVisible() {
     if (g_fnFindPanelTop && g_panelStateOff &&
         InterlockedCompareExchange64(&g_panelManager, 0, 0)) {
-        uint8_t st = 0;
-        bool open = IsViewOpen("ModalMessageView", &st);
-        if (open && g_modalDismissTick &&
-            GetTickCount64() - g_modalDismissTick < MODAL_DISMISS_GRACE_MS) {
-            Log("  modal layer still fading (state 0x%02X) — treated as closed", st);
+        if (!IsViewOpen("ModalMessageView", nullptr)) {
+            InterlockedExchange(&g_modalDismissed, 0);
             return false;
         }
-        return open;
+        return InterlockedCompareExchange(&g_modalDismissed, 0, 0) == 0;
     }
     return InterlockedCompareExchange(&g_itemDetailActiveCount, 0, 0) > 0;
 }
@@ -771,12 +780,15 @@ static void LoadConfig(const char* p) {
 }
 
 // String-Xref helpers (from QuickMenuHotkeys)
+// First occurrence of the NUL-terminated string that also STARTS a string
+// (preceded by a NUL). A tail match ("QuestMenuPanel" inside
+// "DailyQuestMenuPanel") has no code reference of its own.
 static uintptr_t FindString(const char* str) {
     uint8_t* base = (uint8_t*)g_gameBase;
     int len = (int)strlen(str);
     for (DWORD i = 0; i + len + 1 < g_imageSize; i++) {
-        if (base[i] == (uint8_t)str[0] &&
-            memcmp(base + i, str, len + 1) == 0)
+        if (base[i] != (uint8_t)str[0] || (i && base[i - 1] != 0)) continue;
+        if (memcmp(base + i, str, len + 1) == 0)
             return (uintptr_t)(base + i);
     }
     return 0;
@@ -963,7 +975,8 @@ static bool InitXInput() {
 //  DLL export (g_pXInputGetState) which is not affected by the IAT.
 //
 //  Filter rules:
-//    - while warehouse is mod-owned: clear B (no dodge),
+//    - while warehouse is mod-owned: clear B (no dodge) — unless a dialog
+//      is up, which the game must be able to cancel with B;
 //      clear configured per-panel buttons + their modifiers when
 //      both are held (so combos that are bound to mod-actions never
 //      reach the game)
@@ -994,8 +1007,9 @@ extern "C" DWORD WINAPI XInputGetState_Filtered(DWORD slot, XINPUT_STATE_LOCAL* 
         if (modBit) clear |= modBit;
     }
 
-    // B always masked while warehouse is mod-owned (no dodge).
-    if (InterlockedCompareExchange(&g_warehouseActive, 0, 0))
+    // B masked while the warehouse is mod-owned (no dodge) — except while a
+    // dialog is up, which the game has to be able to cancel with B.
+    if (InterlockedCompareExchange(&g_warehouseActive, 0, 0) && !IsNewModalDialogVisible())
         clear |= 0x2000;
 
     state->Gamepad.wButtons = btns & ~clear;
@@ -1232,8 +1246,8 @@ static const char* InvNameForFileId(uint16_t fileId) {
     return (fileId < sizeof(kNames) / sizeof(kNames[0])) ? kNames[fileId] : "?";
 }
 
-// Confirm the field offset by content before writing anything: the housing
-// chests must read 10/1000 and the camp warehouse 240/1000.
+// Confirm the field offset by content before writing anything: two housing
+// chests (Dresser, Refrigerator) must read 10/1000 at the same offset.
 static bool ValidateSlotField(uintptr_t arr, uint32_t count, uint32_t off) {
     __try {
         if (0x13 >= count) return false;
@@ -1424,13 +1438,12 @@ static void DumpInvGroups() {
 // Raise the live capacity of the five housing chests to the record maximum
 // (info+0x4A) the way the game's own bonus path does: growth = max - slots;
 // slots = max; bonus += growth; +0x18 += growth. CampWareHouse (0x08) is left
-// alone. openingId selects which group gets a before/after line; quiet
-// suppresses the per-chest lines after the first few (worker thread).
-static int PatchGroupCapacities(uint16_t openingId, bool quiet = false) {
+// alone. openingId selects which group gets a before/after line. Only called
+// from InitWarehousePanel (on open).
+static int PatchGroupCapacities(uint16_t openingId) {
     uintptr_t cont = ResolveInvContainer();
     if (!cont || !g_invMgrGlobal) return 0;
     static const uint16_t kIds[] = { 0x0F, 0x10, 0x11, 0x12, 0x13 };   // FILE ids
-    static LONG quietLogs = 0;
     int raised = 0;
     __try {
         uintptr_t mgr = *(uintptr_t*)g_invMgrGlobal;
@@ -1458,9 +1471,7 @@ static int PatchGroupCapacities(uint16_t openingId, bool quiet = false) {
             *(uint16_t*)(g + 0x16) = (uint16_t)(*(uint16_t*)(g + 0x16) + growth);
             *(uint16_t*)(g + 0x18) = (uint16_t)(*(uint16_t*)(g + 0x18) + growth);
             raised++;
-            if (!quiet || InterlockedIncrement(&quietLogs) <= 20)
-                Log("  InvGroups: id 0x%02X live slots %u -> %u%s", id, cur, max,
-                    quiet ? " (worker)" : "");
+            Log("  InvGroups: id 0x%02X live slots %u -> %u", id, cur, max);
             if (id == openingId) LogInvGroup("after ", g);
         }
     } __except(EXCEPTION_EXECUTE_HANDLER) { Log("InvGroups: EXCEPTION while patching"); }
@@ -1580,8 +1591,14 @@ static int PatchSlotsViaManager() {
 // cleared when ESC/B/Circle dismisses the popup or the warehouse closes.
 extern "C" void __fastcall CaptureOnItemDetailCtor(void* /*param_1*/, void* /*param_2*/) {
     InterlockedExchange(&g_itemDetailActiveCount, 1);
-    g_modalDismissTick = 0;          // a fresh popup is never "fading"
+    InterlockedExchange(&g_modalDismissed, 0);      // a new dialog is up again
     Log("ItemDetailModal opened");
+}
+
+// Fires when the game opens a quantity ("counting") dialog.
+extern "C" void __fastcall CaptureOnCountingModal(void* /*param_1*/, void* /*param_2*/) {
+    InterlockedExchange(&g_modalDismissed, 0);
+    Log("CountingModal opened");
 }
 
 // Resolve mainChar from the game manager singleton: *(*(globalPtr) + 0x48)
@@ -2050,6 +2067,25 @@ static int32_t ResolveStoreScreenId() {
 }
 
 // ---- game-menu gate --------------------------------------------------------
+// The first  MOV reg,[RCX+disp32]  loads with a struct-sized displacement in a
+// code window, in address order (used on FindPanelTop's prolog).
+static int CollectRcxDisp32Loads(const uint8_t* f, int len, uint32_t* out, int n, int max) {
+    __try {
+        for (int i = 0; i + 6 < len && n < max; i++) {
+            int k = i;
+            if (f[k] == 0x48 || f[k] == 0x4C || f[k] == 0x49 || f[k] == 0x4D) k++;
+            if (f[k] != 0x8B || (f[k+1] & 0xC7) != 0x81) continue;
+            uint32_t disp = *(const uint32_t*)(f + k + 2);
+            if (disp < 0x1000 || disp > 0x100000) continue;
+            bool dup = false;
+            for (int j = 0; j < n; j++) if (out[j] == disp) dup = true;
+            if (!dup) out[n++] = disp;
+            i = k + 5;
+        }
+    } __except(EXCEPTION_EXECUTE_HANDLER) {}
+    return n;
+}
+
 // FindPanelTop is the most-voted callee of the first CALL within 40 bytes of a
 // LEA RDX,[MainMenuView2] (build 25116796: 21/21 sites). Its prolog loads the
 // panel entry array and count from pm (two MOV reg,[RCX+disp32]); the view
@@ -2100,17 +2136,19 @@ static bool ResolvePanelLookup() {
     if (!fn || best < 3 || best * 2 <= total) {
         Log("PanelLookup:  FAIL (FindPanelTop best %d/%d)", best, total); return false;
     }
-    // 3) pm offsets from FindPanelTop's prolog: first two MOV reg,[RCX+disp32]
+    // 3) pm offsets from FindPanelTop's prolog: first two MOV reg,[RCX+disp32].
+    //    Another mod (QuickMenuHotkeys seeds pm the same way) may already have
+    //    its JMP on the prolog; the stolen bytes then live in ITS trampoline,
+    //    so read them from there and continue behind the 14-byte JMP.
     uint32_t found[2] = {}; int n = 0;
     const uint8_t* f = (const uint8_t*)fn;
-    for (int i = 0; i < 0x40 && n < 2; i++) {
-        int k = i;
-        if (f[k] == 0x48 || f[k] == 0x4C || f[k] == 0x49 || f[k] == 0x4D) k++;
-        if (f[k] != 0x8B || (f[k+1] & 0xC7) != 0x81) continue;
-        uint32_t disp = *(const uint32_t*)(f + k + 2);
-        if (disp < 0x1000 || disp > 0x100000) continue;
-        found[n++] = disp;
-        i = k + 5;
+    if (f[0] == 0xFF && f[1] == 0x25 && *(const int32_t*)(f + 2) == 0) {
+        const uint8_t* tramp = *(const uint8_t* const*)(f + 6);
+        n = CollectRcxDisp32Loads(tramp, 0x100, found, n, 2);
+        n = CollectRcxDisp32Loads(f + 14, 0x40 - 14, found, n, 2);
+        Log("PanelLookup:  FindPanelTop already hooked by another mod — prolog read via its trampoline");
+    } else {
+        n = CollectRcxDisp32Loads(f, 0x40, found, n, 2);
     }
     if (n < 2 || !g_panelStateOff) {
         Log("PanelLookup:  FAIL (prolog offsets %d, state off 0x%X)", n, g_panelStateOff); return false;
@@ -2490,10 +2528,9 @@ static void ClearActivePanelState(uintptr_t handler) {
 }
 
 // triggerKind: 0 = open, 1 = close (modal-aware, used by F-keys),
-//              2 = force close (skip modal block — used by controller B/Circle
-//              and per-panel buttons; the modal check at +0x258 can return
-//              true on stale pointers from previous housing-chest sessions
-//              and would otherwise block the close indefinitely).
+//              2 = force close (skip the modal block — used by controller
+//              B/Circle and per-panel buttons, which handle the modal case
+//              themselves at press time).
 static void TriggerWarehouse(int triggerKind = 0) {
     bool forceClose = (triggerKind == 2);
     // mainChar only serves as the "a session is loaded" gate here.
@@ -2595,6 +2632,7 @@ static void TriggerWarehouse(int triggerKind = 0) {
         // Modal popup state belongs to the closed warehouse — clear so a
         // stuck flag doesn't survive into the next session.
         InterlockedExchange(&g_itemDetailActiveCount, 0);
+        InterlockedExchange(&g_modalDismissed, 0);
 
         // Force-close fallback for housing chests: ClearActivePanelState
         // works for Private (Camp panel) but doesn't always visually close
@@ -2643,8 +2681,8 @@ static void LogModalState(const char* prefix) {
 // ============================================================
 //  WndProc + Input
 // ============================================================
-// g_pendingCircleClose / g_pendingBClose now live near the file top
-// (next to the diagnostic forward-decls) so TriggerWarehouse can clear them.
+// g_pendingCircleClose / g_pendingBClose are defined near the file top so
+// TriggerWarehouse can clear them.
 
 static LRESULT CALLBACK HookedWndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     if (m==WM_TRIGGER_WAREHOUSE) { TriggerWarehouse((int)w); return 0; }
@@ -2675,11 +2713,10 @@ static LRESULT CALLBACK HookedWndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             if (w == VK_ESCAPE && InterlockedCompareExchange(&g_warehouseActive, 0, 0)) {
                 if (IsNewModalDialogVisible()) {
                     // Each ESC consumes one modal: pass it to the game, clear
-                    // the fallback flag and start the fade-out grace window.
+                    // the fallback flag and mark the dialog as dismissed.
                     InterlockedExchange(&g_itemDetailActiveCount, 0);
-                    g_modalDismissTick = GetTickCount64();
-                    uint8_t st = 0; IsViewOpen("ModalMessageView", &st);
-                    Log("ESC pressed -> modal up (state 0x%02X), passing through to game", st);
+                    InterlockedExchange(&g_modalDismissed, 1);
+                    Log("ESC pressed -> modal up, passing through to game");
                     return CallWindowProcA(g_originalWndProc, h, m, w, l);
                 }
                 Log("ESC pressed -> closing warehouse");
@@ -2740,9 +2777,8 @@ static LRESULT CALLBACK HookedWndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             if (down && !g_panelPsLastDown[i] && modOk) {
                 if (InterlockedCompareExchange(&g_warehouseActive, 0, 0)) {
                     if (IsNewModalDialogVisible()) {
-                        // Mirror ESC: clear stale ItemDetailModal flag so a
-                        // popup dismissed via a non-ESC path doesn't block
-                        // the next close press.
+                        // A dialog is up: the panel button closes neither the
+                        // dialog nor the chest. Only clear the fallback flag.
                         InterlockedExchange(&g_itemDetailActiveCount, 0);
                     } else {
                         // Force close: bypass TriggerWarehouse modal-block.
@@ -2759,7 +2795,10 @@ static LRESULT CALLBACK HookedWndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         // Circle pressed while warehouse open → mark pending close (don't close yet)
         if (circleDown && !g_circleWasDown && InterlockedCompareExchange(&g_warehouseActive, 0, 0)) {
             if (IsNewModalDialogVisible()) {
+                // The game sees this Circle too (WM_INPUT is passed on) and
+                // dismisses the dialog with it: mirror ESC.
                 InterlockedExchange(&g_itemDetailActiveCount, 0);
+                InterlockedExchange(&g_modalDismissed, 1);
             } else {
                 InterlockedExchange(&g_pendingCircleClose, 1);
             }
@@ -2898,12 +2937,10 @@ static DWORD WINAPI InputThread(LPVOID) {
                     // Rising-edge toggle
                     if (down && !g_panelXiLastDown[i] && modOk) {
                         if (warehouseActiveBtn) {
-                            // Modal-aware close: when a quantity dialog or Details popup
-                            // is up, pressing the panel-button should NOT force-close the
-                            // warehouse. Clear our tracked itemDetail flag (so the game's
-                            // own close path can dismiss the popup) and skip the close.
-                            // Users press the button again after the popup is gone to
-                            // close the warehouse.
+                            // Modal-aware close: with a quantity dialog or Details popup
+                            // up, the panel combo (masked from the game) must not
+                            // force-close the warehouse. Only clear the fallback flag;
+                            // the user dismisses the dialog with B first.
                             if (IsNewModalDialogVisible()) {
                                 InterlockedExchange(&g_itemDetailActiveCount, 0);
                                 s_panelHoldFiredClose[i] = true;  // absorb hold-detection
@@ -2944,17 +2981,18 @@ static DWORD WINAPI InputThread(LPVOID) {
                 }
 
                 // ---- B button (default close): mirrors DirectInput Circle.
-                //  - Rising edge with a modal up (quantity dialog at +0x258
-                //    or ItemDetailModal counter > 0): just clear the popup
-                //    flag — game's own input handler will close the modal.
-                //    Do NOT mark pending close so the release doesn't trigger
-                //    warehouse-close on top of the modal-close.
+                //  - Rising edge with a modal up (IsNewModalDialogVisible):
+                //    the game sees this B (the IAT filter lets B through
+                //    while a dialog is up) and dismisses the dialog with it;
+                //    mark the dialog dismissed, like ESC. Do NOT mark pending
+                //    close so the release doesn't close the warehouse too.
                 //  - Rising edge with no modal: mark pending. Falling edge
                 //    triggers warehouse-close (force, bypass modal-block).
                 bool bDown = (buttons & 0x2000) != 0;
                 if (bDown && !g_xiBWasDown && warehouseActiveBtn) {
                     if (IsNewModalDialogVisible()) {
                         InterlockedExchange(&g_itemDetailActiveCount, 0);
+                        InterlockedExchange(&g_modalDismissed, 1);
                     } else {
                         InterlockedExchange(&g_pendingBClose, 1);
                     }
@@ -3250,7 +3288,8 @@ static bool ResolveAddresses() {
     }
 
     // Step 4: Find CanShow via Handler's vtable (update-proof — scans all vtable entries)
-    // CanShow signature: contains MOVZX reg, byte [reg+0x118] (reads the active flag).
+    // CanShow signature: MOVZX EAX, byte [this+disp32] followed by RET (reads the
+    // active flag; 0x118 on 1.0x, 0x130 since 2.01.00).
     // We find ALL data references to g_fnHandler (could be in vtables, reloc tables, etc.),
     // verify each is a real vtable (adjacent entries are valid code pointers), then scan
     // the vtable for a function matching the CanShow signature.
@@ -3476,7 +3515,7 @@ static bool ResolveAddresses() {
     }
 
     // Step 7: Find language byte dynamically
-    // The Steam API init function (FUN_140487400) compares Steam's language string
+    // The Steam API init function compares Steam's language string
     // against a table of known languages ("koreana", "english", ...) and stores the
     // matching index as a single byte in a global variable.
     // Algorithm: find "koreana" string → find pointer table → find code reference →
@@ -3598,6 +3637,20 @@ static bool ResolveAddresses() {
             Log("ItemDetailCtor:      WARN string-xref failed — \"View Details\" popup detection disabled (ESC may close warehouse instead of popup)");
         }
     }
+    // Quantity dialog opener, same way ("CountingModalMessage" string LEA xref).
+    g_addrCountingModal = 0;
+    {
+        uintptr_t strCnt = FindString("CountingModalMessage");
+        uintptr_t leaAddr = strCnt ? FindLEA(strCnt) : 0;
+        uintptr_t fnStart = leaAddr ? FindFunctionStart(leaAddr) : 0;
+        if (fnStart) {
+            g_addrCountingModal = fnStart;
+            Log("CountingModal:       OK base+0x%llX (string-xref \"CountingModalMessage\")",
+                (unsigned long long)(fnStart - g_gameBase));
+        } else {
+            Log("CountingModal:       WARN string-xref failed — a quantity dialog re-opened while the modal layer fades is not detected");
+        }
+    }
 
     return g_fnHandler && g_fnCanShow && g_fnSetInventory && g_mainCharGlobalPtr &&
            g_menuRequestFn && EffectiveStoreScreenId() >= 0;
@@ -3680,6 +3733,12 @@ static DWORD WINAPI ModThread(LPVOID) {
         if (!InstallHook(g_addrItemDetailCtor, (uintptr_t)&CaptureOnItemDetailCtor,
                          "ItemDetailOpen")) {
             Log("ItemDetailOpen hook FAILED — popup won't be detected");
+        }
+    }
+    if (g_addrCountingModal) {
+        if (!InstallHook(g_addrCountingModal, (uintptr_t)&CaptureOnCountingModal,
+                         "CountingModalOpen")) {
+            Log("CountingModalOpen hook FAILED");
         }
     }
 

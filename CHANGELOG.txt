@@ -30,7 +30,14 @@ v1.6.0 (2026-09-11)
   check had stopped working with 2.01; the mod now asks the game's own UI
   whether those views are on screen.
 - Fixed: quantity and "View Details" dialogs are detected through the game's
-  own modal layer, so ESC closes the dialog first and the storage second.
+  own modal layer plus the dialog open events, so one ESC closes the dialog
+  and the next ESC closes the storage — no dead presses in between, no timers.
+- Fixed: on an Xbox controller the B button now cancels a quantity dialog
+  again; the mod used to hide B from the game the whole time a storage was
+  open. B and Circle then behave like ESC (dialog first, storage second).
+- Compatibility: the mod and Quick Menu Hotkeys both hook the game's panel
+  lookup. The mod now reads through the other mod's hook, so the menu gate
+  works no matter which of the two loaded first.
 - All pointer chains are self-validating and skip cleanly if a future
   update moves them. The camp warehouse is never modified.
 

@@ -3,7 +3,7 @@ Copy the line(s) below the version number when uploading that file version.
 =======================================================================
 
 v1.6.0
-Updated for game 2.02.00. Fixes the mod not loading after the update, the wrong chest or title opening, the Dresser stuck at 10 slots, and hotkeys firing while a game menu is open. Camp warehouse untouched.
+Update for game 2.02.00. Final version — the mod is no longer maintained. The source code is public on GitHub (github.com/Stevi2195/PrivateStorageAnywhere).
 
 v1.5.10
 Fixes housing-chest capacity briefly showing 10 slots instead of 1000 right after a teleport or load (now re-applied the instant you open a box). Also hardens the mod against future game updates so storage hotkeys are less likely to break on a patch.

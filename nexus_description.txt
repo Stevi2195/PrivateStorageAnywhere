@@ -6,6 +6,10 @@ Open your [b]Private Storage[/b] and all five [b]Housing Storage Chests[/b] (Gat
 
 [line]
 
+[b]Final version.[/b] v1.6.0 for game version [b]2.02.00[/b] is the last update; the mod is no longer maintained. The complete source code is public on [url=https://github.com/Stevi2195/PrivateStorageAnywhere]https://github.com/Stevi2195/PrivateStorageAnywhere[/url] — anyone is welcome to pick it up and continue it.
+
+[line]
+
 [size=3][b]Features[/b][/size]
 
 [list]
@@ -141,12 +145,7 @@ Delete [b]PrivateStorageAnywhere.asi[/b] and [b]PrivateStorageAnywhere.ini[/b] f
 
 [b]v1.6.0[/b]
 [list]
-[*]Updated for game version [b]2.02.00[/b] (covers the September "Enhanced" update 2.01.00 as well). Fixes the mod not loading and every storage hotkey doing nothing after the update: the storage is now opened through the game's own menu-request call, and the warehouse screen id is derived from the game code at startup.
-[*][b]Fixed:[/b] the correct chest opens for every hotkey again, and the chest name shows in the header again.
-[*][b]Fixed:[/b] the [b]Dresser[/b] kept showing [b]10[/b] slots while the other chests had [b]1000[/b]. The game indexes its inventory table by position, not by the id stored in the data file (they differ by one), so every earlier version raised the wrong five records and never the Dresser. All five housing chests are now resolved through the game's own index table.
-[*][b]Changed:[/b] the housing-chest capacity is raised once at startup and re-checked when a storage opens — no more background timer rewriting game memory every few seconds.
-[*][b]Fixed:[/b] the storage hotkeys no longer fire while the main menu or the world map is open, and quantity / "View Details" dialogs are detected through the game's own modal layer (ESC closes the dialog first, the storage second).
-[*][b]Removed:[/b] the TraceMode option and the diagnostic code left over from earlier game versions. The mod is about half its previous size and touches less game state. New INI key [b]InvDumpKey[/b] (F10, needs DebugLog=1) writes the live storage capacities to the log for troubleshooting.
+[*]Update for game version [b]2.02.00[/b]. Final version — the source code is published on GitHub.
 [/list]
 
 [b]v1.5.10[/b]
