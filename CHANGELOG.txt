@@ -25,6 +25,12 @@ v1.6.0 (2026-09-11)
   The mod is about half its previous size and touches less game state.
 - New: INI key InvDumpKey (default F10, needs DebugLog=1) writes the live
   capacity of every storage to the log for troubleshooting. Read-only.
+- Fixed: the storage hotkeys no longer fire while the main menu (inventory,
+  quest journal, skills, ...) or the world map is open. The old game-state
+  check had stopped working with 2.01; the mod now asks the game's own UI
+  whether those views are on screen.
+- Fixed: quantity and "View Details" dialogs are detected through the game's
+  own modal layer, so ESC closes the dialog first and the storage second.
 - All pointer chains are self-validating and skip cleanly if a future
   update moves them. The camp warehouse is never modified.
 

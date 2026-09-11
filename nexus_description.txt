@@ -145,6 +145,7 @@ Delete [b]PrivateStorageAnywhere.asi[/b] and [b]PrivateStorageAnywhere.ini[/b] f
 [*][b]Fixed:[/b] the correct chest opens for every hotkey again, and the chest name shows in the header again.
 [*][b]Fixed:[/b] the [b]Dresser[/b] kept showing [b]10[/b] slots while the other chests had [b]1000[/b]. The game indexes its inventory table by position, not by the id stored in the data file (they differ by one), so every earlier version raised the wrong five records and never the Dresser. All five housing chests are now resolved through the game's own index table.
 [*][b]Changed:[/b] the housing-chest capacity is raised once at startup and re-checked when a storage opens — no more background timer rewriting game memory every few seconds.
+[*][b]Fixed:[/b] the storage hotkeys no longer fire while the main menu or the world map is open, and quantity / "View Details" dialogs are detected through the game's own modal layer (ESC closes the dialog first, the storage second).
 [*][b]Removed:[/b] the TraceMode option and the diagnostic code left over from earlier game versions. The mod is about half its previous size and touches less game state. New INI key [b]InvDumpKey[/b] (F10, needs DebugLog=1) writes the live storage capacities to the log for troubleshooting.
 [/list]
 

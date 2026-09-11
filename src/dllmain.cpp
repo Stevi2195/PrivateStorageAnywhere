@@ -39,14 +39,12 @@ static uintptr_t g_fnModeSwitcher = 0, g_fnCanShow = 0, g_fnSetInventory = 0;
 static uintptr_t g_fnSetTitle = 0;
 static uintptr_t g_warehouseVtableEntry = 0;  // vtable address containing handler — used for auto-capture verification
 static uintptr_t g_warehouseVtableStart = 0;  // vtable start of warehouse class — set on first successful capture
-static uint32_t  g_modalDialogOff = 0;     // handler+N: move-quantity dialog pointer
-static bool      g_modalOffValid  = true;  // set false once the slot at +g_modalDialogOff stops looking like a
-                                           // modal-dialog pointer (handler-struct drift guard; disables modal tracking)
 static uintptr_t g_langByteAddr = 0;      // address of language byte (resolved dynamically from Steam API init function)
 
-// ItemDetailModal ("View Details" popup) tracking. The popup's open handler is
-// found via the "ItemDetailModalMessage" string xref and hooked to raise the
-// active flag; ESC/B/Circle clear it again when they dismiss the popup.
+// ItemDetailModal ("View Details" popup) tracking, used only when the game's
+// own modal-view test (IsViewOpen("ModalMessageView")) is unavailable: the
+// popup's open handler is found via the "ItemDetailModalMessage" string xref
+// and hooked to raise this flag; ESC/B/Circle clear it again.
 static volatile LONG g_itemDetailActiveCount = 0;
 static uintptr_t g_addrItemDetailCtor = 0;
 
@@ -91,6 +89,16 @@ static uintptr_t g_mainCharGlobalPtr = 0;
 // ModeSwitcher case emits the "store" view tag — WareHouseView is declared in
 // uigameconfig2.xml as tag2="store ingamemenu", so that tag is what mounts it.
 static uintptr_t g_menuRequestFn  = 0;
+// Game-menu gate (replaces the mainChar mode/sub-mode check that 2.01.00 took
+// away): the game's own per-view open test. FindPanelTop(pm, name) returns the
+// view object; its state byte at +g_panelStateOff reads (st & 0x60) == 0x40
+// while the view is open. pm (the panel manager) is captured from FindPanelTop's
+// first argument by a read-only hook and validated against the array it walks.
+static uintptr_t g_fnFindPanelTop  = 0;
+static uint32_t  g_panelStateOff   = 0;
+static uint32_t  g_pmArrayOff      = 0;    // pm+N: panel entry array (from FindPanelTop's prolog)
+static uint32_t  g_pmCountOff      = 0;    // pm+N: panel entry count
+static volatile LONG64 g_panelManager = 0;
 static uintptr_t g_menuRootGlobal = 0;   // menuObj = *( *(global) + g_menuObjOff )
 static uint32_t  g_menuObjOff     = 0;
 static int32_t   g_storeScreenId  = -1;  // derived from ModeSwitcher; -1 = unknown
@@ -191,7 +199,6 @@ static DWORD g_invDumpKey = 0x79;  // VK_F10
 static volatile LONG g_nextOpenPanel = PANEL_PRIVATE;
 
 static volatile ULONGLONG g_closeTimestamp = 0;  // GetTickCount64 at last close (re-open cooldown)
-static volatile LONG64 g_lastModalPassed = 0;   // ModalMessageView addr when ESC was last passed to game for a modal
 
 // Forward declaration (defined later in Utilities section)
 static void Log(const char* fmt, ...);
@@ -199,6 +206,7 @@ static void InitWarehousePanel(uintptr_t handler, const char* initString);
 static bool TriggerWarehouseViewMount(void);
 static void TriggerWarehouseViewUnmount(void);
 static void LogModalState(const char* prefix);
+static bool IsViewOpen(const char* name, uint8_t* stOut);
 
 // Pending-close flags. Set on press while warehouse is active, cleared on
 // release-driven close OR on warehouse close from any other path. Defined
@@ -598,59 +606,30 @@ static const char* GetWarehouseTitle() {
     }
 }
 
-// Read the active modal dialog pointer from the handler struct.
-static uintptr_t ReadModalDialog(uintptr_t handler) {
-    if (!g_modalDialogOff || !g_modalOffValid) return 0;
-    __try {
-        return *(uintptr_t*)(handler + g_modalDialogOff);
-    } __except(EXCEPTION_EXECUTE_HANDLER) { return 0; }
-}
+// Is a modal dialog (quantity / confirm / "View Details") up over the
+// warehouse? The warehouse code itself asks the panel manager for
+// "ModalMessageView" (uigameconfig.xml: the modal layer, layer 100) and reads
+// its view state — so do we. Only when that test is unavailable do we fall
+// back to the ItemDetailOpen hook flag.
+// After an ESC has been passed through to dismiss a modal, the modal layer
+// keeps reporting "open" for the fade-out (seen on 2.02: two to four extra
+// ESC presses did nothing). Within this window the layer counts as closed.
+static volatile ULONGLONG g_modalDismissTick = 0;
+static const ULONGLONG MODAL_DISMISS_GRACE_MS = 1500;
 
-// Check if a NEW sub-dialog (quantity/confirm dialog OR "View Details" popup)
-// is visible. The two tracking sources are independent:
-//
-//   1. handler+0x258 (ModalDlgOff): the game writes a pointer here when a
-//      quantity/confirm sub-dialog opens. childCount at +0x30 of the view
-//      tells us if it still has visible children.
-//
-//   2. g_itemDetailActiveCount: set by the ItemDetailOpen hook when the game
-//      processes an "ItemDetailModalMessage" command. The popup does NOT
-//      register at handler+0x258 — only the hook sees it.
-//
-// CRITICAL: never let one source clear the other. Earlier versions cleared
-// g_itemDetailActiveCount whenever +0x258 looked stale, which silently
-// suppressed the Details popup detection — ESC then closed the warehouse
-// instead of the popup.
 static bool IsNewModalDialogVisible() {
-    // Source #2 is always consulted first because it's independent of the
-    // handler/+0x258 state and is the only source for Details popups.
-    if (InterlockedCompareExchange(&g_itemDetailActiveCount, 0, 0) > 0) {
-        return true;
-    }
-
-    uintptr_t handler = (uintptr_t)InterlockedCompareExchange64(&g_handlerThis, 0, 0);
-    if (!handler) return false;
-
-    __try {
-        uintptr_t modalView = ReadModalDialog(handler);
-        if (modalView > 0x10000 && modalView < 0x7FFFFFFFFFFF) {
-            uint32_t childCount = *(uint32_t*)(modalView + 0x30);
-            // childCount == 0: no modal visible.
-            // childCount > 0x100: freed-memory garbage (modal was dismissed,
-            // pointer not cleared — reading at the old address returns
-            // whatever the allocator wrote). Treat as dismissed.
-            if (childCount == 0 || childCount > 0x100) {
-                InterlockedExchange64(&g_lastModalPassed, 0);
-                // DO NOT touch g_itemDetailActiveCount here.
-                return false;
-            }
-            uintptr_t lastPassed = (uintptr_t)InterlockedCompareExchange64(&g_lastModalPassed, 0, 0);
-            if (lastPassed == modalView) return false;
-            return true;
+    if (g_fnFindPanelTop && g_panelStateOff &&
+        InterlockedCompareExchange64(&g_panelManager, 0, 0)) {
+        uint8_t st = 0;
+        bool open = IsViewOpen("ModalMessageView", &st);
+        if (open && g_modalDismissTick &&
+            GetTickCount64() - g_modalDismissTick < MODAL_DISMISS_GRACE_MS) {
+            Log("  modal layer still fading (state 0x%02X) — treated as closed", st);
+            return false;
         }
-    } __except(EXCEPTION_EXECUTE_HANDLER) {}
-    InterlockedExchange64(&g_lastModalPassed, 0);
-    return false;
+        return open;
+    }
+    return InterlockedCompareExchange(&g_itemDetailActiveCount, 0, 0) > 0;
 }
 
 static DWORD ReadHexValue(const char* section, const char* key, DWORD defaultVal, const char* iniPath) {
@@ -1601,6 +1580,7 @@ static int PatchSlotsViaManager() {
 // cleared when ESC/B/Circle dismisses the popup or the warehouse closes.
 extern "C" void __fastcall CaptureOnItemDetailCtor(void* /*param_1*/, void* /*param_2*/) {
     InterlockedExchange(&g_itemDetailActiveCount, 1);
+    g_modalDismissTick = 0;          // a fresh popup is never "fading"
     Log("ItemDetailModal opened");
 }
 
@@ -2069,6 +2049,112 @@ static int32_t ResolveStoreScreenId() {
     return -1;
 }
 
+// ---- game-menu gate --------------------------------------------------------
+// FindPanelTop is the most-voted callee of the first CALL within 40 bytes of a
+// LEA RDX,[MainMenuView2] (build 25116796: 21/21 sites). Its prolog loads the
+// panel entry array and count from pm (two MOV reg,[RCX+disp32]); the view
+// state offset is the majority disp32 of the open-test idiom
+// MOVZX EAX,byte [RAX+disp32]; AND AL,0x60; CMP AL,0x40 (98 sites, +0xB0).
+static bool ResolvePanelLookup() {
+    uint8_t* base = (uint8_t*)g_gameBase;
+    // 1) state byte offset
+    {
+        uint32_t cand[8] = {}; int votes[8] = {}; int nc = 0;
+        for (DWORD i = 0; (size_t)i + 11 < g_imageSize; i++) {
+            if (base[i] != 0x0F || base[i+1] != 0xB6 || base[i+2] != 0x80) continue;
+            if (base[i+7] != 0x24 || base[i+8] != 0x60) continue;
+            if (base[i+9] != 0x3C || base[i+10] != 0x40) continue;
+            uint32_t off = *(uint32_t*)(base + i + 3);
+            if (off < 0x10 || off > 0x2000) continue;
+            int k = 0;
+            for (; k < nc; k++) if (cand[k] == off) { votes[k]++; break; }
+            if (k == nc && nc < 8) { cand[nc] = off; votes[nc] = 1; nc++; }
+        }
+        int best = 0;
+        for (int k = 0; k < nc; k++) if (votes[k] > best) { best = votes[k]; g_panelStateOff = cand[k]; }
+    }
+    // 2) FindPanelTop
+    uintptr_t strMM = FindString("MainMenuView2");
+    if (!strMM) { Log("PanelLookup:  FAIL (MainMenuView2 string missing)"); return false; }
+    uintptr_t cand[16] = {}; int votes[16] = {}; int nc = 0;
+    uintptr_t lea = 0;
+    for (int guard = 0; guard < 64; guard++) {
+        lea = FindLEA(strMM, lea ? lea + 1 : 0);
+        if (!lea) break;
+        uint8_t* p = (uint8_t*)lea;
+        if (!(p[0] == 0x48 && p[1] == 0x8D && p[2] == 0x15)) continue;     // LEA RDX only
+        uintptr_t t = 0;
+        for (int j = 7; j < 40; j++) {
+            if (p[j] != 0xE8) continue;
+            t = (uintptr_t)(p + j + 5) + *(int32_t*)(p + j + 1);
+            if (t <= g_gameBase || t >= g_gameBase + g_imageSize) t = 0;
+            break;
+        }
+        if (!t) continue;
+        int k = 0;
+        for (; k < nc; k++) if (cand[k] == t) { votes[k]++; break; }
+        if (k == nc && nc < 16) { cand[nc] = t; votes[nc] = 1; nc++; }
+    }
+    int best = 0, total = 0; uintptr_t fn = 0;
+    for (int k = 0; k < nc; k++) { total += votes[k]; if (votes[k] > best) { best = votes[k]; fn = cand[k]; } }
+    if (!fn || best < 3 || best * 2 <= total) {
+        Log("PanelLookup:  FAIL (FindPanelTop best %d/%d)", best, total); return false;
+    }
+    // 3) pm offsets from FindPanelTop's prolog: first two MOV reg,[RCX+disp32]
+    uint32_t found[2] = {}; int n = 0;
+    const uint8_t* f = (const uint8_t*)fn;
+    for (int i = 0; i < 0x40 && n < 2; i++) {
+        int k = i;
+        if (f[k] == 0x48 || f[k] == 0x4C || f[k] == 0x49 || f[k] == 0x4D) k++;
+        if (f[k] != 0x8B || (f[k+1] & 0xC7) != 0x81) continue;
+        uint32_t disp = *(const uint32_t*)(f + k + 2);
+        if (disp < 0x1000 || disp > 0x100000) continue;
+        found[n++] = disp;
+        i = k + 5;
+    }
+    if (n < 2 || !g_panelStateOff) {
+        Log("PanelLookup:  FAIL (prolog offsets %d, state off 0x%X)", n, g_panelStateOff); return false;
+    }
+    g_fnFindPanelTop = fn; g_pmArrayOff = found[0]; g_pmCountOff = found[1];
+    Log("PanelLookup:  OK FindPanelTop=base+0x%llX (%d/%d votes) pm array +0x%X count +0x%X state byte +0x%X",
+        (unsigned long long)(fn - g_gameBase), best, total, g_pmArrayOff, g_pmCountOff, g_panelStateOff);
+    return true;
+}
+
+// Read-only capture of the panel manager: FindPanelTop(pm, name) is called
+// from hundreds of UI sites long before any hotkey, so pm is known within the
+// first frames. The candidate is validated against the array the function
+// itself walks; a wrong RCX is never adopted.
+extern "C" void __fastcall CaptureOnFindPanelTop(void* rcx, void*, void*, void*) {
+    if (InterlockedCompareExchange64(&g_panelManager, 0, 0) != 0) return;
+    uintptr_t pm = (uintptr_t)rcx;
+    if (pm <= 0x10000 || pm >= 0x7FFFFFFFFFFFULL || !g_pmArrayOff) return;
+    __try {
+        uintptr_t entries = *(uintptr_t*)(pm + g_pmArrayOff);
+        uint32_t  count   = *(uint32_t*)(pm + g_pmCountOff);
+        if (entries <= 0x10000 || count == 0 || count > 0x1000) return;
+        if (InterlockedCompareExchange64(&g_panelManager, (LONG64)pm, 0) == 0)
+            Log("PanelManager: 0x%llX captured from FindPanelTop (entries=0x%llX count=%u)",
+                (unsigned long long)pm, (unsigned long long)entries, count);
+    } __except(EXCEPTION_EXECUTE_HANDLER) {}
+}
+
+// Is the named view on screen right now? false also when the gate is unavailable.
+static bool IsViewOpen(const char* name, uint8_t* stOut = nullptr) {
+    if (!g_fnFindPanelTop || !g_panelStateOff) return false;
+    uintptr_t pm = (uintptr_t)InterlockedCompareExchange64(&g_panelManager, 0, 0);
+    if (!pm) return false;
+    typedef uintptr_t (__fastcall* FindPanelTopFn)(uintptr_t, const char*);
+    __try {
+        uintptr_t panel = ((FindPanelTopFn)g_fnFindPanelTop)(pm, name);
+        if (!panel) return false;
+        uint8_t st = *(uint8_t*)(panel + g_panelStateOff);
+        if (stOut) *stOut = st;
+        return (st & 0x60) == 0x40;
+    } __except(EXCEPTION_EXECUTE_HANDLER) {}
+    return false;
+}
+
 // Push a screen open/close request through the game's own queue.
 static bool MenuRequestScreen(int32_t screenId, bool open) {
     if (!g_menuRequestFn || !g_menuRootGlobal || screenId < 0) return false;
@@ -2116,27 +2202,6 @@ static void InitWarehousePanel(uintptr_t handler, const char* initString) {
     // them. A no-op once the boot-time worker has done its job; it only matters
     // when the manager was re-created after that (e.g. a second save loaded).
     PatchSlotsViaManager();
-
-    // Clear stale modal dialog pointer from previous warehouse sessions.
-    // Self-validate first: the slot must be 0 or a canonical heap pointer. If it
-    // holds a small scalar / non-canonical value the handler struct has drifted and
-    // +g_modalDialogOff is no longer the modal slot — skip the (valid-but-wrong,
-    // SEH-uncatchable) write and disable modal tracking for this session.
-    if (g_modalDialogOff && g_modalOffValid) {
-        __try {
-            uintptr_t cur = *(uintptr_t*)(handler + g_modalDialogOff);
-            bool looksValid = (cur == 0) ||
-                (cur >= 0x10000000000ULL && cur < 0x7FFFFFFFFFFFULL);
-            if (looksValid) {
-                *(uintptr_t*)(handler + g_modalDialogOff) = 0;
-                Log("  Cleared stale modal pointer at +0x%X", g_modalDialogOff);
-            } else {
-                g_modalOffValid = false;
-                Log("  Modal offset +0x%X looks relocated (0x%llX) — modal tracking disabled this build",
-                    g_modalDialogOff, (unsigned long long)cur);
-            }
-        } __except(EXCEPTION_EXECUTE_HANDLER) {}
-    }
 
     // Ask for the view mount again now that the handler exists. TriggerWarehouse
     // already sent one request before the capture; the second one is part of the
@@ -2450,6 +2515,21 @@ static void TriggerWarehouse(int triggerKind = 0) {
             return;
         }
 
+        // Game-menu gate: never open on top of the main menu (inventory, quest
+        // journal, skills, ...) or the world map — the request would close
+        // that menu and mount the warehouse over it.
+        {
+            static const char* const kViews[] = { "MainMenuView2", "WorldMapView" };
+            for (int v = 0; v < 2; v++) {
+                uint8_t st = 0;
+                if (IsViewOpen(kViews[v], &st)) {
+                    Log("BLOCKED: %s is open (state 0x%02X) — close it first", kViews[v], st);
+                    InterlockedExchange(&g_nextOpenPanel, PANEL_PRIVATE);
+                    return;
+                }
+            }
+        }
+
         LONG targetPanel = InterlockedExchange(&g_nextOpenPanel, PANEL_PRIVATE);
         {
             LONG tp = targetPanel;
@@ -2457,7 +2537,6 @@ static void TriggerWarehouse(int triggerKind = 0) {
             Log("=== OPENING WAREHOUSE (%s) ===", g_panels[tp].name);
         }
         InterlockedExchange(&g_activePanel, targetPanel);
-        InterlockedExchange64(&g_lastModalPassed, 0);
         InterlockedExchange(&g_warehouseActive, 1);
 
         // The panel is initialised once the controller is known. On the first
@@ -2479,20 +2558,10 @@ static void TriggerWarehouse(int triggerKind = 0) {
         }
 
     } else {
-        // Block close while modal dialog is active — but only for non-forced
-        // closes (F6/F7/etc). Controller closes always proceed because the
-        // +0x258 modal pointer can hold stale data on housing chests, which
-        // previously caused B and per-panel-combo presses to be silently
-        // dropped on Gatherables/Dresser/Refrigerator/Symbol/Collecting.
+        // Block close while a modal dialog is up — but only for non-forced
+        // closes (hotkeys). Controller closes always proceed.
         if (!forceClose && IsNewModalDialogVisible()) {
-            uintptr_t h2 = (uintptr_t)InterlockedCompareExchange64(&g_handlerThis, 0, 0);
-            uintptr_t mv2 = h2 ? ReadModalDialog(h2) : 0;
-            uint32_t cc2 = 0;
-            if (mv2 > 0x10000 && mv2 < 0x7FFFFFFFFFFF) {
-                __try { cc2 = *(uint32_t*)(mv2 + 0x30); } __except(EXCEPTION_EXECUTE_HANDLER) {}
-            }
-            Log("CLOSE BLOCKED: modal dialog still active (mv=0x%llX childCount=0x%X)",
-                (unsigned long long)mv2, cc2);
+            Log("CLOSE BLOCKED: modal dialog still open");
             return;
         }
         Log("=== CLOSING WAREHOUSE ===");
@@ -2556,13 +2625,6 @@ static void TriggerWarehouse(int triggerKind = 0) {
 static void LogModalState(const char* prefix) {
     if (!g_debugLog) return;
     uintptr_t handler = (uintptr_t)InterlockedCompareExchange64(&g_handlerThis, 0, 0);
-    uintptr_t modalView = handler ? ReadModalDialog(handler) : 0;
-    uint32_t  childCount = 0;
-    if (modalView > 0x10000 && modalView < 0x7FFFFFFFFFFF) {
-        __try { childCount = *(uint32_t*)(modalView + 0x30); }
-        __except(EXCEPTION_EXECUTE_HANDLER) {}
-    }
-    uintptr_t lastPassed = (uintptr_t)InterlockedCompareExchange64(&g_lastModalPassed, 0, 0);
     LONG itemDetail = InterlockedCompareExchange(&g_itemDetailActiveCount, 0, 0);
     uint8_t  af = 0;
     uint64_t pv = 0;
@@ -2572,11 +2634,9 @@ static void LogModalState(const char* prefix) {
             pv = *(uint64_t*)(handler + g_offPanelValue);
         } __except(EXCEPTION_EXECUTE_HANDLER) {}
     }
-    Log("%s state: handler=0x%llX +PV=0x%llX +0x%X=%u modalView=0x%llX "
-        "childCount=0x%X lastPassed=0x%llX itemDetail=%ld activePanel=%ld",
+    Log("%s state: handler=0x%llX +PV=0x%llX +0x%X=%u modal=%d itemDetail=%ld activePanel=%ld",
         prefix, (unsigned long long)handler, (unsigned long long)pv,
-        g_offActiveFlag, (unsigned)af,
-        (unsigned long long)modalView, childCount, (unsigned long long)lastPassed,
+        g_offActiveFlag, (unsigned)af, IsNewModalDialogVisible() ? 1 : 0,
         (long)itemDetail, (long)InterlockedCompareExchange(&g_activePanel, 0, 0));
 }
 
@@ -2614,20 +2674,12 @@ static LRESULT CALLBACK HookedWndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             // ESC: warehouse-close (or pass-through to dismiss modal first).
             if (w == VK_ESCAPE && InterlockedCompareExchange(&g_warehouseActive, 0, 0)) {
                 if (IsNewModalDialogVisible()) {
-                    uintptr_t handler = (uintptr_t)InterlockedCompareExchange64(&g_handlerThis, 0, 0);
-                    if (handler) {
-                        __try {
-                            InterlockedExchange64(&g_lastModalPassed, (LONG64)ReadModalDialog(handler));
-                        } __except(EXCEPTION_EXECUTE_HANDLER) {}
-                    }
-                    // The ItemDetailModal isn't tracked at handler+0x258, so
-                    // the polling-based close-detection never clears the
-                    // hook-set flag. Each ESC consumes one modal — passing
-                    // it to the game closes the popup, so we clear the flag
-                    // to mirror that. Subsequent F-key/ESC checks see fresh
-                    // state.
+                    // Each ESC consumes one modal: pass it to the game, clear
+                    // the fallback flag and start the fade-out grace window.
                     InterlockedExchange(&g_itemDetailActiveCount, 0);
-                    Log("ESC pressed -> modal up, passing through to game");
+                    g_modalDismissTick = GetTickCount64();
+                    uint8_t st = 0; IsViewOpen("ModalMessageView", &st);
+                    Log("ESC pressed -> modal up (state 0x%02X), passing through to game", st);
                     return CallWindowProcA(g_originalWndProc, h, m, w, l);
                 }
                 Log("ESC pressed -> closing warehouse");
@@ -3343,13 +3395,6 @@ static bool ResolveAddresses() {
             Log("  Vtable start: FAIL (RTTI scan)");
     }
 
-    // Step 4b: Modal dialog slot. No code anchor identifies it uniquely, so it
-    // is fixed at +0x258 and validated at every open: the slot must hold 0 or a
-    // canonical heap pointer, otherwise modal tracking is disabled for the
-    // session (see InitWarehousePanel). Still correct on 2.01.00.
-    g_modalDialogOff = 0x258;
-    Log("ModalDlgOff:  fixed offset=0x%X (validated on open)", g_modalDialogOff);
-
     // Step 5a: game-manager singleton (mainChar = *(*(global) + 0x48)). The
     // load pair
     //     MOV rX, [rip+global]     ; manager singleton slot
@@ -3419,6 +3464,8 @@ static bool ResolveAddresses() {
     // Step 5c: the game's own menu request queue and the screen id whose
     // ModeSwitcher case emits the "store" view tag (WareHouseView is declared
     // tag2="store ingamemenu" in uigameconfig2.xml).
+    ResolvePanelLookup();
+
     if (ResolveMenuRequest()) {
         g_storeScreenId = ResolveStoreScreenId();
         if (g_storeScreenIdIni >= 0)
@@ -3619,6 +3666,13 @@ static DWORD WINAPI ModThread(LPVOID) {
 
     if(!InstallHook(g_fnHandler,(uintptr_t)&CaptureOnHandler,"Handler",hookSizeHandler)) return 0;
     if(!InstallCanShowHook(g_fnCanShow)) return 0;
+
+    // Read-only hook that seeds the panel manager for the game-menu gate.
+    // Non-fatal: without it the gate simply stays off.
+    if (g_fnFindPanelTop) {
+        if (!InstallHook(g_fnFindPanelTop, (uintptr_t)&CaptureOnFindPanelTop, "FindPanelTop"))
+            Log("FindPanelTop hook FAILED — game-menu gate disabled");
+    }
 
     // ItemDetailOpen hook: raises g_itemDetailActiveCount so ESC/B/Circle close
     // the popup first instead of the warehouse.
